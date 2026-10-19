@@ -28,10 +28,23 @@ local function hub_error(call_error)
   return code, message or 'Hub request failed'
 end
 
+-- One control message from this plugin is at most 64 KiB (LazyRex docs/rex-protocol.md, "Rex Lua
+-- runtime"). hub() measures each request before it sends it: a request that can never fit is
+-- invalid_input with its size, not the retryable 'unavailable', and nothing of it is committed.
+-- request_limit leaves 1 KiB for the control frame around the client.perform payload.
+local request_limit = 65536 - 1024
+local measure -- encoded_size, defined below with the other size helpers
+
 local function hub(action, args)
-  local response, call_error = rex.call('client.perform', {
-    client_id = hub_id, action = action, args = args, timeout_ms = 10000
-  })
+  local request = {client_id = hub_id, action = action, args = args, timeout_ms = 10000}
+  if measure then
+    local n = measure(request)
+    if n > request_limit then
+      fail('invalid_input', 'The ' .. action .. ' request is ' .. n .. ' bytes encoded; one request is at most ' .. request_limit
+        .. ' (the records it writes are too large)')
+    end
+  end
+  local response, call_error = rex.call('client.perform', request)
   if not response then fail(hub_error(call_error)) end
   if type(response.result) ~= 'table' then fail('internal', 'Invalid hub result') end
   return response.result
@@ -341,6 +354,7 @@ local function encoded_size(v)
   local _, separators = text:gsub('\226\128[\168\169]', '')
   return #text + 5 * html + 3 * separators
 end
+measure = encoded_size
 
 -- utf8_cut returns a prefix of s of at most n bytes that ends at a UTF-8 boundary.
 local function utf8_cut(s, n)
@@ -588,7 +602,11 @@ local function page_bytes(m)
 end
 
 -- admit refuses a new message that would not arrive in full in one read or history page.
-local body_limit = 32768
+-- body_limit: a send's hub.store.batch carries the body twice (the message record and the
+-- operation fingerprint), and the rest of the 64 KiB request holds the mailbox, thread and
+-- groups records. The body limit is fixed; whether the whole batch fits depends on the current
+-- records, and hub() checks that for each batch.
+local body_limit = 16384
 local function admit(m)
   local body = encoded_size(m.body) - 2
   if body > body_limit then
@@ -863,7 +881,7 @@ local function ack(agent, args)
   end
   if count ~= maximum then fail('refused', 'ids must be a contiguous array') end
   if count == 0 then return {acked = true} end
-  local records = get(keys)
+  local records = message_records(keys)
   for id in pairs(wanted) do
     local record = records['message/' .. id]
     if record.rev == '0' or type(record.value) ~= 'table' or not addressed(record.value, agent) or record.value.id ~= id then
@@ -1181,18 +1199,22 @@ end
 
 -- Membership changes affect future delivery. Legacy messages keep a separate delivery snapshot.
 -- notice_body sets the body of a membership notice. A title that would make the notice too large
--- for one read page is cut (with "…"). If the notice does not fit with an empty title, the change
+-- for one read page, or its body larger than body_limit, is cut (with "…"). If the notice does not fit with an empty title, the change
 -- is refused before its batch, so nothing is written.
 local function notice_body(message, title)
   local function body(t) return 'You were added to ' .. t .. '. Read earlier messages with messaging.history.' end
+  -- over: the bytes to remove, for the page and for the body limit of every message.
+  local function over_by()
+    return math.max(page_bytes(message) - reply_budget, encoded_size(message.body) - 2 - body_limit)
+  end
   message.body = body(title)
-  local over = page_bytes(message) - reply_budget
+  local over = over_by()
   if over <= 0 then return end
   local cut = title
   while over > 0 and cut ~= '' do
     cut = utf8_cut(cut, #cut - over - 3)
     message.body = body(cut .. '…')
-    over = page_bytes(message) - reply_budget
+    over = over_by()
   end
   if over > 0 then
     message.body = body('')
@@ -2022,7 +2044,7 @@ end
 
 local actions = {
   {name = 'messaging.send', kind = 'client', title = 'Send a message',
-    description = 'Send a message to an agent, to "user" (the human), or to the group "team" (everyone else). Choose a key before sending. After an unknown outcome, retry the same key and content. Set reply_to to acknowledge the message you answer. Set reply_expected=false for an informational message. Use ack for routine receipts. Limits: body at most 32768 bytes encoded as JSON, key at most 200 bytes, reply_to at most 512 bytes, and the whole message must fit one read page (48 KB).',
+    description = 'Send a message to an agent, to "user" (the human), or to the group "team" (everyone else). Choose a key before sending. After an unknown outcome, retry the same key and content. Set reply_to to acknowledge the message you answer. Set reply_expected=false for an informational message. Use ack for routine receipts. Limits: body at most 16384 bytes encoded as JSON, key at most 200 bytes, reply_to at most 512 bytes, and the whole message must fit one read page (48 KB).',
     args = {type = 'object', properties = {
       to = {type = 'string', minLength = 1}, body = {type = 'string', minLength = 1}, key = {type = 'string', minLength = 1},
       reply_to = {type = 'string', minLength = 1}, reply_expected = {type = 'boolean'}
