@@ -96,6 +96,18 @@ local function resolve_recipient(id)
   error(result, 0)
 end
 
+-- set_rev is the revision at which a home or a title was set. A migration rewrites a record and
+-- so gives it a new revision; the moved value keeps the old one in set_rev. Identities report one
+-- at a time, so a second migration must still see the first one's age. A normal write replaces
+-- the whole value, so its own revision counts again.
+local function set_rev(source) return source.record.value.set_rev or source.record.rev end
+local function with_set_rev(source)
+  local value = {}
+  for k, v in pairs(source.record.value) do value[k] = v end
+  value.set_rev = set_rev(source)
+  return value
+end
+
 local function migrate_aliases()
   local names = {}
   for id in pairs(aliases) do names[#names + 1] = id end
@@ -144,16 +156,16 @@ local function migrate_aliases()
         -- Preserve the first home when aliases join two records.
         local first
         for _, source in ipairs(contributors) do
-          if not first or later(first.record.rev, source.record.rev) then first = source end
+          if not first or later(set_rev(first), set_rev(source)) then first = source end
         end
-        value = first.record.value
+        value = with_set_rev(first)
       elseif target:match('^thread%-title/') then
         -- The latest explicit rename wins when legacy and canonical titles both exist.
         local newest
         for _, source in ipairs(contributors) do
-          if not newest or later(source.record.rev, newest.record.rev) then newest = source end
+          if not newest or later(set_rev(source), set_rev(newest)) then newest = source end
         end
-        value = newest.record.value
+        value = with_set_rev(newest)
       elseif target:match('^draft/') then
         value = {text = ''}
         for _, source in ipairs(contributors) do
