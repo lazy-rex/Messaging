@@ -144,6 +144,7 @@ test('a 50 KB key is larger than the batch target but still reaches the store', 
   write({{key = box('bob'), value = {ids = {}}}})
 end)
 
--- key_too_large (a key whose own hub.store.get request is over 64512 bytes) is not tested: the
+-- key_too_large (a key whose own hub.store.get request is over 64512 bytes) is not tested here: the
 -- record that holds the ID (a mailbox or a thread) is written in one request with more overhead
--- than that get, so no Lua writer, including this runner, can store such an ID.
+-- than that get, so no Lua writer, including this runner, can store such an ID. A writer with a
+-- larger limit (a Go test fixture) could.
