@@ -1,0 +1,2 @@
+# The tests are Node scripts; the plugin is Lua. Keep the tests out of the language stats.
+tests/** linguist-detectable=false
