@@ -1071,7 +1071,8 @@ local function render_home(user, context)
   for _, a in ipairs(ordered) do
     local n = a.observer and 0 or (counts[a.id] or 0)
     local item = {id = a.id, label = thread_title(user, a), detail = n > 0 and (n .. ' unread') or 'No unread messages',
-      action = {name = archived[a.id] and 'restore' or 'open', label = archived[a.id] and 'Restore' or 'Open', enabled = true}}
+      action = archived[a.id] and {name = 'restore', label = 'Restore', enabled = true, tool = 'messaging.thread_archive'}
+        or {name = 'open', label = 'Open', enabled = true, user_only = 'navigation'}}
     if a.observer then item.detail = a.readonly and 'Read-only direct thread' or 'Send a message to join' end
     local target = archived[a.id] and archived_items or (a.observer and observed_items or items)
     target[#target + 1] = item
@@ -1088,7 +1089,7 @@ local function render_home(user, context)
     {id = 'observed_threads', type = 'list', label = 'Agent-only threads', items = observed_items},
     {id = 'archived_threads', type = 'list', label = 'Archived', items = archived_items},
     {id = 'new_thread', type = 'form', label = 'New thread', fields = fields,
-      submit_action = {name = 'submit', label = 'Create thread', enabled = true}},
+      submit_action = {name = 'submit', label = 'Create thread', enabled = true, tool = 'messaging.thread_create'}},
   }}
 end
 
@@ -1183,11 +1184,12 @@ local function render_thread(user, route)
     title = thread_title(user, peer),
     back = nil, -- the Rex sidebar lists the threads; no Back control
     nodes = {
-      {id = 'thread_menu', type = 'menu', label = 'Thread…', action = {name = 'open', enabled = true}},
+      {id = 'thread_menu', type = 'menu', label = 'Thread…', action = {name = 'open', enabled = true, user_only = 'navigation'}},
       -- has_more: older messages exist. The transcript pane fetches them with view.history.
       {id = 'history', type = 'history', messages = messages, has_more = has_more, page_size = #messages},
       {id = 'composer', type = 'composer', label = 'Message', text = text, draft_revision = draft_rev,
-        save_action = {name = 'save', label = 'Save', enabled = true}, send_action = {name = 'send', label = 'Send', enabled = true}},
+        save_action = {name = 'save', label = 'Save', enabled = true, user_only = 'draft is UI state'},
+        send_action = {name = 'send', label = 'Send', enabled = true, tool = 'messaging.send'}},
     },
   }
   if peer.readonly then
@@ -1231,12 +1233,12 @@ local function render_gallery()
     title = 'Gallery', back = nil,
     nodes = {
       {id = 'intro', type = 'widget', text = 'Live control gallery. Every control here runs the real renderer: hover, click, scroll and type. Nothing here changes your threads.',
-        action = {name = 'open', label = 'Reset gallery', enabled = true}},
+        action = {name = 'open', label = 'Reset gallery', enabled = true, user_only = 'sample view'}},
       {id = 'last', type = 'widget', text = 'Last action: ' .. (state.last or 'none yet')},
       {id = 'sample_list', type = 'list', label = 'List', items = {
-        {id = 'a', label = 'Design review', detail = '2 unread messages', action = {name = 'open', label = 'Open', enabled = true}},
-        {id = 'b', label = 'Release notes', detail = 'No unread messages', action = {name = 'open', label = 'Open', enabled = true}},
-        {id = 'c', label = 'Archived thread', detail = 'Disabled item', action = {name = 'open', label = 'Open', enabled = false}},
+        {id = 'a', label = 'Design review', detail = '2 unread messages', action = {name = 'open', label = 'Open', enabled = true, user_only = 'sample view'}},
+        {id = 'b', label = 'Release notes', detail = 'No unread messages', action = {name = 'open', label = 'Open', enabled = true, user_only = 'sample view'}},
+        {id = 'c', label = 'Archived thread', detail = 'Disabled item', action = {name = 'open', label = 'Open', enabled = false, user_only = 'sample view'}},
       }},
       {id = 'sample_form', type = 'form', label = 'Form', fields = {
         {id = 'name', label = 'Text field', kind = 'text', value = '', required = false},
@@ -1245,11 +1247,12 @@ local function render_gallery()
         {id = 'opt_b', label = 'Checkbox, on', kind = 'boolean', value = true, required = false},
         {id = 'size', label = 'Select', kind = 'select', value = 'medium', required = false, options = {
           {value = 'small', label = 'Small'}, {value = 'medium', label = 'Medium'}, {value = 'large', label = 'Large'}}},
-      }, submit_action = {name = 'submit', label = 'Apply', enabled = true}},
+      }, submit_action = {name = 'submit', label = 'Apply', enabled = true, user_only = 'sample view'}},
       {id = 'history', type = 'history', messages = messages, has_more = false, page_size = page_size,
         load_action = {name = 'load', label = 'Older messages', enabled = false}},
       {id = 'composer', type = 'composer', label = 'Message', text = text, draft_revision = draft_rev,
-        save_action = {name = 'save', label = 'Save', enabled = true}, send_action = {name = 'send', label = 'Send', enabled = true}},
+        save_action = {name = 'save', label = 'Save', enabled = true, user_only = 'sample view'},
+        send_action = {name = 'send', label = 'Send', enabled = true, user_only = 'sample view'}},
     },
   }
 end
@@ -1361,7 +1364,7 @@ local function agent_items(user, peer)
     items[#items + 1] = {id = id, label = display_name(a),
       icon = not open and '◌' or (activity == 'working' and '●' or '○'),
       status = open and activity or 'no tab',
-      action = {name = 'agent', label = 'Open tab', enabled = open}}
+      action = {name = 'agent', label = 'Open tab', enabled = open, user_only = 'navigation'}}
   end
   return items
 end
@@ -1434,13 +1437,13 @@ local function render_form(args)
     local agents = agent_items(args.user, peer)
     local summary = (#agents == 1 and '1 agent' or #agents .. ' agents') .. ' · ' .. #ids .. (#ids == 1 and ' message' or ' messages')
     local actions = {
-      {id = 'rename', label = 'Rename…', icon = '✎', action = {name = 'rename', enabled = true}},
-      {id = 'move', label = 'Move to session…', icon = '⇄', action = {name = 'move', enabled = true}},
-      {id = 'archive', label = 'Archive', icon = '▤', action = {name = 'archive', enabled = true}},
+      {id = 'rename', label = 'Rename…', icon = '✎', action = {name = 'rename', enabled = true, user_only = 'navigation'}},
+      {id = 'move', label = 'Move to session…', icon = '⇄', action = {name = 'move', enabled = true, user_only = 'navigation'}},
+      {id = 'archive', label = 'Archive', icon = '▤', action = {name = 'archive', enabled = true, tool = 'messaging.thread_archive'}},
     }
     -- The team and observed threads have no member list to change, so they show no Members… row.
     if not peer.observer and builtin[peer.id] == nil then
-      table.insert(actions, 2, {id = 'members', label = 'Members…', icon = '+', action = {name = 'members', enabled = true}})
+      table.insert(actions, 2, {id = 'members', label = 'Members…', icon = '+', action = {name = 'members', enabled = true, user_only = 'navigation'}})
     end
     local nodes = {{id = 'summary', type = 'widget', text = summary}}
     if #agents > 0 then nodes[#nodes + 1] = {id = 'agents', type = 'list', label = 'Agents', items = agents} end
@@ -1453,7 +1456,7 @@ local function render_form(args)
     fields[#fields + 1] = {id = 'title', label = 'Title (optional)', kind = 'text', value = ''}
     for _, field in ipairs(participant_fields(args.user, context.session_id, {})) do fields[#fields + 1] = field end
     return {title = 'New thread', nodes = {
-      {id = 'new_thread', type = 'form', fields = fields, submit_action = {name = 'submit', label = 'Create thread', enabled = true}},
+      {id = 'new_thread', type = 'form', fields = fields, submit_action = {name = 'submit', label = 'Create thread', enabled = true, tool = 'messaging.thread_create'}},
       cancel_node(),
     }}
   end
@@ -1824,8 +1827,8 @@ actions[#actions + 1] = {name = 'hub.forward', kind = 'client', title = 'Forward
     required = {'action', 'args', 'requester_pid'}, additionalProperties = false}}
 rex.call('client.keymap', {actions = actions})
 local registration = hub('hub.register', {plugin = 'messaging', instance_id = instance_id, exports = exports,
-  commands = {{id = 'new_thread', title = 'New Thread…', description = 'Start a conversation with agents', keywords = {'message', 'conversation'}, route = '/forms/new-thread'},
-    {id = 'threads', title = 'Threads…', description = 'List all threads, with this session first', keywords = {'message', 'conversation'}, surface = 'panel', landing = true, route = '/panels/threads'}}})
+  commands = {{id = 'new_thread', title = 'New Thread…', description = 'Start a conversation with agents', keywords = {'message', 'conversation'}, route = '/forms/new-thread', action = 'messaging.thread_create'},
+    {id = 'threads', title = 'Threads…', description = 'List all threads, with this session first', keywords = {'message', 'conversation'}, surface = 'panel', landing = true, route = '/panels/threads', user_only = 'navigation'}}})
 if type(registration.generation) ~= 'string' then fail('internal', 'Missing hub generation') end
 -- Spike 3 has one UI user. Each conversation has one tab.
 local ui_user = 'user'

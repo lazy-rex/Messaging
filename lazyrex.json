@@ -1,0 +1,27 @@
+{
+ "name": "messaging",
+ "main": "messaging.lua",
+ "test": {
+  "agents": [
+   {
+    "id": "alice",
+    "name": "Alice"
+   },
+   {
+    "id": "bob",
+    "name": "Bob"
+   },
+   {
+    "id": "charlie",
+    "name": "Charlie"
+   }
+  ],
+  "parity_fixture": "tests/parity_fixture.lua",
+  "parity_routes": [
+   "/forms/thread-menu",
+   "/forms/thread-rename",
+   "/forms/thread-move",
+   "/forms/thread-members"
+  ]
+ }
+}
