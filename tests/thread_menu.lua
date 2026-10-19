@@ -1,0 +1,90 @@
+-- The thread menu actions on both paths: the agent tool (messaging.thread_rename, _members, _move,
+-- through the agent face) and the UI form submit (the hub view path). Both call one handler.
+
+local function part(s) return #s .. ':' .. s end
+
+local function thread_of(list, id)
+  for _, t in ipairs(list.threads) do if t.id == id then return t end end
+end
+
+-- form opens a thread menu form from the user's thread view and returns the form view.
+local function form(thread_id, item)
+  local v = user:open('thread/' .. thread_id)
+  v:render()
+  local op = v:action('thread_menu', 'open', {})
+  expect(op.effects, 'thread menu').to_be('done')
+  local menu = user:view('/forms/thread-menu')
+  menu:render()
+  op = menu:action('thread_menu', item, {item_id = item})
+  expect(op.effects, item .. ' form').to_be('done')
+  local f = user:view('/forms/thread-' .. item)
+  f:render()
+  return f
+end
+
+local group
+local function the_group()
+  if not group then
+    group = agent('alice'):call('messaging.thread_create', {key = 'menu-group', title = 'Menu group', members = {'bob', 'user'}})
+  end
+  return group
+end
+
+test('rename as a tool sets the caller\'s title only', function()
+  local alice, bob = agent('alice'), agent('bob')
+  local g = the_group()
+  expect(alice:call('messaging.thread_rename', {thread = g.id, title = 'Alice title', key = 'r1'})).to_equal({title = 'Alice title'})
+  expect(thread_of(alice:call('messaging.thread_list', {}), g.id).title).to_be('Alice title')
+  expect(thread_of(bob:call('messaging.thread_list', {}), g.id).title).to_be('Menu group')
+  -- A replay returns the first result; the same key with another title is a conflict.
+  expect(alice:call('messaging.thread_rename', {thread = g.id, title = 'Alice title', key = 'r1'})).to_equal({title = 'Alice title'})
+  expect_error(function() alice:call('messaging.thread_rename', {thread = g.id, title = 'Other', key = 'r1'}) end, 'operation_conflict')
+  expect_error(function() alice:call('messaging.thread_rename', {thread = g.id, title = '  ', key = 'r2'}) end, 'empty')
+end)
+
+test('rename in the UI form uses the same record', function()
+  local g = the_group()
+  local op = form(g.id, 'rename'):action('rename_thread', 'submit', {values = {title = 'User title'}})
+  expect(op.status).to_be('succeeded')
+  expect(store('thread-title/' .. part('user') .. part(g.id)).value).to_equal({title = 'User title'})
+  expect(tab('thread/' .. g.id).title).to_match('^User title')
+end)
+
+test('members as a tool: a member adds a participant; others and the team are refused', function()
+  local alice, charlie = agent('alice'), agent('charlie')
+  local g = the_group()
+  local r = alice:call('messaging.thread_members', {thread = g.id, members = {'bob', 'user', 'charlie'}, key = 'm1'})
+  expect(r.id).to_be(g.id)
+  expect(r.members).to_equal({'alice', 'bob', 'charlie', 'user'})
+  -- charlie got the member notice and can now read the thread.
+  local mail = charlie:call('messaging.read', {thread = g.id})
+  expect(mail.messages[1].body).to_match('You were added')
+  expect_error(function() alice:call('messaging.thread_members', {thread = 'team', members = {'bob'}, key = 'm2'}) end, 'dynamic membership')
+  local outsider = agent('bob')
+  local other = alice:call('messaging.thread_create', {key = 'menu-private', title = 'Private', members = {'charlie', 'user'}})
+  expect_error(function() outsider:call('messaging.thread_members', {thread = other.id, members = {'alice', 'charlie'}, key = 'm3'}) end, 'Unknown thread')
+  expect_error(function() outsider:call('messaging.thread_rename', {thread = other.id, title = 'Mine', key = 'm4'}) end, 'Unknown thread')
+  expect_error(function() outsider:call('messaging.thread_move', {thread = other.id, session_id = session('Outsider'), key = 'm5'}) end, 'Unknown thread')
+end)
+
+test('members in the UI form uses the same handler', function()
+  local g = the_group()
+  local op = form(g.id, 'members'):action('thread_members', 'submit', {values = {member_alice = true, member_bob = true}})
+  expect(op.status).to_be('succeeded')
+  local groups = store('groups').value.groups
+  expect(groups[g.id].members).to_equal({'alice', 'bob', 'user'})
+end)
+
+test('move as a tool sets the thread home; the UI form does the same', function()
+  local alice = agent('alice')
+  local g = the_group()
+  local s1 = session('Move one')
+  expect(alice:call('messaging.thread_move', {thread = g.id, session_id = s1, key = 'mv1'})).to_equal({id = g.id, moved = true})
+  local home = 'thread-meta/' .. part('') .. part(g.id)
+  expect(store(home).value.home_session).to_be(s1)
+  expect_error(function() alice:call('messaging.thread_move', {thread = g.id, session_id = 'session:closed', key = 'mv2'}) end, 'closed')
+  local s2 = session('Move two')
+  local op = form(g.id, 'move'):action('move_thread', 'submit', {values = {session_id = s2, session_name = ''}})
+  expect(op.status).to_be('succeeded')
+  expect(store(home).value.home_session).to_be(s2)
+end)

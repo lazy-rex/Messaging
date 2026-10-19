@@ -85,7 +85,7 @@ try {
       let result;
       if (ev.action === 'hub.register') {
         assert.equal(ev.args.instance_id,'plugin-test');
-        assert.deepEqual(ev.args.exports,process.env.BASELINE ? ['messaging.send','messaging.read','messaging.ack'] : ['messaging.send','messaging.read','messaging.ack','messaging.thread_list','messaging.thread_create','messaging.history','messaging.thread_archive']);
+        assert.deepEqual(ev.args.exports,process.env.BASELINE ? ['messaging.send','messaging.read','messaging.ack'] : ['messaging.send','messaging.read','messaging.ack','messaging.thread_list','messaging.thread_create','messaging.history','messaging.thread_archive','messaging.thread_rename','messaging.thread_members','messaging.thread_move']);
         assert.equal(ev.args.actions,undefined);
         pluginId = ev.requester.client_id;
         result = {namespace:'messaging',generation:'1'};

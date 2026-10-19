@@ -1407,15 +1407,16 @@ local function chosen_session(values)
   return {session_id = values.session_id}
 end
 
-local function move_thread(user, peer, input, operation_key, context)
+-- move_thread sets the user's home session of a thread. intent is {session_id} or {new_session}
+-- (or empty: the source session). The form submit and messaging.thread_move both call it.
+local function move_thread(user, peer, intent, operation_key, source_session)
   if type(operation_key) ~= 'string' or operation_key == '' then fail('invalid_input', 'An operation key is required') end
-  local values = type(input) == 'table' and type(input.values) == 'table' and input.values or {}
-  local kind, value = session_intent(chosen_session(values))
+  local kind, value = session_intent(intent)
   local fingerprint = 'thread-move-v1/' .. part(peer.id) .. part(kind) .. part(value)
   local saved = prior_operation('thread-move/', user, operation_key)
   if saved.found then return operation_result(saved, fingerprint) end
   local op_key = 'thread-move/' .. part(user) .. part(operation_key)
-  local session = resolve_session(kind, value, context.session_id, op_key)
+  local session = resolve_session(kind, value, source_session, op_key)
   local result = {navigate = 'thread/' .. peer.id}
   for _ = 1, attempts do
     local _, home_key, rev = thread_home(user, peer.id)
@@ -1463,14 +1464,14 @@ local function render_form(args)
   local peer = form_peer(args)
   if args.route == '/forms/thread-move' then
     return {title = 'Move to session', menu = true, nodes = {
-      {id = 'move_thread', type = 'form', fields = session_fields(context.session_id), submit_action = {name = 'submit', label = 'Move thread', enabled = true}},
+      {id = 'move_thread', type = 'form', fields = session_fields(context.session_id), submit_action = {name = 'submit', label = 'Move thread', enabled = true, tool = 'messaging.thread_move'}},
       cancel_node(),
     }}
   end
   if args.route == '/forms/thread-rename' then
     return {title = 'Rename thread', menu = true, nodes = {
       {id = 'rename_thread', type = 'form', fields = {{id = 'title', label = 'Title', kind = 'text', value = thread_title(args.user, peer), required = true}},
-        submit_action = {name = 'submit', label = 'Save title', enabled = true}},
+        submit_action = {name = 'submit', label = 'Save title', enabled = true, tool = 'messaging.thread_rename'}},
       cancel_node(),
     }}
   end
@@ -1481,7 +1482,7 @@ local function render_form(args)
     else selected[peer.id] = true end
     return {title = 'Thread members', menu = true, nodes = {
       {id = 'thread_members', type = 'form', fields = participant_fields(args.user, context.session_id, selected),
-        submit_action = {name = 'submit', label = 'Save members', enabled = true}},
+        submit_action = {name = 'submit', label = 'Save members', enabled = true, tool = 'messaging.thread_members'}},
       {id = 'membership_help', type = 'widget', text = 'New members can read full history in pages. Old messages do not become unread. Adding members to a direct thread creates a new group.'},
       cancel_node(),
     }}
@@ -1549,6 +1550,37 @@ local function view_rename(args)
   fail('conflict', 'Thread title changed; retry the rename')
 end
 
+-- Agent actions of the thread menu forms (agent parity). Each calls the handler of its form
+-- submit, with the same rules: the caller must see the thread; only a member changes a group's
+-- members; the team group's members are fixed.
+local function thread_arg(agent, args)
+  if type(args.thread) ~= 'string' or args.thread == '' then fail('invalid_input', 'thread is required') end
+  if type(args.key) ~= 'string' or args.key == '' then fail('invalid_input', 'key is required') end
+  return thread_peer('/thread/' .. args.thread, agent)
+end
+
+local function thread_rename(agent, args)
+  local peer = thread_arg(agent, args)
+  return view_rename({user = agent, route = '/thread/' .. peer.id, title = args.title, operation_key = args.key})
+end
+
+local function thread_members(agent, args, source_session)
+  local peer = thread_arg(agent, args)
+  if type(args.members) ~= 'table' then fail('invalid_input', 'members must be an array') end
+  local values = {}
+  for _, id in ipairs(args.members) do
+    if type(id) ~= 'string' or id == '' then fail('invalid_input', 'members must be agent IDs') end
+    values['member_' .. id] = true
+  end
+  return change_members(agent, peer, {values = values}, args.key, {session_id = source_session})
+end
+
+local function thread_move(agent, args, source_session)
+  local peer = thread_arg(agent, args)
+  move_thread(agent, peer, {session_id = args.session_id, new_session = args.new_session}, args.key, source_session)
+  return {id = peer.id, moved = true}
+end
+
 -- The UI uses the same creation operation as agent tools.
 local function create_thread(user, input, operation_key, context)
   local values = type(input) == 'table' and type(input.values) == 'table' and input.values or {}
@@ -1573,7 +1605,8 @@ local function view_action(args)
   if args.route == '/forms/thread-move' then
     local peer = form_peer(args)
     if args.node_id ~= 'move_thread' or args.action ~= 'submit' then fail('invalid_input', 'Unknown form action') end
-    return move_thread(args.user, peer, args.input, args.operation_key, args.context)
+    local values = type(args.input) == 'table' and type(args.input.values) == 'table' and args.input.values or {}
+    return move_thread(args.user, peer, chosen_session(values), args.operation_key, args.context and args.context.session_id)
   end
   if args.route == '/forms/thread-members' then
     local peer = form_peer(args)
@@ -1790,6 +1823,18 @@ local actions = {
   {name = 'messaging.thread_archive', kind = 'client', title = 'Archive or restore a thread',
     description = 'Archive a thread for yourself without deleting history or drafts or changing delivery. Set archived=false to restore. Choose a key and retry with the same content after an unknown outcome.',
     args = {type = 'object', properties = {thread = {type = 'string', minLength = 1}, archived = {type = 'boolean'}, key = {type = 'string', minLength = 1}},
+      required = {'thread', 'key'}, additionalProperties = false}},
+  {name = 'messaging.thread_rename', kind = 'client', title = 'Rename a thread',
+    description = 'Set your title of a thread. Other participants keep their own titles. Choose a key and retry with the same content after an unknown outcome.',
+    args = {type = 'object', properties = {thread = {type = 'string', minLength = 1}, title = {type = 'string', minLength = 1}, key = {type = 'string', minLength = 1}},
+      required = {'thread', 'title', 'key'}, additionalProperties = false}},
+  {name = 'messaging.thread_members', kind = 'client', title = 'Change thread members',
+    description = 'Set the members of a group thread that you are in (you stay a member). New members can read full history; old messages do not become unread for them. For a direct thread, a larger selection creates a new group and returns its id. The team group cannot change. Choose a key and retry with the same content after an unknown outcome.',
+    args = {type = 'object', properties = {thread = {type = 'string', minLength = 1}, members = {type = 'array', items = {type = 'string', minLength = 1}}, key = {type = 'string', minLength = 1}},
+      required = {'thread', 'members', 'key'}, additionalProperties = false}},
+  {name = 'messaging.thread_move', kind = 'client', title = 'Move a thread to a session',
+    description = 'Set the Rex session where the thread opens for you. Set session_id for an open session or new_session for a new name; with neither, your current session. Choose a key and retry with the same content after an unknown outcome.',
+    args = {type = 'object', properties = {thread = {type = 'string', minLength = 1}, session_id = {type = 'string', minLength = 1}, new_session = {type = 'string', minLength = 1}, key = {type = 'string', minLength = 1}},
       required = {'thread', 'key'}, additionalProperties = false}}
 }
 local exports = {}
@@ -1866,11 +1911,15 @@ rex.on('client_perform_requested', function(ctx, ev)
     if ev.action == 'messaging.thread_list' then return thread_list(agent, args) end
     if ev.action == 'messaging.thread_create' then return thread_create(agent, args, source_session) end
     if ev.action == 'messaging.thread_archive' then return thread_archive(agent, args) end
+    if ev.action == 'messaging.thread_rename' then return thread_rename(agent, args) end
+    if ev.action == 'messaging.thread_members' then return thread_members(agent, args, source_session) end
+    if ev.action == 'messaging.thread_move' then return thread_move(agent, args, source_session) end
     if ev.action == 'messaging.ack' then return ack(agent, args) end
     fail('not_supported', 'Unknown messaging action')
   end)
   if ok and (ev.action == 'messaging.send' or ev.action == 'messaging.ack'
     or ev.action == 'messaging.thread_create' or ev.action == 'messaging.thread_archive'
+    or ev.action == 'messaging.thread_rename' or ev.action == 'messaging.thread_members' or ev.action == 'messaging.thread_move'
     or ev.action == 'view.rename' or ev.action == 'view.action' or ev.action == 'view.send' or ev.action == 'view.seen') then
     local tabs_ok, tabs_error = pcall(declare_tabs, ui_user)
     if not tabs_ok then ok = false; result = tabs_error end
