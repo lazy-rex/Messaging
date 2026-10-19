@@ -125,14 +125,25 @@ test('several long message IDs: requests are packed by size, and every message a
   expect(pages >= 2, 'four 13 KB IDs need more than one page').to_be(true)
 end)
 
-test('a key too long for one hub request is key_too_large, not a skip', function()
-  local id = 'legacy/' .. string.rep('k', 50000)
-  local mb = store(box('bob'))
+-- add_unread puts an ID in a reader's mailbox (only the mailbox: no message record).
+local function add_unread(reader, id)
+  local mb = store(box(reader))
   local unread = mb.value and mb.value.ids or {}
   unread[id] = true
-  write({{key = box('bob'), value = {ids = unread}}})
+  write({{key = box(reader), value = {ids = unread}}})
+end
+
+test('a 50 KB key is larger than the batch target but still reaches the store', function()
+  local id = 'legacy/' .. string.rep('k', 50000)
+  add_unread('bob', id)
   local ok, e = pcall(bob.call, bob, 'messaging.read', {})
   expect(ok).to_be(false)
-  expect(e.code).to_be('key_too_large')
-  expect(#(e.message or '') < 400, 'the error is bounded').to_be(true)
+  -- The store answered: the record is missing, so the mailbox reference is invalid.
+  expect(e.code).to_be('internal')
+  expect(e.message).to_match('Mailbox references an invalid message')
+  write({{key = box('bob'), value = {ids = {}}}})
 end)
+
+-- key_too_large (a key whose own hub.store.get request is over 64512 bytes) is not tested: the
+-- record that holds the ID (a mailbox or a thread) is written in one request with more overhead
+-- than that get, so no Lua writer, including this runner, can store such an ID.

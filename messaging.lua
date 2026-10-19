@@ -421,8 +421,9 @@ end
 local builtin = {team = {name = 'Team'}}
 
 -- message_records reads records in batches: at most 8 keys and request_budget bytes of keys in
--- one request. A batch whose reply is over the hub limit is read one key at a time. Other errors
--- keep their code. A key that does not fit one request is a definite size error.
+-- one request (a target, not a limit: a larger key goes alone). A batch whose reply is over the
+-- hub limit is read one key at a time. Other errors keep their code. A key whose request does not
+-- fit request_limit, measured as hub() measures it, is a definite size error.
 local function message_records(keys)
   local out = {}
   local function read_batch(batch)
@@ -438,8 +439,11 @@ local function message_records(keys)
   local batch, size = {}, 2
   for _, k in ipairs(keys) do
     local cost = encoded_size(k) + 1
-    if cost + 2 > request_budget then fail('key_too_large', 'Key ' .. preview(k) .. ' does not fit one hub request') end
-    if #batch == 8 or size + cost > request_budget then
+    if cost + 2 > request_budget
+      and encoded_size({client_id = hub_id, action = 'hub.store.get', args = {keys = {k}}, timeout_ms = 10000}) > request_limit then
+      fail('key_too_large', 'Key ' .. preview(k) .. ' does not fit one hub request')
+    end
+    if #batch > 0 and (#batch == 8 or size + cost > request_budget) then
       read_batch(batch)
       batch, size = {}, 2
     end

@@ -31,9 +31,10 @@ The plugin keeps every reply and request inside that limit:
   is `invalid_input` with its size, and nothing of it is committed. The body limit is fixed; whether
   a whole batch fits depends on the current mailbox, thread and groups records (index growth is a
   separate open item, F in the LazyRex roadmap).
-- **Reads from the hub** take at most 8 keys and 49152 encoded bytes of keys in one request. A batch
-  whose reply is over the hub's limit (`reply_too_large`) is read one key at a time. One record over
-  the hub limit is `record_too_large`; one key over a request is `key_too_large`.
+- **Reads from the hub** take at most 8 keys and, as a target, 49152 encoded bytes of keys in one
+  request; a larger key goes alone. A batch whose reply is over the hub's limit (`reply_too_large`)
+  is read one key at a time. One record over the hub limit is `record_too_large`; a key whose own
+  request does not fit (64 KiB minus 1 KiB) is `key_too_large`.
 - **Stored messages from before these limits**: a body that does not fit a page arrives as a UTF-8
   safe prefix with `truncated` and `body_bytes`. Metadata that does not fit gives a marker
   `{cursor, id, metadata_too_large, bytes}`, or `id_prefix` and `id_bytes` when the ID does not fit
