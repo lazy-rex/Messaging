@@ -182,3 +182,19 @@ test('a membership change whose notice cannot fit is refused, and nothing is wri
   expect(store('groups'), 'membership is unchanged').to_equal(before)
   expect(store(box('charlie')), 'no notice was delivered').to_equal(box_before)
 end)
+
+test('a send to a legacy group with a long ID is refused by the page rule, before any batch', function()
+  -- admit runs before the batch is built: the read and history pages of this message would hold the
+  -- group ID twice (to, and the history thread), over 49152 bytes even with a one-byte body.
+  local gid = 'g-' .. string.rep('p', 25000)
+  local groups = store('groups').value.groups
+  groups[gid] = {name = 'Long legacy group', members = {'alice', 'bob'}}
+  write({{key = 'groups', value = {groups = groups}}})
+  local writes = batches()
+  local ok, e = pcall(alice.call, alice, 'messaging.send', {to = gid, body = 'x', key = 'page-rule'})
+  expect(ok).to_be(false)
+  expect(e.code).to_be('invalid_input')
+  expect(e.message).to_match('The message does not fit one read page: %d+ bytes encoded, limit 49152')
+  expect(batches(), 'no batch was sent').to_be(writes)
+  expect(store('message/send/' .. part('alice') .. part('page-rule')).rev).to_be('0')
+end)
