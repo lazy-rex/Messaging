@@ -175,3 +175,24 @@ test('revisions beyond the exact float range still order arrivals', function()
   expect(got).to_equal({last.id})
   expect_error(function() bob:call('messaging.read', {since = '1e3'}) end, 'since')
 end)
+
+-- A hub error keeps its code (messaging.lua hub_error). A definite failure ends a view send; only a
+-- transient code (unavailable, disconnected, timeout, or no code) is retried by the hub.
+test('a definite hub failure ends a view send; a transient one is retried', function()
+  alice:call('messaging.send', {to = 'user', body = 'Code check', key = 'code-hello'})
+  local v = user:open('thread/alice')
+  v:render()
+  local function send_with(key, spec)
+    local saved = v:draft('composer', 'Code check ' .. key, H.node(v:render(), 'composer').draft_revision or '0', key .. '-draft')
+    expect(saved.status, 'draft ' .. key).to_be('succeeded')
+    spec.match = {op_key = 'send/' .. part('user') .. part(key)}
+    local op
+    with_injection(spec, 1, function() op = v:send('composer', 'Code check ' .. key, saved.result.draft_revision, key) end)
+    return op
+  end
+  local definite = send_with('code-definite', {fail = 'Definite refusal'})
+  expect(definite.status, 'a definite code is not retried').to_be('failed')
+  expect(definite.error.message).to_match('Definite refusal')
+  local transient = send_with('code-transient', {fail = 'Transient failure', fail_code = 'unavailable'})
+  expect(transient.status, 'the hub retried a transient code').to_be('succeeded')
+end)

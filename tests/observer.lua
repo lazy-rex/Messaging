@@ -87,7 +87,7 @@ test('the first message joins the group atomically, retries a concurrent rename,
   local join_key = 'send/' .. part('user') .. part('join-group')
   -- Atomic join: a failed commit leaves neither the membership nor the message. The hub retries
   -- the operation (the outcome was unknown); three failures, then a concurrent rename.
-  local failing = inject({match = {op_key = join_key}, fail = 'Injected join failure', times = 3})
+  local failing = inject({match = {op_key = join_key}, fail = 'Injected join failure', fail_code = 'unavailable', times = 3})
   local renaming = inject({match = {op_key = join_key}, ops = {{key = 'groups', value = groups}}})
   local _, k = v:admit('send', {node_id = 'composer', text = 'Joining the discussion', draft_revision = saved.result.draft_revision, operation_key = 'join-group'})
   wait('a failed join commit', function() if injection(failing).consumed >= 1 then return true end end)

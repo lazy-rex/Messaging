@@ -7,14 +7,32 @@ local function fail(code, message)
   error({code = code, message = message})
 end
 
+-- A hub error keeps its code. Only an error without a code, or with a transient code, becomes
+-- 'unavailable' (retryable): a definite refusal must end an operation, not repeat it.
+local transient = {unavailable = true, disconnected = true, timeout = true}
+
+-- hub_error turns a Rex perform error into {code, message}. Rex Lua gives it as text that ends in
+-- "(status=<n> code=<code>)" (LazyRex docs/rex-protocol.md).
+local function hub_error(call_error)
+  local code, message
+  if type(call_error) == 'table' then
+    code, message = call_error.code, call_error.message
+  else
+    local text = tostring(call_error or 'Hub request failed')
+    code = text:match('code=([%w_%-%.]+)%)%s*$')
+    message = text:match('failed: (.*) %(status=%d+ code=[^)]*%)%s*$') or text
+    -- A hub error message keeps its own "code: " prefix; drop it when it repeats the code.
+    if code and message:sub(1, #code + 2) == code .. ': ' then message = message:sub(#code + 3) end
+  end
+  if not code or transient[code] then code = 'unavailable' end
+  return code, message or 'Hub request failed'
+end
+
 local function hub(action, args)
   local response, call_error = rex.call('client.perform', {
     client_id = hub_id, action = action, args = args, timeout_ms = 10000
   })
-  if not response then
-    if type(call_error) == 'table' then fail(call_error.code or 'unavailable', call_error.message or 'Hub request failed') end
-    fail('unavailable', tostring(call_error or 'Hub request failed'))
-  end
+  if not response then fail(hub_error(call_error)) end
   if type(response.result) ~= 'table' then fail('internal', 'Invalid hub result') end
   return response.result
 end
@@ -88,10 +106,9 @@ local function resolve_recipient(id)
   local ok, result = pcall(hub, 'hub.agents.resolve', {to = id})
   if ok then return result.id end
   -- The hub refuses a name that matches no agent, or more than one. A retry cannot change that, so
-  -- it is invalid input, not 'unavailable'. The hub error arrives as text that ends in its code.
-  local message = type(result) == 'table' and tostring(result.message) or tostring(result)
-  if message:find('code=refused)', 1, true) then
-    fail('invalid_input', 'Unknown recipient: ' .. tostring(id) .. ' (' .. (message:match('failed: ([^%(]+) %(status=') or message) .. ')')
+  -- it is invalid input, not 'unavailable'.
+  if type(result) == 'table' and result.code == 'refused' then
+    fail('invalid_input', 'Unknown recipient: ' .. tostring(id) .. ' (' .. tostring(result.message) .. ')')
   end
   error(result, 0)
 end
