@@ -205,3 +205,21 @@ test('a group made by direct expansion takes the form session and an empty token
   expect(home_tab(id).session_id, 'the new group lives in the form session').to_be(v.session)
   expect(home_tab(id).revision, 'an empty group has a stable empty token').to_be('')
 end)
+
+test('a replay after the conversation resumed in another session keeps the first home', function()
+  -- A pane cannot move to another session (rex-protocol.md). A conversation can: it resumes in a
+  -- new pane, and the hub moves the identity there. Its source session changes.
+  local first = agent('roam', {join = false, session = elsewhere})
+  first:report({kind = 'claude', conversation_id = 'roam'})
+  local args = {members = {'alice', 'user'}, title = 'Roaming default', key = 'roam-home-default'}
+  local made = first:call('messaging.thread_create', args)
+  expect(home_tab(made.id).session_id).to_be(elsewhere)
+  local resumed = agent('roam-resumed', {join = false})
+  resumed:report({kind = 'claude', conversation_id = 'roam', source = 'resume'})
+  expect(resumed:call('messaging.thread_list', {}).threads[1] ~= nil, 'the identity moved to the new pane').to_be(true)
+  expect(resumed:call('messaging.thread_create', args), 'the replay returns the original result').to_equal(made)
+  expect(home_tab(made.id).session_id, 'the original home stays').to_be(elsewhere)
+  local fresh = resumed:call('messaging.thread_create', {members = {'bob', 'user'}, title = 'After resume', key = 'roam-after'})
+  expect(home_tab(fresh.id).session_id, 'the source session changed with the pane').to_be(here)
+  expect_error(function() resumed:call('messaging.thread_create', {members = {'alice', 'user'}, title = 'Roaming default', key = 'roam-home-default', session_id = here}) end, 'different content')
+end)

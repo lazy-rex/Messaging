@@ -84,10 +84,24 @@ test('the first message joins the group atomically, retries a concurrent rename,
   local user_box = store('mailbox/' .. part('user'))
   local groups = store('groups').value
   groups.groups[group.id].name = 'Agent discussion after concurrent rename'
-  with_injection({match = {op_key = 'send/' .. part('user') .. part('join-group')}, ops = {{key = 'groups', value = groups}}}, 1, function()
-    joined = v:send('composer', 'Joining the discussion', saved.result.draft_revision, 'join-group')
-  end)
+  local join_key = 'send/' .. part('user') .. part('join-group')
+  -- Atomic join: a failed commit leaves neither the membership nor the message. The hub retries
+  -- the operation (the outcome was unknown); three failures, then a concurrent rename.
+  local failing = inject({match = {op_key = join_key}, fail = 'Injected join failure', times = 3})
+  local renaming = inject({match = {op_key = join_key}, ops = {{key = 'groups', value = groups}}})
+  local _, k = v:admit('send', {node_id = 'composer', text = 'Joining the discussion', draft_revision = saved.result.draft_revision, operation_key = 'join-group'})
+  wait('a failed join commit', function() if injection(failing).consumed >= 1 then return true end end)
+  expect(operation(k).status, 'the join is still pending').to_be('pending')
+  for _, m in ipairs(store('groups').value.groups[group.id].members) do expect(m, 'a failed join commits no membership').not_to_be('user') end
+  expect(store('message/' .. join_key).rev, 'and no message').to_be('0')
+  joined = v:settle(k)
+  expect(injection(failing).consumed).to_be(3)
+  expect(injection(renaming).consumed, 'the join retried a concurrent group rename').to_be(1)
   expect(joined.status).to_be('succeeded')
+  local writes = batches()
+  local again = v:send('composer', 'Joining the discussion', saved.result.draft_revision, 'join-group')
+  expect(again.result, 'joining and sending are idempotent').to_equal(joined.result)
+  expect(batches(), 'the repeat writes nothing').to_be(writes)
   local n = 0
   for _, m in ipairs(store('groups').value.groups[group.id].members) do if m == 'user' then n = n + 1 end end
   expect(n).to_be(1)

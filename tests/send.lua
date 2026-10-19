@@ -94,6 +94,10 @@ test('the retry budget is bounded and saves no operation', function()
   end)
   expect(batches() - before).to_be(4)
   expect(store('message/send/' .. part('alice') .. part('conflict-always')).rev).to_be('0')
+  -- No operation was saved: the same key commits now, with a new message.
+  local later = alice:call('messaging.send', {key = 'conflict-always', body = 'hello', to = 'bob'})
+  expect(later.id).to_be('send/' .. part('alice') .. part('conflict-always'))
+  expect(store('message/' .. later.id).value.body).to_be('hello')
 end)
 
 test('a batch that another invocation already committed returns the saved result', function()

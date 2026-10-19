@@ -62,6 +62,7 @@ test('migration moves mailboxes, groups, drafts, archives and homes to the ident
   expect(store('draft/' .. part('user') .. part(alice_id)).value.text).to_be('keep the legacy draft')
   expect(store('thread-open/' .. part('user') .. part(alice_id)).value.opened, 'migration keeps the explicit open intent').to_be(true)
   expect(store('thread-archive/' .. part('user')).value.ids[alice_id]).to_be(true)
+  expect(notice('bob').pending, 'the legacy notice is cleared').to_be(false)
   expect(notice(bob_id).pending).to_be(true)
   bob:call('messaging.ack', {ids = {retry_result.id}})
   expect(has_id(bob:call('messaging.read', {}).messages, retry_result.id)).to_be(false)
@@ -169,6 +170,13 @@ test('an unnamed identity shows a short ID; declared titles are never empty', fu
     end, 5)
     expect(ok.title).to_match('^codex:conversa')
     for _, t in ipairs(tabs()) do expect(t.title:match('%S'), 'tab ' .. t.key).to_be_truthy() end
+    -- The New Thread member field shows the same short name.
+    user:command('new_thread')
+    local form = user:view('/forms/new-thread', nil, H.args.tests_session)
+    local field
+    for _, f in ipairs(H.node(form:render(), 'new_thread').fields) do if f.id == 'member_' .. bob_id then field = f end end
+    expect(field.label, 'the member field label').to_be('codex:conversa')
+    form:action('cancel', '$cancel', {})
   end
   bob:set_label('bob tab')
 end)
@@ -189,4 +197,18 @@ test('two different drafts stop a migration until one is removed', function()
   expect(store('draft/' .. part('user') .. part(charlie_id)).value.text).to_be('old draft')
   expect(store('thread-title/' .. part('user') .. part(charlie_id)).value.title).to_be('Latest title')
   expect(store('thread-title/' .. part('user') .. part('charlie')).rev).to_be('0')
+end)
+
+test('a tab rename of a view that is not a thread is refused', function()
+  -- Panels and forms are not tabs, so the hub never renames them. The gallery is a tab.
+  local g = user:open('gallery')
+  local title = g:render().title
+  g:rename_tab('Inbox')
+  local e = wait('the tab_rename event', function()
+    for _, x in ipairs(H.hub('hub.test.events', {event = 'tab_rename'}).events or {}) do
+      if x.route == '/gallery' then return x end
+    end
+  end)
+  expect(e.ok, 'the plugin refuses view.rename for a route that is not a thread').to_be(false)
+  expect(g:render().title).to_be(title)
 end)

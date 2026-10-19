@@ -40,6 +40,10 @@ test('rename as a tool sets the caller\'s title only', function()
   expect(alice:call('messaging.thread_rename', {thread = g.id, title = 'Alice title', key = 'r1'})).to_equal({title = 'Alice title'})
   expect_error(function() alice:call('messaging.thread_rename', {thread = g.id, title = 'Other', key = 'r1'}) end, 'operation_conflict')
   expect_error(function() alice:call('messaging.thread_rename', {thread = g.id, title = '  ', key = 'r2'}) end, 'empty')
+  -- The shared rename handler: an old key replays its result and does not undo a later rename.
+  alice:call('messaging.thread_rename', {thread = g.id, title = 'Later title', key = 'r3'})
+  expect(alice:call('messaging.thread_rename', {thread = g.id, title = 'Alice title', key = 'r1'})).to_equal({title = 'Alice title'})
+  expect(thread_of(alice:call('messaging.thread_list', {}), g.id).title, 'an old replay does not undo a later rename').to_be('Later title')
 end)
 
 test('rename in the UI form uses the same record', function()
