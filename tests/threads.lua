@@ -1,0 +1,179 @@
+-- Port of tests/messaging.mjs: tabs, thread creation and replay, membership refusals, FYI,
+-- unread status, cursors, and archive and restore. The human acts through the UI (forms, the
+-- thread menu, the threads panel); agents act as tools.
+
+local function part(s) return #s .. ':' .. s end
+local function has_tab(key) return tab(key) ~= nil end
+local function find(list, id)
+  for _, t in ipairs(list or {}) do if t.id == id then return t end end
+end
+local function ids(list)
+  local out = {}
+  for _, t in ipairs(list or {}) do out[#out + 1] = t.id end
+  return out
+end
+local function panel()
+  user:command('threads')
+  return user:view('/panels/threads')
+end
+
+local alice, bob, charlie = agent('alice'), agent('bob'), agent('charlie')
+
+test('roster agents get no empty direct tab; member groups keep theirs', function()
+  for _, k in ipairs({'thread/alice', 'thread/bob', 'thread/charlie'}) do expect(has_tab(k), k).to_be(false) end
+  expect(has_tab('thread/team')).to_be(true)
+end)
+
+test('an explicit open declares the empty direct thread once (view.open through the hub)', function()
+  user:open('thread/alice'):render()
+  expect(has_tab('thread/alice')).to_be(true)
+  local before = batches()
+  user:open('thread/alice'):render()
+  expect(batches(), 'opening again does not write').to_be(before)
+  expect_error(function() user:plugin_view('open', {route = '/thread/charlie', user = 'user'}) end, 'Only the hub')
+end)
+
+test('New Thread declares an empty direct thread; archive hides it; restore brings it back', function()
+  user:command('new_thread')
+  local form = user:view('/forms/new-thread')
+  form:render()
+  local op = form:action('new_thread', 'submit', {values = {member_bob = true}})
+  expect(op.status).to_be('succeeded')
+  expect(has_tab('thread/bob')).to_be(true)
+  -- Archive from the thread menu of thread/alice.
+  local v = user:open('thread/alice')
+  v:render()
+  v:action('thread_menu', 'open', {})
+  local menu = user:view('/forms/thread-menu')
+  menu:render()
+  op = menu:action('thread_menu', 'archive', {item_id = 'archive'})
+  expect(op.result).to_equal({panel = {command = 'threads'}})
+  expect(has_tab('thread/alice')).to_be(false)
+  -- A navigation does not undo the archive: view.open declares nothing.
+  pcall(function() H.hub('hub.ui.navigate', {plugin = 'messaging', tab = 'thread/alice'}) end)
+  expect(has_tab('thread/alice'), 'opening does not undo archive').to_be(false)
+  local p = panel()
+  expect(find(H.node(p:render(), 'archived_threads').items, 'alice')).to_be_truthy()
+  op = p:action('archived_threads', 'restore', {item_id = 'alice'})
+  expect(op.result).to_equal({navigate = 'thread/alice'})
+  expect(has_tab('thread/alice'), 'restore keeps the explicit open').to_be(true)
+  expect(has_tab('thread/charlie'), 'unopened direct threads stay absent').to_be(false)
+end)
+
+local created
+local create_args = {key = 'group/:one', title = 'Review', members = {'bob', 'user'}}
+
+test('thread_create makes a group; a replay returns it without a write', function()
+  created = alice:call('messaging.thread_create', create_args)
+  expect(created.group).to_be(true)
+  expect(created.members).to_equal({'alice', 'bob', 'user'})
+  expect(find(alice:call('messaging.thread_list', {}).threads, created.id).title).to_be('Review')
+  expect(has_tab('thread/' .. created.id)).to_be(true)
+  local before = batches()
+  expect(alice:call('messaging.thread_create', {key = 'group/:one', title = 'Review', members = {'user', 'bob', 'alice'}})).to_equal(created)
+  expect(batches(), 'a create replay does not write').to_be(before)
+  expect_error(function() alice:call('messaging.thread_create', {key = 'group/:one', title = 'Other', members = {'bob', 'user'}}) end, 'different content')
+  local other = alice:call('messaging.thread_create', {key = 'groupone', title = 'Review', members = {'bob', 'user'}})
+  expect(other.id, 'punctuation in operation keys is kept').not_to_be(created.id)
+  expect_error(function() alice:call('messaging.thread_create', {key = 'missing', members = {'unknown'}}) end, 'Unknown recipient')
+end)
+
+test('a concurrent group write survives a create retry; a direct create returns the direct thread', function()
+  local groups = store('groups').value.groups
+  groups['g-concurrent'] = {name = 'Concurrent', members = {'alice', 'bob'}}
+  local raced
+  with_injection({match = {writes = 'groups'}, ops = {{key = 'groups', value = {groups = groups}}}}, 1, function()
+    raced = alice:call('messaging.thread_create', {key = 'create-race', title = 'Raced', members = {'bob'}})
+  end)
+  expect(store('groups').value.groups['g-concurrent']).to_be_truthy()
+  expect(store('groups').value.groups[raced.id]).to_be_truthy()
+  local direct = alice:call('messaging.thread_create', {key = 'direct', members = {'bob'}})
+  expect(direct.id).to_be('bob')
+  expect(direct.group).to_be(false)
+  expect(alice:call('messaging.thread_create', {key = 'direct', members = {'bob'}})).to_equal(direct)
+end)
+
+test('a non-member cannot list, archive, read or send to a group', function()
+  expect(find(charlie:call('messaging.thread_list', {}).threads, created.id)).to_be(nil)
+  expect_error(function() charlie:call('messaging.thread_archive', {thread = created.id, key = 'foreign'}) end, 'Unknown thread')
+  expect_error(function() charlie:call('messaging.read', {thread = created.id}) end, 'member')
+  expect_error(function() charlie:call('messaging.send', {to = created.id, key = 'foreign', body = 'no'}) end, 'member')
+end)
+
+local info, cursor
+test('FYI: reply_expected false is stored; unread shows on the user tab; a cursor does not acknowledge', function()
+  info = alice:call('messaging.send', {to = created.id, key = 'fyi', body = 'Review complete', reply_expected = false})
+  expect(store('message/' .. info.id).value.reply_expected).to_be(false)
+  expect_error(function() alice:call('messaging.send', {to = created.id, key = 'fyi', body = 'Review complete'}) end, 'different content')
+  -- The user's tab before the user looks at it: the hub shows the view, and that acknowledges.
+  local t = tab('thread/' .. created.id)
+  expect(t.title).to_be('Review (1)')
+  expect(t.status).to_equal({state = 'done', msg = '1 unread'})
+  local filtered = bob:call('messaging.read', {thread = created.id})
+  expect(#filtered.messages).to_be(1)
+  expect(filtered.messages[1].reply_expected).to_be(false)
+  cursor = filtered.next_cursor
+  expect(bob:call('messaging.read', {thread = created.id, since = cursor}).messages).to_equal({})
+  expect(#bob:call('messaging.read', {thread = created.id}).messages, 'a cursor does not acknowledge').to_be(1)
+end)
+
+test('the thread view: no tree status, a menu button, FYI marked in history', function()
+  local v = user:open('thread/' .. created.id)
+  local tree = v:render()
+  expect(v:get().status, 'the tab declaration owns the thread status').to_equal(tab('thread/' .. created.id).status)
+  expect(H.node(tree, 'thread_menu').action.name).to_be('open')
+  expect(H.node(tree, 'history').messages[1].fyi).to_be(true)
+  local op = v:action('thread_menu', 'open', {})
+  expect(op.result).to_equal({form = '/forms/thread-menu'})
+end)
+
+local draft_key, draft_before
+test('archive from the menu keeps other archived threads, the draft and unread delivery', function()
+  -- Unread mail for the user that the archive must keep.
+  local unread = alice:call('messaging.send', {to = created.id, key = 'fyi-2', body = 'Second note'})
+  draft_key = 'draft/' .. part('user') .. part(created.id)
+  write({{key = draft_key, value = {text = 'keep this draft'}}})
+  draft_before = store(draft_key)
+  local menu = user:view('/forms/thread-menu')
+  menu:render()
+  local op
+  with_injection({match = {writes = 'thread-archive/' .. part('user')}, ops = {{key = 'thread-archive/' .. part('user'), value = {ids = {team = true}}}}}, 1, function()
+    op = menu:action('thread_menu', 'archive', {item_id = 'archive'})
+  end)
+  expect(op.result).to_equal({panel = {command = 'threads'}})
+  local archived = store('thread-archive/' .. part('user')).value.ids
+  expect(archived.team, 'the retry keeps other archived threads').to_be(true)
+  expect(archived[created.id]).to_be(true)
+  expect(has_tab('thread/' .. created.id), 'archive omits the tab').to_be(false)
+  expect(store(draft_key), 'archive keeps the draft').to_equal(draft_before)
+  expect(store('mailbox/' .. part('user')).value.ids[unread.id], 'archive keeps unread delivery').to_be(true)
+  local p = panel()
+  expect(find(H.node(p:render(), 'archived_threads').items, created.id)).to_be_truthy()
+  expect(find(bob:call('messaging.thread_list', {}).threads, created.id).archived, 'archive is per participant').to_be_falsy()
+  local later = alice:call('messaging.send', {to = created.id, key = 'later', body = 'Another note'})
+  expect(has_tab('thread/' .. created.id), 'new mail does not undo archive').to_be(false)
+  expect(ids(bob:call('messaging.read', {thread = created.id, since = cursor}).messages)).to_contain(later.id)
+end)
+
+test('restore from the panel; seeing the thread clears its status', function()
+  local p = user:view('/panels/threads')
+  p:render()
+  local op = p:action('archived_threads', 'restore', {item_id = created.id})
+  expect(op.result).to_equal({navigate = 'thread/' .. created.id})
+  local v = user:view('thread/' .. created.id)
+  v:render()
+  v:seen()
+  local t = H.wait('the restored tab to have no unread status', function()
+    local x = tab('thread/' .. created.id)
+    if x and x.status == nil then return x end
+  end)
+  expect(t.title).to_be('Review')
+end)
+
+test('an old archive retry does not undo a newer restore', function()
+  local args = {thread = created.id, key = 'archive-1'}
+  alice:call('messaging.thread_archive', args)
+  alice:call('messaging.thread_archive', {thread = created.id, key = 'restore-1', archived = false})
+  alice:call('messaging.thread_archive', args)
+  expect(find(alice:call('messaging.thread_list', {}).threads, created.id).archived).to_be_falsy()
+end)
