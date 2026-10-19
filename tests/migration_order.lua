@@ -79,7 +79,7 @@ test('two-alias titles after the last migration: the newest effective write wins
 end)
 
 test('an explicit rename after a carried title wins', function()
-  -- A title key (owner, peer) holds one alias, so its legacy and canonical records merge once.
+  -- Bob's legacy title for alice merged when bob migrated; it is carried now.
   local carried = store('thread-title/' .. part(b_id) .. part(a_id)).value
   expect(carried.title).to_be('Legacy title')
   expect(carried.set_rev, 'the carried title keeps its age').to_be_truthy()
