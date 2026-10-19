@@ -323,8 +323,53 @@ local function normalized_fingerprint(fp)
   return fp
 end
 
+-- Size limits (LazyRex docs/rex-protocol.md, "Rex Lua runtime"). What this plugin sends is at
+-- most 64 KiB in one control message, and a reply that is too large never arrives. A result to
+-- an agent (read, history) holds at most reply_budget encoded bytes; the client.reply frame adds
+-- its envelope and call_id, inside the 16 KiB left. A hub request from this plugin holds at most
+-- request_budget encoded bytes of keys. The hub refuses its own reply over 1 MiB with
+-- reply_too_large.
+local reply_budget = 49152
+local request_budget = 49152
+
+-- encoded_size returns the JSON size of v, counted as the hub's Go encoder writes it: '<', '>' and
+-- '&' as \u003c (6 bytes), U+2028 and U+2029 as \u2028 (6 bytes). rex.json escapes no more than
+-- that, so the count is also an upper bound of this plugin's own encoding.
+local function encoded_size(v)
+  local text = assert(rex.json.encode(v))
+  local _, html = text:gsub('[<>&]', '')
+  local _, separators = text:gsub('\226\128[\168\169]', '')
+  return #text + 5 * html + 3 * separators
+end
+
+-- utf8_cut returns a prefix of s of at most n bytes that ends at a UTF-8 boundary.
+local function utf8_cut(s, n)
+  if n < 0 then n = 0 end
+  if #s <= n then return s end
+  local cut = n
+  while cut > 0 do
+    local b = s:byte(cut + 1)
+    if not b or b < 0x80 or b >= 0xC0 then break end
+    cut = cut - 1
+  end
+  return s:sub(1, cut)
+end
+
+-- preview names a long value in an error: a UTF-8-safe prefix of at most 64 bytes and its size.
+local function preview(v)
+  if #v <= 64 then return v end
+  return utf8_cut(v, 64) .. '... (' .. #v .. ' bytes)'
+end
+
 local function get(keys)
-  local result = hub('hub.store.get', {keys = keys})
+  local ok, result = pcall(hub, 'hub.store.get', {keys = keys})
+  if not ok then
+    -- One record over the hub's reply limit cannot be read at all: a definite size error.
+    if type(result) == 'table' and result.code == 'reply_too_large' and #keys == 1 then
+      fail('record_too_large', 'Record ' .. preview(keys[1]) .. ' is larger than one hub reply')
+    end
+    error(result, 0)
+  end
   if type(result.records) ~= 'table' then fail('internal', 'Missing store records') end
   for _, key in ipairs(keys) do
     local record = result.records[key]
@@ -360,6 +405,36 @@ end
 -- "groups" as {groups = {[id] = {name, members}}}. Created group IDs start with "g-", so they
 -- never equal an agent ID.
 local builtin = {team = {name = 'Team'}}
+
+-- message_records reads records in batches: at most 8 keys and request_budget bytes of keys in
+-- one request. A batch whose reply is over the hub limit is read one key at a time. Other errors
+-- keep their code. A key that does not fit one request is a definite size error.
+local function message_records(keys)
+  local out = {}
+  local function read_batch(batch)
+    local ok, got = pcall(get, batch)
+    if ok then
+      for k, r in pairs(got) do out[k] = r end
+    elseif #batch > 1 and type(got) == 'table' and got.code == 'reply_too_large' then
+      for _, k in ipairs(batch) do out[k] = get({k})[k] end
+    else
+      error(got, 0)
+    end
+  end
+  local batch, size = {}, 2
+  for _, k in ipairs(keys) do
+    local cost = encoded_size(k) + 1
+    if cost + 2 > request_budget then fail('key_too_large', 'Key ' .. preview(k) .. ' does not fit one hub request') end
+    if #batch == 8 or size + cost > request_budget then
+      read_batch(batch)
+      batch, size = {}, 2
+    end
+    batch[#batch + 1] = k
+    size = size + cost
+  end
+  if #batch > 0 then read_batch(batch) end
+  return out
+end
 
 local function roster()
   local ids = {}
@@ -482,6 +557,110 @@ local function saved_result(saved, fingerprint)
   return saved.result
 end
 
+-- Pages. A read or history page holds at most reply_budget encoded bytes. A page is measured with
+-- the largest value of its continuation fields (cursor_max), so the final page is not larger.
+local cursor_max = string.rep('9', 20)
+local count_max = 9999999999
+
+-- read_item is the item of message m in a read or history page.
+local function read_item(m, cursor)
+  return {id = m.id, from = m.from, to = m.to, body = m.body, reply_to = m.reply_to,
+    reply_expected = m.reply_expected, at = m.at, cursor = cursor}
+end
+
+-- min_marker is the smallest item a page can hold for a message: a marker with an empty ID prefix.
+local min_marker = {cursor = cursor_max, id_prefix = '', id_bytes = count_max, metadata_too_large = true, bytes = count_max}
+
+-- history_fits reports whether a history page of thread peer can hold one message at all.
+local function history_fits(peer)
+  return encoded_size({thread = peer, messages = {min_marker}, next_before = cursor_max}) <= reply_budget
+end
+
+-- page_bytes is the size of the largest page that holds message m alone: a read page, and a
+-- history page for each thread value a reader can see (from, to).
+local function page_bytes(m)
+  local item = read_item(m, cursor_max)
+  local worst = encoded_size({messages = {item}, next_cursor = cursor_max, more = true})
+  for _, peer in ipairs({m.from, m.to}) do
+    worst = math.max(worst, encoded_size({thread = peer, messages = {item}, next_before = cursor_max}))
+  end
+  return worst
+end
+
+-- admit refuses a new message that would not arrive in full in one read or history page.
+local body_limit = 32768
+local function admit(m)
+  local body = encoded_size(m.body) - 2
+  if body > body_limit then
+    fail('invalid_input', 'body is ' .. body .. ' bytes encoded; the limit is ' .. body_limit)
+  end
+  local n = page_bytes(m)
+  if n > reply_budget then
+    fail('invalid_input', 'The message does not fit one read page: ' .. n .. ' bytes encoded, limit ' .. reply_budget)
+  end
+end
+
+-- shrink makes the only item of page fit (a stored message from before admit). In order:
+--   1. the body is cut to a UTF-8-safe prefix: truncated = true, body_bytes = its full size;
+--   2. the metadata does not fit either: a marker {cursor, id, metadata_too_large, bytes};
+--   3. the ID does not fit either: id_prefix (at most 256 bytes, can be empty) and id_bytes.
+-- bytes is the encoded size of the full item. The caller checked that min_marker fits.
+local function shrink(page, item)
+  local full = encoded_size(item)
+  local body = item.body or ''
+  item.truncated, item.body_bytes, item.body = true, #body, ''
+  page.messages = {item}
+  local over = encoded_size(page) - reply_budget
+  if over <= 0 then
+    local cut = utf8_cut(body, -over)
+    item.body = cut
+    over = encoded_size(page) - reply_budget
+    while over > 0 do
+      cut = utf8_cut(cut, #cut - over)
+      item.body = cut
+      over = encoded_size(page) - reply_budget
+    end
+    return
+  end
+  local marker = {cursor = item.cursor, id = item.id, metadata_too_large = true, bytes = full}
+  page.messages = {marker}
+  if encoded_size(page) <= reply_budget then return end
+  marker.id, marker.id_bytes = nil, #item.id
+  local prefix = utf8_cut(item.id, 256)
+  marker.id_prefix = prefix
+  over = encoded_size(page) - reply_budget
+  while over > 0 and prefix ~= '' do
+    prefix = utf8_cut(prefix, #prefix - over)
+    marker.id_prefix = prefix
+    over = encoded_size(page) - reply_budget
+  end
+  if over > 0 then fail('internal', 'A message marker does not fit one page') end
+end
+
+-- fit_page adds items to page.messages while the page stays within reply_budget, and returns the
+-- number added. A first item that does not fit alone is shrunk, so each page makes progress.
+local function fit_page(page, items)
+  page.messages = {}
+  local size = encoded_size(page)
+  for i, item in ipairs(items) do
+    local cost = encoded_size(item) + (i > 1 and 1 or 0)
+    if size + cost > reply_budget then
+      if i > 1 then return i - 1 end
+      shrink(page, item)
+      return 1
+    end
+    page.messages[i] = item
+    size = size + cost
+  end
+  return #items
+end
+
+local function checked(page)
+  local n = encoded_size(page)
+  if n > reply_budget then fail('internal', 'A page is ' .. n .. ' bytes, over ' .. reply_budget) end
+  return page
+end
+
 local function send(agent, args)
   for _, name in ipairs({'to', 'body', 'key'}) do
     if type(args[name]) ~= 'string' or args[name] == '' then
@@ -498,6 +677,9 @@ local function send(agent, args)
   local saved = prior_operation('send/', agent, args.key)
   if saved.found == true then return saved_result(saved, fingerprint) end
   if saved.found ~= false then fail('internal', 'Invalid operation lookup') end
+  -- Size limits apply to new sends only: a stored result replays above, whatever its size.
+  if #args.key > 200 then fail('invalid_input', 'key is ' .. #args.key .. ' bytes; the limit is 200') end
+  if args.reply_to and #args.reply_to > 512 then fail('invalid_input', 'reply_to is ' .. #args.reply_to .. ' bytes; the limit is 512') end
   args.to = resolve_recipient(args.to)
   recipients(agent, args.to) -- Validate before checking a reply. Each attempt reads membership again.
   if args.reply_to then
@@ -512,6 +694,7 @@ local function send(agent, args)
   local message_key = 'message/' .. id
   local message = {id = id, from = agent, to = args.to, body = args.body, reply_to = args.reply_to, at = os.date('!%Y-%m-%dT%H:%M:%SZ')}
   if args.reply_expected == false then message.reply_expected = false end
+  admit(message)
   for _ = 1, attempts do
     local targets, guard = recipients(agent, args.to)
     message.recipients = targets
@@ -602,7 +785,7 @@ local function read(agent, args)
   local keys = {}
   for id in pairs(ids) do keys[#keys + 1] = 'message/' .. id end
   if #keys == 0 then return {messages = {}, next_cursor = cursor} end
-  local records, messages = get(keys), {}
+  local records, messages = message_records(keys), {}
   for id in pairs(ids) do
     local record = records['message/' .. id]
     local message = record.value
@@ -610,12 +793,19 @@ local function read(agent, args)
       fail('internal', 'Mailbox references an invalid message')
     end
     if later(record.rev, since) and (args.thread == nil or message_thread(message, agent) == args.thread) then
-      messages[#messages + 1] = {id = id, from = message.from, to = message.to, body = message.body,
-        reply_to = message.reply_to, reply_expected = message.reply_expected, at = message.at, cursor = record.rev}
+      messages[#messages + 1] = read_item(message, record.rev)
     end
   end
   table.sort(messages, function(a, b) return later(b.cursor, a.cursor) end)
-  return {messages = messages, next_cursor = cursor}
+  -- A page that stops early continues after its last message: next_cursor is that cursor.
+  local page = {next_cursor = cursor_max, more = true}
+  local n = fit_page(page, messages)
+  if n == #messages then
+    page.more, page.next_cursor = nil, cursor
+  else
+    page.next_cursor = page.messages[n].cursor
+  end
+  return checked(page)
 end
 
 -- History pages do not change unread mail. Group history requires current membership.
@@ -625,6 +815,9 @@ local function history(agent, args)
   local g = group(peer)
   if g and not is_member(g, agent) then fail('refused', 'Only a current member can read this group history') end
   recipients(agent, peer)
+  if not history_fits(peer) then
+    fail('thread_id_too_large', 'Thread ID ' .. preview(peer) .. ' is too long for one history page (' .. encoded_size(peer) .. ' bytes encoded)')
+  end
   local limit = args.limit or 20
   if type(limit) ~= 'number' or limit % 1 ~= 0 or limit < 1 or limit > 50 then fail('invalid_input', 'limit must be an integer from 1 to 50') end
   local before = args.before
@@ -637,22 +830,23 @@ local function history(agent, args)
     local first = math.max(1, i - 49)
     local keys = {}
     for j = first, i do keys[#keys + 1] = 'message/' .. ids[j] end
-    local records = get(keys)
+    local records = message_records(keys)
     for j = i, first, -1 do
       local record = records['message/' .. ids[j]]
       if not before or later(before, record.rev) then
         if #messages == limit then more = true; break end
         local m = record.value
         if type(m) ~= 'table' then fail('internal', 'Thread references a missing message') end
-        messages[#messages + 1] = {id = m.id, from = m.from, to = m.to, body = m.body, at = m.at,
-          reply_to = m.reply_to, reply_expected = m.reply_expected, cursor = record.rev}
+        messages[#messages + 1] = read_item(m, record.rev)
       end
     end
     i = first - 1
   end
-  local result = {thread = peer, messages = messages}
-  if more then result.next_before = messages[#messages].cursor end
-  return result
+  -- The page also stops at reply_budget. next_before then names its oldest message.
+  local result = {thread = peer, next_before = cursor_max}
+  local n = fit_page(result, messages)
+  result.next_before = (n < #messages or more) and result.messages[n].cursor or nil
+  return checked(result)
 end
 
 local function ack(agent, args)
@@ -986,6 +1180,26 @@ local function selected_members(user, input)
 end
 
 -- Membership changes affect future delivery. Legacy messages keep a separate delivery snapshot.
+-- notice_body sets the body of a membership notice. A title that would make the notice too large
+-- for one read page is cut (with "…"). If the notice does not fit with an empty title, the change
+-- is refused before its batch, so nothing is written.
+local function notice_body(message, title)
+  local function body(t) return 'You were added to ' .. t .. '. Read earlier messages with messaging.history.' end
+  message.body = body(title)
+  local over = page_bytes(message) - reply_budget
+  if over <= 0 then return end
+  local cut = title
+  while over > 0 and cut ~= '' do
+    cut = utf8_cut(cut, #cut - over - 3)
+    message.body = body(cut .. '…')
+    over = page_bytes(message) - reply_budget
+  end
+  if over > 0 then
+    message.body = body('')
+    admit(message) -- fails: the IDs alone do not fit one page
+  end
+end
+
 local function change_members(user, peer, input, operation_key, context)
   if peer.observer then fail('refused', 'Send a message to join this group before changing its members') end
   if type(operation_key) ~= 'string' or operation_key == '' then fail('invalid_input', 'An operation key is required') end
@@ -1010,7 +1224,7 @@ local function change_members(user, peer, input, operation_key, context)
     local thread_key, thread_rev, ids = thread(user, peer.id)
     local keys = {}
     for _, id in ipairs(ids) do keys[#keys + 1] = 'message/' .. id end
-    local messages = #keys > 0 and get(keys) or {}
+    local messages = #keys > 0 and message_records(keys) or {}
     local ops = {}
     for _, id in ipairs(ids) do
       local message = messages['message/' .. id].value
@@ -1033,8 +1247,8 @@ local function change_members(user, peer, input, operation_key, context)
     ops[#ops + 1] = {key = 'groups', if_rev = rev, value = {groups = groups}}
     if #added > 0 then
       local id = 'member-notice/' .. op_key
-      local message = {id = id, from = user, to = peer.id, recipients = added, reply_expected = false,
-        body = 'You were added to ' .. thread_title(user, peer) .. '. Read earlier messages with messaging.history.', at = os.date('!%Y-%m-%dT%H:%M:%SZ')}
+      local message = {id = id, from = user, to = peer.id, recipients = added, reply_expected = false, at = os.date('!%Y-%m-%dT%H:%M:%SZ')}
+      notice_body(message, thread_title(user, peer))
       ops[#ops + 1] = {key = 'message/' .. id, if_rev = '0', value = message}
       ids[#ids + 1] = id
       for _, member in ipairs(added) do
@@ -1136,36 +1350,6 @@ end
 -- tree and a history page therefore carry a bounded part of a thread. The transcript pane fetches
 -- the older pages (view.history) and prints the whole thread.
 local page_budget = 40000
-
--- message_records reads message records in small batches, so no reply exceeds the limit.
-local function message_records(keys)
-  local out = {}
-  for i = 1, #keys, 8 do
-    local chunk = {}
-    for j = i, math.min(#keys, i + 7) do chunk[#chunk + 1] = keys[j] end
-    local ok, got = pcall(get, chunk)
-    if ok then
-      for k, r in pairs(got) do out[k] = r end
-    elseif #chunk > 1 then
-      for _, k in ipairs(chunk) do out[k] = get({k})[k] end
-    else
-      error(got, 0)
-    end
-  end
-  return out
-end
-
--- utf8_cut returns at most n bytes of s, without a partial UTF-8 sequence at the end.
-local function utf8_cut(s, n)
-  if #s <= n then return s end
-  local cut = n
-  while cut > 0 do
-    local b = s:byte(cut + 1)
-    if not b or b < 0x80 or b >= 0xC0 then break end
-    cut = cut - 1
-  end
-  return s:sub(1, cut)
-end
 
 -- history_page returns the newest messages older than the message ID before (nil: the newest
 -- messages), oldest first, within budget bytes of estimated JSON, and whether older messages
@@ -1798,6 +1982,7 @@ local function view_send(args)
   local saved = hub('hub.store.op', {key = id})
   if saved.found == true then return replay(saved) end
   local message = {id = id, from = user, to = peer.id, body = args.text, at = os.date('!%Y-%m-%dT%H:%M:%SZ')}
+  admit(message)
   local result = {message_id = id, cleared_draft_revision = args.draft_revision}
   for _ = 1, attempts do
     local draft_key, draft_rev, draft_text = draft(user, peer.id)
@@ -1837,13 +2022,13 @@ end
 
 local actions = {
   {name = 'messaging.send', kind = 'client', title = 'Send a message',
-    description = 'Send a message to an agent, to "user" (the human), or to the group "team" (everyone else). Choose a key before sending. After an unknown outcome, retry the same key and content. Set reply_to to acknowledge the message you answer. Set reply_expected=false for an informational message. Use ack for routine receipts.',
+    description = 'Send a message to an agent, to "user" (the human), or to the group "team" (everyone else). Choose a key before sending. After an unknown outcome, retry the same key and content. Set reply_to to acknowledge the message you answer. Set reply_expected=false for an informational message. Use ack for routine receipts. Limits: body at most 32768 bytes encoded as JSON, key at most 200 bytes, reply_to at most 512 bytes, and the whole message must fit one read page (48 KB).',
     args = {type = 'object', properties = {
       to = {type = 'string', minLength = 1}, body = {type = 'string', minLength = 1}, key = {type = 'string', minLength = 1},
       reply_to = {type = 'string', minLength = 1}, reply_expected = {type = 'boolean'}
     }, required = {'to', 'body', 'key'}, additionalProperties = false}},
   {name = 'messaging.read', kind = 'client', title = 'Read messages',
-    description = 'Read your unacknowledged messages. Reading does not acknowledge them. Optional thread filters by recipient/group ID. Pass next_cursor as since to get later arrivals; keep a cursor per filter. Omit since for recovery. An empty list can appear as {}.',
+    description = 'Read your unacknowledged messages. Reading does not acknowledge them. Optional thread filters by recipient/group ID. Pass next_cursor as since to get later arrivals; keep a cursor per filter. Omit since for recovery. A reply holds at most 48 KB: if more is true, call again with since = next_cursor. An older message larger than one reply arrives with a prefix of its body, truncated = true and body_bytes (the full body size). If even its other fields do not fit, it arrives as {cursor, id, metadata_too_large = true, bytes}; if its ID does not fit either, id_prefix and id_bytes replace id, and that message cannot be acknowledged. An empty list can appear as {}.',
     args = {type = 'object', properties = {thread = {type = 'string', minLength = 1}, since = {type = 'string', pattern = '^(0|[1-9][0-9]*)$'}}, additionalProperties = false}},
   {name = 'messaging.ack', kind = 'client', title = 'Acknowledge messages',
     description = 'Acknowledge handled messages without sending a receipt reply. Safe to retry. An empty list changes nothing.',
@@ -1857,7 +2042,7 @@ local actions = {
     args = {type = 'object', properties = {members = {type = 'array', items = {type = 'string', minLength = 1}}, title = {type = 'string'}, session_id = {type = 'string', minLength = 1}, new_session = {type = 'string', minLength = 1}, key = {type = 'string', minLength = 1}},
       required = {'members', 'key'}, additionalProperties = false}},
   {name = 'messaging.history', kind = 'client', title = 'Read thread history',
-    description = 'Read a page of thread history, newest messages first. Current group members can read all history. This does not acknowledge or backfill unread mail. Default 20 messages, maximum 50. Pass next_before as before only when you need older context.',
+    description = 'Read a page of thread history, newest messages first. Current group members can read all history. This does not acknowledge or backfill unread mail. Default 20 messages, maximum 50. A page holds at most 48 KB, so it can hold fewer messages; next_before is set when older messages exist. An older message larger than one page arrives as in messaging.read: a body prefix with truncated = true and body_bytes, or a metadata_too_large marker. A thread whose ID is too long for one page fails with thread_id_too_large. Pass next_before as before only when you need older context.',
     args = {type = 'object', properties = {thread = {type = 'string', minLength = 1}, before = {type = 'string', pattern = '^[1-9][0-9]*$'}, limit = {type = 'integer', minimum = 1, maximum = 50}},
       required = {'thread'}, additionalProperties = false}},
   {name = 'messaging.thread_archive', kind = 'client', title = 'Archive or restore a thread',
