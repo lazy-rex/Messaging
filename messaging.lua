@@ -85,7 +85,15 @@ end
 
 local function resolve_recipient(id)
   if id == 'team' or (type(id) == 'string' and id:sub(1, 2) == 'g-') then return id end
-  return hub('hub.agents.resolve', {to = id}).id
+  local ok, result = pcall(hub, 'hub.agents.resolve', {to = id})
+  if ok then return result.id end
+  -- The hub refuses a name that matches no agent, or more than one. A retry cannot change that, so
+  -- it is invalid input, not 'unavailable'. The hub error arrives as text that ends in its code.
+  local message = type(result) == 'table' and tostring(result.message) or tostring(result)
+  if message:find('code=refused)', 1, true) then
+    fail('invalid_input', 'Unknown recipient: ' .. tostring(id) .. ' (' .. (message:match('failed: ([^%(]+) %(status=') or message) .. ')')
+  end
+  error(result, 0)
 end
 
 local function migrate_aliases()
