@@ -1,4 +1,4 @@
--- Port of tests/messaging.mjs: membership changes (the UI form and the tool), delivery
+-- Ported from the Node test messaging.mjs (coverage map: commit eaaf529): membership changes (the UI form and the tool), delivery
 -- snapshots, history pages, a send race with a membership change, direct expansion, the team
 -- refusal, and the replay of a creation that an older plugin version saved.
 

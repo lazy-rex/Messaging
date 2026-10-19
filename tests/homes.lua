@@ -1,4 +1,4 @@
--- Port of tests/messaging.mjs: thread homes (the session where a thread was created), reopen
+-- Ported from the Node test messaging.mjs (coverage map: commit eaaf529): thread homes (the session where a thread was created), reopen
 -- tokens, the session order of the threads panel, home redirects after a home session closes,
 -- a concurrent first home, session choices for agents and the UI, menu moves, and a session
 -- creation that a failure interrupted.

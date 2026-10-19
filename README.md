@@ -36,12 +36,11 @@ lazyrex-hub test -file send.lua
 `lazyrex.json` is the test manifest. `tests/parity_fixture.lua` renders the thread menu forms for
 the parity sweep.
 
-The Node tests need a lab server that you start:
+The Node test needs a lab server that you start:
 
 ```sh
 ../LazyRex/lab/server.sh /tmp/rexlab
 REX_SERVER=unix:///tmp/rexlab/rex.sock node tests/<name>.mjs
 ```
 
-- messaging.mjs (plugin contract, against a mock hub). The Lua tests replace it after review.
 - thread-home-lab.mjs (lab, real hub)

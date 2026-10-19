@@ -1,4 +1,4 @@
--- Port of tests/messaging.mjs: identity migration (a legacy roster name becomes a conversation
+-- Ported from the Node test messaging.mjs (coverage map: commit eaaf529): identity migration (a legacy roster name becomes a conversation
 -- identity), old operation retries, historical cursors, the thread menu overview, thread renames
 -- (the form and a Rex tab rename), short identity names, and a draft conflict during migration.
 -- The hub makes the identities from real reports in the agent panes (hub.identity.report).

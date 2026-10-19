@@ -1,4 +1,4 @@
--- Port of tests/messaging.mjs: the plugin contract on the real hub. The exports reach the agent
+-- Ported from the Node test messaging.mjs (coverage map: commit eaaf529): the plugin contract on the real hub. The exports reach the agent
 -- face; only the hub may forward a call or call view.*; the agent face refuses an action that the
 -- plugin does not export; a forwarded call keeps the agent's identity.
 

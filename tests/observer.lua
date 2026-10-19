@@ -1,4 +1,4 @@
--- Port of tests/messaging.mjs: the user observes agent-only threads. Read-only directs, an
+-- Ported from the Node test messaging.mjs (coverage map: commit eaaf529): the user observes agent-only threads. Read-only directs, an
 -- atomic group join by the first message, unread isolation, and the full history of a long
 -- thread in pages under the 64 KiB control-message limit.
 

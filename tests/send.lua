@@ -1,4 +1,4 @@
--- Port of tests/messaging.mjs: the send, read and ack contract, replies, and injected mailbox
+-- Ported from the Node test messaging.mjs (coverage map: commit eaaf529): the send, read and ack contract, replies, and injected mailbox
 -- races. Agents call through the agent face (the MCP path) unless a test says otherwise.
 
 local function part(s) return #s .. ':' .. s end

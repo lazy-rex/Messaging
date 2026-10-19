@@ -1,4 +1,4 @@
--- Port of tests/messaging.mjs: tabs, thread creation and replay, membership refusals, FYI,
+-- Ported from the Node test messaging.mjs (coverage map: commit eaaf529): tabs, thread creation and replay, membership refusals, FYI,
 -- unread status, cursors, and archive and restore. The human acts through the UI (forms, the
 -- thread menu, the threads panel); agents act as tools.
 

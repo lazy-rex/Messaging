@@ -1,2 +1,2 @@
-# The tests are Node scripts; the plugin is Lua. Keep the tests out of the language stats.
+# Keep the tests out of the language stats: the plugin is the product.
 tests/** linguist-detectable=false
