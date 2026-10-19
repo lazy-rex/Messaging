@@ -5,7 +5,7 @@
 
 local function part(s) return #s .. ':' .. s end
 local function meta(a, b)
-  if b < a then a, b = b, a end
+  if b < a then local t = a; a = b; b = t end -- not a, b = b, a: wrong in Rex Lua (rex-protocol.md)
   return 'thread-meta/' .. part(a) .. part(b)
 end
 local function index_of(items, id)

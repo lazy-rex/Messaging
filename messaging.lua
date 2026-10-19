@@ -153,12 +153,14 @@ local function migrate_aliases()
       elseif target:match('^thread%-open/') then
         value = {opened = true}
       elseif target:match('^thread%-meta/') then
-        -- Preserve the first home when aliases join two records.
-        local first
+        -- A move (moved = true) is an explicit choice: the newest move wins. Without a move,
+        -- the first home wins among the inherited homes (legacy, canonical, carried).
+        local moved, first
         for _, source in ipairs(contributors) do
+          if source.record.value.moved and (not moved or later(set_rev(source), set_rev(moved))) then moved = source end
           if not first or later(set_rev(first), set_rev(source)) then first = source end
         end
-        value = with_set_rev(first)
+        value = with_set_rev(moved or first)
       elseif target:match('^thread%-title/') then
         -- The latest explicit rename wins when legacy and canonical titles both exist.
         local newest
@@ -1440,7 +1442,8 @@ local function move_thread(user, peer, intent, operation_key, source_session)
   local result = {navigate = 'thread/' .. peer.id}
   for _ = 1, attempts do
     local _, home_key, rev = thread_home(user, peer.id)
-    local stored = hub('hub.store.batch', {ops = {{key = home_key, if_rev = rev, value = {home_session = session}}},
+    -- moved: an explicit choice, which a later identity migration keeps (migrate_aliases).
+    local stored = hub('hub.store.batch', {ops = {{key = home_key, if_rev = rev, value = {home_session = session, moved = true}}},
       op = {key = op_key, fingerprint = fingerprint, result = result}})
     if stored.op_exists then return operation_result(stored.op_exists, fingerprint) end
     if type(stored.revs) == 'table' then return result end
