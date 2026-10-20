@@ -120,7 +120,9 @@ Each user of `thread()` today:
   For each contributor it reads the whole chain: segments, then the tail.
 - It merges the IDs as today: no duplicates, sorted by message record revision.
 - It writes a **new chain** under the target: chain number = 1 + the largest chain number of the
-  contributors (so it differs from the target's own chain). It packs the segments with the step
+  contributors (so it differs from the target's own chain). If no contributor has segments, no
+  reader can hold a segment of an old chain: the number stays the largest contributor chain
+  number, and a migration of tails without segments writes `{ids}` as before. It packs the segments with the step
   rule of "Freeze" (longest prefix at or under `tail_limit`, at least one ID, never the newest),
   each with `if_rev = '0'`, then writes the target tail with `seg`, `chain`, `frozen`, and the rest
   (at least the newest ID). The target tail keeps its `if_rev` guard (or `'0'` if absent).

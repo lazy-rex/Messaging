@@ -138,6 +138,9 @@ local function with_set_rev(source)
   return value
 end
 
+-- migrate_chain is defined with the thread chains (F1), after the helpers that it uses.
+local migrate_chain
+
 local function migrate_aliases()
   local names = {}
   for id in pairs(aliases) do names[#names + 1] = id end
@@ -174,7 +177,7 @@ local function migrate_aliases()
         targets[target][#targets[target] + 1] = {key = old, record = record}
       end
     end
-    local values = {}
+    local values, chain_ops, torn = {}, {}, false
     for target, contributors in pairs(targets) do
       local value
       if target:match('^thread%-page/') then
@@ -208,21 +211,10 @@ local function migrate_aliases()
           if text ~= '' then value.text = text end
         end
       elseif target:match('^thread/') then
-        local seen, ids = {}, {}
-        for _, source in ipairs(contributors) do
-          -- Merging only ids would lose a chain's segments. F1 migrates chains in a later commit.
-          if (source.record.value.seg or 0) > 0 then fail('migration_conflict', 'Cannot migrate a segmented thread yet: ' .. target) end
-          for _, id in ipairs(source.record.value.ids) do
-            if not seen[id] then seen[id] = true; ids[#ids + 1] = id end
-          end
-        end
-        table.sort(ids, function(a, b)
-          local ra, rb = records['message/' .. a], records['message/' .. b]
-          if not ra or not rb then fail('internal', 'Thread references a missing message') end
-          if ra.rev == rb.rev then return a < b end
-          return later(rb.rev, ra.rev)
-        end)
-        value = {ids = ids}
+        local ops
+        value, ops = migrate_chain(target, contributors, records)
+        -- A torn scan matters only for a thread that this migration rewrites.
+        if value then chain_ops[target] = ops elseif changed[target] then torn = true end
       else
         local ids = {}
         for _, source in ipairs(contributors) do
@@ -256,20 +248,24 @@ local function migrate_aliases()
       -- The pending notice derives from this mailbox snapshot, so guard it in the same batch.
       if box then changed['mailbox/' .. part(aliases[id])] = true end
     end
-    local ops = {}
-    for record_key in pairs(changed) do
-      local old = records[record_key]
-      local op = {key = record_key, if_rev = old and old.rev or '0'}
-      if values[record_key] then op.value = values[record_key] else op.delete = true end
-      ops[#ops + 1] = op
+    -- A torn scan (a tail without one of its segments) scans again, like a revision conflict.
+    if not torn then
+      local ops = {}
+      for record_key in pairs(changed) do
+        local old = records[record_key]
+        local op = {key = record_key, if_rev = old and old.rev or '0'}
+        if values[record_key] then op.value = values[record_key] else op.delete = true end
+        ops[#ops + 1] = op
+        for _, chain_op in ipairs(chain_ops[record_key] or {}) do ops[#ops + 1] = chain_op end
+      end
+      for _, id in ipairs(names) do
+        ops[#ops + 1] = {key = 'identity-migrated/' .. part(id), if_rev = '0', value = {identity = aliases[id]}}
+      end
+      for id, pending in pairs(notices) do ops[#ops + 1] = {notify = {agent = id, pending = pending}} end
+      local stored = hub('hub.store.batch', {ops = ops, op = {key = key, fingerprint = key, result = {migrated = true}}})
+      if stored.op_exists or type(stored.revs) == 'table' then return end
+      if not stored.conflict or stored.conflict.kind ~= 'revision' then fail('migration_conflict', 'Identity migration failed') end
     end
-    for _, id in ipairs(names) do
-      ops[#ops + 1] = {key = 'identity-migrated/' .. part(id), if_rev = '0', value = {identity = aliases[id]}}
-    end
-    for id, pending in pairs(notices) do ops[#ops + 1] = {notify = {agent = id, pending = pending}} end
-    local stored = hub('hub.store.batch', {ops = ops, op = {key = key, fingerprint = key, result = {migrated = true}}})
-    if stored.op_exists or type(stored.revs) == 'table' then return end
-    if not stored.conflict or stored.conflict.kind ~= 'revision' then fail('migration_conflict', 'Identity migration failed') end
   end
   fail('unavailable', 'Messaging changed during identity migration; retry')
 end
@@ -651,6 +647,17 @@ local function ids_size(item_sizes, n)
   return total
 end
 
+-- step_take is the step rule: the number of IDs from first on, at least one and never last, in
+-- the longest prefix whose {ids} is at or under tail_limit.
+local function step_take(sizes, first, last)
+  local take, size = 1, 10 + sizes[first]
+  while first + take < last and size + 1 + sizes[first + take] <= tail_limit do
+    size = size + 1 + sizes[first + take]
+    take = take + 1
+  end
+  return take
+end
+
 -- prepare_tail runs freeze steps on the thread of a and b until the tail with next_id fits
 -- tail_limit, or the tail is one ID. A step is one batch: the longest oldest prefix at or under
 -- tail_limit, at least one ID and never the newest, becomes segment seg; the tail keeps the rest.
@@ -667,11 +674,7 @@ local function prepare_tail(a, b, next_id)
     for i, id in ipairs(tail.ids) do sizes[i] = encoded_size(id) end
     sizes[n + 1] = encoded_size(next_id)
     if ids_size(sizes, n + 1) <= tail_limit then return key, rev, tail end
-    local take, size = 1, 10 + sizes[1]
-    while take < n - 1 and size + 1 + sizes[take + 1] <= tail_limit do
-      take = take + 1
-      size = size + 1 + sizes[take]
-    end
+    local take = step_take(sizes, 1, n)
     local frozen, rest = {}, {}
     for i = 1, n do
       if i <= take then frozen[#frozen + 1] = tail.ids[i] else rest[#rest + 1] = tail.ids[i] end
@@ -689,6 +692,61 @@ local function prepare_tail(a, b, next_id)
       fail('internal', 'Invalid store batch result')
     end
   end
+end
+
+-- migrate_chain merges the chains of the contributors (thread tails) of target, from the records
+-- of one scan. It reads each chain (segments, then the tail), merges the IDs (no duplicates, in
+-- message revision order) and packs them with the step rule into a new chain. The new chain number
+-- is 1 + the largest contributor chain number if a contributor has segments, so a reader of an old
+-- chain finds its segments missing and starts again. Returns the tail value and the ops: the new
+-- segments (if_rev '0') and the deletion of every old segment (if_rev = the scanned revision).
+-- Returns nil if the scan has a tail without one of its segments: the caller scans again.
+migrate_chain = function(target, contributors, records)
+  local seen, ids, ops, top, segmented = {}, {}, {}, 0, false
+  for _, source in ipairs(contributors) do
+    local v = source.record.value
+    local seg, chain = v.seg or 0, v.chain or '0'
+    top = math.max(top, tonumber(chain))
+    if seg > 0 then segmented = true end
+    local lists = {}
+    for k = 0, seg - 1 do
+      local sk = segment_key(source.key, chain, k)
+      local r = records[sk]
+      if not r or type(r.value) ~= 'table' or type(r.value.ids) ~= 'table' then return nil end
+      lists[#lists + 1] = r.value.ids
+      ops[#ops + 1] = {key = sk, delete = true, if_rev = r.rev}
+    end
+    lists[#lists + 1] = v.ids
+    for _, list in ipairs(lists) do
+      for _, id in ipairs(list) do
+        if not seen[id] then seen[id] = true; ids[#ids + 1] = id end
+      end
+    end
+  end
+  table.sort(ids, function(a, b)
+    local ra, rb = records['message/' .. a], records['message/' .. b]
+    if not ra or not rb then fail('internal', 'Thread references a missing message') end
+    if ra.rev == rb.rev then return a < b end
+    return later(rb.rev, ra.rev)
+  end)
+  local chain = tostring(top + (segmented and 1 or 0))
+  local sizes = {}
+  for i, id in ipairs(ids) do sizes[i] = encoded_size(id) end
+  local n, first, seg = #ids, 1, 0
+  local remaining = ids_size(sizes, n)
+  while n - first >= 1 and remaining > tail_limit do
+    local take, frozen = step_take(sizes, first, n), {}
+    for i = first, first + take - 1 do
+      frozen[#frozen + 1] = ids[i]
+      remaining = remaining - sizes[i] - 1
+    end
+    ops[#ops + 1] = {key = segment_key(target, chain, seg), value = {ids = frozen}, if_rev = '0'}
+    seg = seg + 1
+    first = first + take
+  end
+  local rest = {}
+  for i = first, n do rest[#rest + 1] = ids[i] end
+  return tail_value({ids = rest, seg = seg, chain = chain, frozen = first - 1}), ops
 end
 
 local function identify(ev)
