@@ -210,6 +210,8 @@ local function migrate_aliases()
       elseif target:match('^thread/') then
         local seen, ids = {}, {}
         for _, source in ipairs(contributors) do
+          -- Merging only ids would lose a chain's segments. F1 migrates chains in a later commit.
+          if (source.record.value.seg or 0) > 0 then fail('migration_conflict', 'Cannot migrate a segmented thread yet: ' .. target) end
           for _, id in ipairs(source.record.value.ids) do
             if not seen[id] then seen[id] = true; ids[#ids + 1] = id end
           end
@@ -544,15 +546,97 @@ local function thread_home(a, b)
   return type(record.value) == 'table' and record.value.home_session or nil, key, record.rev
 end
 
+-- Thread chains (docs/f-thread-tail.md, F1). The thread record is the tail: {ids, seg, chain,
+-- frozen}. ids are the newest message IDs, oldest first. The older IDs are in seg segments
+-- thread-seg/<suffix>/<chain>/<k>, each {ids}, segment 0 the oldest; frozen counts their IDs. A
+-- tail from before F1 has ids only. A segment is written once and never changes.
+local function segment_key(tail_key, chain, k)
+  return 'thread-seg/' .. tail_key:sub(8) .. '/' .. chain .. '/' .. k
+end
+
+local function count_field(v)
+  return v == nil or (type(v) == 'number' and v >= 0 and v % 1 == 0)
+end
+
 local function thread(a, b)
   local key = thread_key(a, b)
   local record = get({key})[key]
-  local ids = {}
+  local tail = {ids = {}, seg = 0, chain = '0', frozen = 0}
   if record.rev ~= '0' then
-    if type(record.value) ~= 'table' or type(record.value.ids) ~= 'table' then fail('internal', 'Invalid thread record') end
-    for _, id in ipairs(record.value.ids) do ids[#ids + 1] = id end
+    local v = record.value
+    if type(v) ~= 'table' or type(v.ids) ~= 'table' or not count_field(v.seg) or not count_field(v.frozen)
+      or (v.chain ~= nil and (type(v.chain) ~= 'string' or not v.chain:match('^%d+$'))) then
+      fail('internal', 'Invalid thread record')
+    end
+    for _, id in ipairs(v.ids) do tail.ids[#tail.ids + 1] = id end
+    tail.seg, tail.chain, tail.frozen = v.seg or 0, v.chain or '0', v.frozen or 0
   end
-  return key, record.rev, ids
+  return key, record.rev, tail
+end
+
+-- tail_value is the record value of a tail. The chain fields stay absent while they are 0, as in
+-- a tail from before F1.
+local function tail_value(tail)
+  local v = {ids = tail.ids}
+  if tail.seg > 0 then v.seg = tail.seg end
+  if tail.chain ~= '0' then v.chain = tail.chain end
+  if tail.frozen > 0 then v.frozen = tail.frozen end
+  return v
+end
+
+-- with_chain runs fn(key, rev, tail, segment) on the thread of a and b. segment(k) returns the IDs
+-- of segment k. A missing segment means that an alias migration replaced the chain after the tail
+-- read: fn's whole work is discarded, and fn runs again from a new tail read, at most attempts
+-- times for the whole read. A walk never continues on a new tail: it could repeat or skip IDs.
+local chain_changed = {}
+local function with_chain(a, b, fn)
+  for _ = 1, attempts do
+    local key, rev, tail = thread(a, b)
+    local function segment(k)
+      local sk = segment_key(key, tail.chain, k)
+      local record = get({sk})[sk]
+      if record.rev == '0' then error(chain_changed, 0) end
+      if type(record.value) ~= 'table' or type(record.value.ids) ~= 'table' then fail('internal', 'Invalid thread segment') end
+      return record.value.ids
+    end
+    local out = {pcall(fn, key, rev, tail, segment)}
+    if out[1] then return unpack(out, 2) end
+    if out[2] ~= chain_changed then error(out[2], 0) end
+  end
+  fail('unavailable', 'The thread changed during the read; retry')
+end
+
+-- chain_reader returns next_ids(n): up to n more IDs of the chain, newest first; {} at the end.
+-- The position is in table fields, not captured locals: in Rex Lua, a closure made before a pcall
+-- catch keeps its own copy of the locals that it captured (coordinator, 2026-10-19).
+local function chain_reader(tail, segment)
+  local at = {list = tail.ids, i = #tail.ids, k = tail.seg}
+  return function(n)
+    local out = {}
+    while #out < n do
+      if at.i >= 1 then
+        out[#out + 1] = at.list[at.i]
+        at.i = at.i - 1
+      elseif at.k >= 1 then
+        at.k = at.k - 1
+        at.list = segment(at.k)
+        at.i = #at.list
+      else
+        break
+      end
+    end
+    return out
+  end
+end
+
+-- chain_ids returns every ID of the chain, oldest first.
+local function chain_ids(tail, segment)
+  local out = {}
+  for k = 0, tail.seg - 1 do
+    for _, id in ipairs(segment(k)) do out[#out + 1] = id end
+  end
+  for _, id in ipairs(tail.ids) do out[#out + 1] = id end
+  return out
 end
 
 local function identify(ev)
@@ -756,9 +840,9 @@ local function send(agent, args)
       ops[#ops + 1] = {key = box_key, value = {ids = self_ids}, if_rev = rev}
       ops[#ops + 1] = {notify = {agent = agent, pending = true}}
     end
-    local thread_key, thread_rev, thread_ids = thread(agent, args.to)
-    thread_ids[#thread_ids + 1] = id
-    ops[#ops + 1] = {key = thread_key, value = {ids = thread_ids}, if_rev = thread_rev}
+    local thread_key, thread_rev, tail = thread(agent, args.to)
+    tail.ids[#tail.ids + 1] = id
+    ops[#ops + 1] = {key = thread_key, value = tail_value(tail), if_rev = thread_rev}
     local stored = hub('hub.store.batch', {
       ops = ops,
       op = {key = id, fingerprint = fingerprint, result = result}
@@ -844,26 +928,28 @@ local function history(agent, args)
   if type(limit) ~= 'number' or limit % 1 ~= 0 or limit < 1 or limit > 50 then fail('invalid_input', 'limit must be an integer from 1 to 50') end
   local before = args.before
   if before ~= nil and (type(before) ~= 'string' or not before:match('^[1-9][0-9]*$')) then fail('invalid_input', 'before must be a positive revision cursor') end
-  local _, _, ids = thread(agent, peer)
-  local messages, more = {}, false
-  -- Fetch bounded chunks. Only the requested page enters the agent's context.
-  local i = #ids
-  while i > 0 and not more do
-    local first = math.max(1, i - 49)
-    local keys = {}
-    for j = first, i do keys[#keys + 1] = 'message/' .. ids[j] end
-    local records = message_records(keys)
-    for j = i, first, -1 do
-      local record = records['message/' .. ids[j]]
-      if not before or later(before, record.rev) then
-        if #messages == limit then more = true; break end
-        local m = record.value
-        if type(m) ~= 'table' then fail('internal', 'Thread references a missing message') end
-        messages[#messages + 1] = read_item(m, record.rev)
+  local messages, more = with_chain(agent, peer, function(_, _, tail, segment)
+    local next_ids = chain_reader(tail, segment)
+    local messages, more = {}, false
+    -- Fetch bounded chunks, newest first. Only the requested page enters the agent's context.
+    while not more do
+      local ids = next_ids(50)
+      if #ids == 0 then break end
+      local keys = {}
+      for _, id in ipairs(ids) do keys[#keys + 1] = 'message/' .. id end
+      local records = message_records(keys)
+      for _, id in ipairs(ids) do
+        local record = records['message/' .. id]
+        if not before or later(before, record.rev) then
+          if #messages == limit then more = true; break end
+          local m = record.value
+          if type(m) ~= 'table' then fail('internal', 'Thread references a missing message') end
+          messages[#messages + 1] = read_item(m, record.rev)
+        end
       end
     end
-    i = first - 1
-  end
+    return messages, more
+  end)
   -- The page also stops at reply_budget. next_before then names its oldest message.
   local result = {thread = peer, next_before = cursor_max}
   local n = fit_page(result, messages)
@@ -1247,7 +1333,10 @@ local function change_members(user, peer, input, operation_key, context)
     if not g or not is_member(g, user) then fail('refused', 'Only a member changes this group') end
     local added = {}
     for _, id in ipairs(members) do if not is_member(g, id) then added[#added + 1] = id end end
-    local thread_key, thread_rev, ids = thread(user, peer.id)
+    -- The backfill reads the whole chain. Its tail revision guards the batch below.
+    local thread_key, thread_rev, tail, ids = with_chain(user, peer.id, function(key, rev, tail, segment)
+      return key, rev, tail, chain_ids(tail, segment)
+    end)
     local keys = {}
     for _, id in ipairs(ids) do keys[#keys + 1] = 'message/' .. id end
     local messages = #keys > 0 and message_records(keys) or {}
@@ -1276,7 +1365,7 @@ local function change_members(user, peer, input, operation_key, context)
       local message = {id = id, from = user, to = peer.id, recipients = added, reply_expected = false, at = os.date('!%Y-%m-%dT%H:%M:%SZ')}
       notice_body(message, thread_title(user, peer))
       ops[#ops + 1] = {key = 'message/' .. id, if_rev = '0', value = message}
-      ids[#ids + 1] = id
+      tail.ids[#tail.ids + 1] = id
       for _, member in ipairs(added) do
         local key, box_rev, unread = mailbox(member)
         unread[id] = true
@@ -1285,7 +1374,7 @@ local function change_members(user, peer, input, operation_key, context)
       end
     end
     -- This revision check also prevents a concurrent send from escaping the membership snapshot.
-    ops[#ops + 1] = {key = thread_key, if_rev = thread_rev, value = {ids = ids}}
+    ops[#ops + 1] = {key = thread_key, if_rev = thread_rev, value = tail_value(tail)}
     local stored = hub('hub.store.batch', {ops = ops, op = {key = op_key, fingerprint = fingerprint, result = result}})
     if stored.op_exists then return operation_result(stored.op_exists, fingerprint) end
     if type(stored.revs) == 'table' then return result end
@@ -1382,46 +1471,48 @@ local page_budget = 40000
 -- exist. JSON escapes can double a body, so the estimate counts each body twice. The first message
 -- always fits. A message larger than a page is cut, with a note, in the tree and in pages alike.
 local function history_page(user, peer, before, budget)
-  local _, _, ids = thread(user, peer.id)
-  local last = #ids
-  if before ~= nil then
-    last = nil
-    for i, id in ipairs(ids) do if id == before then last = i - 1 end end
-    if not last then fail('invalid_input', 'Unknown history cursor') end
-  end
-  local names = {}
-  for _, a in ipairs(participants) do names[a.id] = display_name(a) end
-  local newest_first, size, i = {}, 0, last
-  while i >= 1 do
-    local lo = math.max(1, i - 7)
-    local keys = {}
-    for k = lo, i do keys[#keys + 1] = 'message/' .. ids[k] end
-    local records = message_records(keys)
-    for k = i, lo, -1 do
-      local m = records['message/' .. ids[k]].value
-      if type(m) == 'table' then
-        local body = type(m.body) == 'string' and m.body or ''
-        local author = names[m.from] or m.from
-        local cost = 2 * #body + #author + #m.id + 200
-        if #newest_first > 0 and size + cost > budget then
-          local older = {}
-          for n = #newest_first, 1, -1 do older[#older + 1] = newest_first[n] end
-          return older, true
+  return with_chain(user, peer.id, function(_, _, tail, segment)
+    local next_ids = chain_reader(tail, segment)
+    if before ~= nil then
+      repeat
+        local id = next_ids(1)[1]
+        if not id then fail('invalid_input', 'Unknown history cursor') end
+      until id == before
+    end
+    local names = {}
+    for _, a in ipairs(participants) do names[a.id] = display_name(a) end
+    local newest_first, size = {}, 0
+    while true do
+      local ids = next_ids(8)
+      if #ids == 0 then break end
+      local keys = {}
+      for _, id in ipairs(ids) do keys[#keys + 1] = 'message/' .. id end
+      local records = message_records(keys)
+      for _, id in ipairs(ids) do
+        local m = records['message/' .. id].value
+        if type(m) == 'table' then
+          local body = type(m.body) == 'string' and m.body or ''
+          local author = names[m.from] or m.from
+          local cost = 2 * #body + #author + #m.id + 200
+          if #newest_first > 0 and size + cost > budget then
+            local older = {}
+            for n = #newest_first, 1, -1 do older[#older + 1] = newest_first[n] end
+            return older, true
+          end
+          if cost > page_budget then
+            body = utf8_cut(body, math.floor((page_budget - 400) / 2)) .. '\n\n… (message cut: ' .. math.floor(#m.body / 1024) .. ' KB)'
+            cost = page_budget
+          end
+          -- author is display text. own (optional) marks the user's own messages for styling.
+          newest_first[#newest_first + 1] = {id = m.id, author = author, own = m.from == user, text = body, at = m.at, fyi = m.reply_expected == false}
+          size = size + cost
         end
-        if cost > page_budget then
-          body = utf8_cut(body, math.floor((page_budget - 400) / 2)) .. '\n\n… (message cut: ' .. math.floor(#m.body / 1024) .. ' KB)'
-          cost = page_budget
-        end
-        -- author is display text. own (optional) marks the user's own messages for styling.
-        newest_first[#newest_first + 1] = {id = m.id, author = author, own = m.from == user, text = body, at = m.at, fyi = m.reply_expected == false}
-        size = size + cost
       end
     end
-    i = lo - 1
-  end
-  local older = {}
-  for n = #newest_first, 1, -1 do older[#older + 1] = newest_first[n] end
-  return older, false
+    local older = {}
+    for n = #newest_first, 1, -1 do older[#older + 1] = newest_first[n] end
+    return older, false
+  end)
 end
 
 local function render_thread(user, route)
@@ -1684,9 +1775,10 @@ local function render_form(args)
   if args.route == '/forms/thread-menu' then
     -- The thread overview: who is in the thread, then what the user can do with it.
     local peer = form_peer(args)
-    local _, _, ids = thread(args.user, peer.id)
+    local _, _, tail = thread(args.user, peer.id)
+    local count = tail.frozen + #tail.ids
     local agents = agent_items(args.user, peer)
-    local summary = (#agents == 1 and '1 agent' or #agents .. ' agents') .. ' · ' .. #ids .. (#ids == 1 and ' message' or ' messages')
+    local summary = (#agents == 1 and '1 agent' or #agents .. ' agents') .. ' · ' .. count .. (count == 1 and ' message' or ' messages')
     local actions = {
       {id = 'rename', label = 'Rename…', icon = '✎', action = {name = 'rename', enabled = true, user_only = 'navigation'}},
       {id = 'move', label = 'Move to session…', icon = '⇄', action = {name = 'move', enabled = true, user_only = 'navigation'}},
@@ -1760,7 +1852,8 @@ local function declare_tabs(user)
   for _, a in ipairs(peers(user)) do
     if not archived[a.id] then
       local home = thread_home(user, a.id)
-      local _, _, ids = thread(user, a.id)
+      local _, _, tail = thread(user, a.id)
+      local ids = tail.ids -- never empty after the first message (F1)
       if (not a.observer and (a.group or #ids > 0)) or opened_thread(user, a.id) then
         -- A thread with a composer opens as a transcript pane over the composer when the hub enables
         -- it (spikes/04-scrollback). A read-only direct thread has no composer: it keeps one view.
@@ -1964,13 +2057,18 @@ end
 
 -- A user joins an observed group in the same transaction as the first message.
 -- Earlier mail keeps its original delivery list and never enters the user's mailbox.
+-- ui_recipients returns the targets, the groups guard, the delivery backfill ops, and the tail
+-- that the backfill read ({key, rev, tail}, or nil): the send batch guards that same revision.
 local function ui_recipients(user, peer)
   local g, rev, groups = group(peer.id)
   if user ~= 'user' or not g then return recipients(user, peer.id) end
-  local ops = {}
+  local ops, read = {}, nil
   if not is_member(g, user) then
     if not rev then fail('refused', 'The user cannot join this group') end
-    local _, _, ids = thread(user, peer.id)
+    local ids
+    read, ids = with_chain(user, peer.id, function(key, tail_rev, tail, segment)
+      return {key = key, rev = tail_rev, tail = tail}, chain_ids(tail, segment)
+    end)
     for _, id in ipairs(ids) do
       local message = get({'message/' .. id})['message/' .. id].value
       if type(message) ~= 'table' then fail('internal', 'Thread references a missing message') end
@@ -1988,7 +2086,7 @@ local function ui_recipients(user, peer)
   end
   local targets = {}
   for _, id in ipairs(g.members) do if id ~= user then targets[#targets + 1] = id end end
-  return targets, rev and {key = 'groups', if_rev = rev, value = {groups = groups}} or nil, ops
+  return targets, rev and {key = 'groups', if_rev = rev, value = {groups = groups}} or nil, ops, read
 end
 
 local function view_send(args)
@@ -2015,7 +2113,7 @@ local function view_send(args)
     if draft_rev ~= args.draft_revision or draft_text ~= args.text then
       fail('draft_conflict', 'The saved draft differs from the text to send')
     end
-    local targets, guard, membership_ops = ui_recipients(user, peer)
+    local targets, guard, membership_ops, read = ui_recipients(user, peer)
     message.recipients = targets
     local ops = membership_ops or {}
     ops[#ops + 1] = {key = 'message/' .. id, value = message, if_rev = '0'}
@@ -2026,9 +2124,13 @@ local function view_send(args)
       ops[#ops + 1] = {key = box_key, value = {ids = ids}, if_rev = box_rev}
       ops[#ops + 1] = {notify = {agent = to, pending = true}}
     end
-    local thread_key, thread_rev, thread_ids = thread(user, peer.id)
-    thread_ids[#thread_ids + 1] = id
-    ops[#ops + 1] = {key = thread_key, value = {ids = thread_ids}, if_rev = thread_rev}
+    if not read then
+      local key, rev, tail = thread(user, peer.id)
+      read = {key = key, rev = rev, tail = tail}
+    end
+    local thread_key, thread_rev, tail = read.key, read.rev, read.tail
+    tail.ids[#tail.ids + 1] = id
+    ops[#ops + 1] = {key = thread_key, value = tail_value(tail), if_rev = thread_rev}
     ops[#ops + 1] = {key = draft_key, value = {text = ''}, if_rev = draft_rev}
     local stored = hub('hub.store.batch', {
       ops = ops,

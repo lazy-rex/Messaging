@@ -67,6 +67,7 @@ lazyrex-hub test -file send.lua
 | thread_menu.lua | Rename, members and move as tools and as UI forms. |
 | readsize_send.lua | Size admission: encoded sizes as the hub stores them, the body limit on both send paths, key and reply_to, replay before limits, a batch that cannot fit, the notice title. |
 | readsize_legacy.lua | Stored messages over the limits: body prefix, metadata markers, long IDs, `thread_id_too_large`, packed reads, `key_too_large`. |
+| chain_readers.lua | F1 readers: history and view history across segments, the menu count, the tab revision, writers keep the chain fields, backfills from segments, a missing segment. |
 
 `lazyrex.json` is the test manifest. `tests/parity_fixture.lua` renders the thread menu forms for
 the parity sweep.
