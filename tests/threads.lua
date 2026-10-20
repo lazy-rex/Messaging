@@ -120,7 +120,13 @@ end)
 test('the thread view: no tree status, a menu button, FYI marked in history', function()
   local v = user:open('thread/' .. created.id)
   local tree = v:render()
-  expect(v:get().status, 'the tab declaration owns the thread status').to_equal(tab('thread/' .. created.id).status)
+  -- The hub commits the tab status first; a separate worker then updates the snapshots.
+  local declared = tab('thread/' .. created.id).status
+  expect(declared, 'the FYI is unread').to_equal({state = 'done', msg = '1 unread'})
+  wait('the snapshot status', function()
+    local s = v:get().status
+    if s and s.state == declared.state and s.msg == declared.msg and s.kind == declared.kind then return true end
+  end)
   expect(H.node(tree, 'thread_menu').action.name).to_be('open')
   expect(H.node(tree, 'history').messages[1].fyi).to_be(true)
   local op = v:action('thread_menu', 'open', {})
