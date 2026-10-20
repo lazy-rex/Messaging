@@ -134,22 +134,29 @@ end)
 -- the reply of a get of key, so the reader has the old data and its next read sees the change.
 
 test('a chain replaced after the reader consumed a segment: the whole read starts again', function()
+  -- An agent-only thread: no view renders it, so only the tested history call reads its segments.
+  local charlie = agent('charlie')
   local ids = {}
-  for i = 1, 11 do ids[i] = bob:call('messaging.send', {to = 'user', body = 'r' .. i, key = 'race-' .. i}).id end
-  local key = tail_key('bob', 'user')
-  chain(key, '0', ids, {3, 3, 3})
-  -- After segment 2 is read, an alias migration replaces chain 0 with chain 1, packed otherwise.
+  for i = 1, 110 do ids[i] = charlie:call('messaging.send', {to = 'bob', body = 'r' .. i, key = 'race-' .. i}).id end
+  local key = tail_key('bob', 'charlie')
+  chain(key, '0', ids, {30, 30, 30})
+  -- before = r100. The first fetch (the tail and segment 2) collects r99 to r61. The second fetch
+  -- reads segment 1, then finds segment 0 missing: a reader that kept its first collection would
+  -- return r99 to r61 twice.
+  local before = bob:call('messaging.history', {thread = 'charlie', limit = 11}).messages[11].cursor
+  -- After segment 1 is read, an alias migration replaces chain 0 with chain 1, packed otherwise.
   local ops = {}
   for k = 0, 2 do ops[#ops + 1] = {key = seg_key(key, '0', k), delete = true} end
-  ops[#ops + 1] = {key = seg_key(key, '1', 0), value = {ids = slice(ids, 1, 4)}}
-  ops[#ops + 1] = {key = seg_key(key, '1', 1), value = {ids = slice(ids, 5, 8)}}
-  ops[#ops + 1] = {key = key, value = {ids = slice(ids, 9, 11), seg = 2, chain = '1', frozen = 8}}
-  local id = inject({match = {reads = seg_key(key, '0', 2)}, ops = ops})
-  local h = bob:call('messaging.history', {thread = 'user', limit = 50})
-  expect(injection(id).consumed, 'the reader read segment 2 of the old chain').to_be(1)
-  local newest_first = {}
-  for i = 11, 1, -1 do newest_first[#newest_first + 1] = ids[i] end
-  expect(ids_of(h.messages), 'no repeated and no missing message').to_equal(newest_first)
+  ops[#ops + 1] = {key = seg_key(key, '1', 0), value = {ids = slice(ids, 1, 40)}}
+  ops[#ops + 1] = {key = seg_key(key, '1', 1), value = {ids = slice(ids, 41, 80)}}
+  ops[#ops + 1] = {key = key, value = {ids = slice(ids, 81, 110), seg = 2, chain = '1', frozen = 80}}
+  local id = inject({match = {reads = seg_key(key, '0', 1)}, ops = ops})
+  local h = bob:call('messaging.history', {thread = 'charlie', limit = 50, before = before})
+  expect(injection(id).consumed, 'the reader read segment 1 of the old chain').to_be(1)
+  local want = {}
+  for i = 99, 50, -1 do want[#want + 1] = ids[i] end
+  expect(ids_of(h.messages), 'no repeated and no missing message').to_equal(want)
+  expect(h.next_before).to_be(h.messages[50].cursor)
 end)
 
 test('a join send guards the tail that its backfill read', function()
