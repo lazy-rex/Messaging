@@ -60,6 +60,7 @@ lazyrex-hub test -file send.lua
 | threads.lua | Tabs, thread creation, FYI, unread status, cursors, archive and restore. |
 | members.lua | Membership changes, delivery snapshots, history pages, direct expansion. |
 | homes.lua | Thread homes, reopen tokens, panel order, redirects, sessions, moves. |
+| home_views.lua | The open view of a homed thread: focus, a user close, a closed tab across a hub restart, reopens by a message and by Threads…, the draft across a menu form. |
 | migration.lua, migration_order.lua | Identity migration, old retries, renames, short names. |
 | observer.lua | Read-only observation, the group join, long history in pages. |
 | thread_menu.lua | Rename, members and move as tools and as UI forms. |
@@ -68,12 +69,3 @@ lazyrex-hub test -file send.lua
 
 `lazyrex.json` is the test manifest. `tests/parity_fixture.lua` renders the thread menu forms for
 the parity sweep.
-
-The Node test needs a lab server that you start:
-
-```sh
-../LazyRex/lab/server.sh /tmp/rexlab
-REX_SERVER=unix:///tmp/rexlab/rex.sock node tests/<name>.mjs
-```
-
-- thread-home-lab.mjs (lab, real hub)
