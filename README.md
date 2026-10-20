@@ -33,8 +33,13 @@ The plugin keeps every reply and request inside that limit:
   read page and one history page. A stored operation replays before these limits.
 - **Every hub request** is measured before it is sent (64 KiB minus 1 KiB). One that can never fit
   is `invalid_input` with its size, and nothing of it is committed. The body limit is fixed; whether
-  a whole batch fits depends on the current mailbox, thread and groups records (index growth is a
-  separate open item, F in the LazyRex roadmap).
+  a whole batch fits depends on the current mailbox, thread and groups records (mailbox growth is a
+  separate open item, F2 in docs/f-thread-tail.md).
+- **Thread chains (F1, docs/f-thread-tail.md).** The thread record `thread/<pair>` is the tail:
+  the newest IDs, at most 8192 encoded bytes as a packing target. Before an append, freeze steps
+  move the oldest IDs into segments `thread-seg/<pair>/<chain>/<k>`, written once. Readers walk
+  the tail and the segments; a missing segment restarts the whole read. The alias migration
+  writes a new chain. A thread of 2000 messages with IDs of about 85 bytes is tested.
 - **Reads from the hub** take at most 8 keys and, as a target, 49152 encoded bytes of keys in one
   request; a larger key goes alone. A batch whose reply is over the hub's limit (`reply_too_large`)
   is read one key at a time. One record over the hub limit is `record_too_large`; a key whose own
@@ -72,6 +77,9 @@ lazyrex-hub test -file send.lua
 | readsize_send.lua | Size admission: encoded sizes as the hub stores them, the body limit on both send paths, key and reply_to, replay before limits, a batch that cannot fit, the notice title. |
 | readsize_legacy.lua | Stored messages over the limits: body prefix, metadata markers, long IDs, `thread_id_too_large`, packed reads, `key_too_large`. |
 | chain_readers.lua | F1 readers: history and view history across segments, the menu count, the tab revision, writers keep the chain fields, backfills from segments, a missing segment. |
+| chain_freeze.lua | F1 writers: the freeze boundary, an interrupted freeze, legacy tails in steps, oversized IDs, races with appends, backfills and view sends. |
+| chain_migration.lua, chain_migration_limits.lua | F1 alias migration: merged chains, a second migration, a conflict, a torn scan, a batch over the limit. |
+| chain_growth.lua | F1 growth: 2000 messages, every send commits, history to the oldest message. |
 
 `lazyrex.json` is the test manifest. `tests/parity_fixture.lua` renders the thread menu forms for
 the parity sweep.

@@ -4,7 +4,10 @@ Status: proposal, revision 3, 2026-10-19. Revision 1 (e9e7a33) was not approved:
 found three gaps (an empty tail after a freeze, `ui_recipients`, the alias migration rule).
 Revision 2 (aa30c23) answered them; the reviewer accepted 8192 bytes as the packing target and
 asked for recovery rules (resume by size, oversized IDs, a restart of the whole read). This
-revision adds them. Nothing is implemented. Read README "Size limits" first.
+revision adds them. Read README "Size limits" first.
+
+Implementation: F1 is built in four commits (readers, writers, alias migration, growth test), with
+the tests of "Tests" below. F2 and F3 are not implemented.
 
 ## Problem
 
