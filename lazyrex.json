@@ -1,6 +1,7 @@
 {
  "name": "messaging",
  "main": "messaging.lua",
+ "notice": "New message. Call messaging_read.",
  "test": {
   "agents": [
    {
