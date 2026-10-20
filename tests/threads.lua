@@ -81,9 +81,8 @@ end)
 test('a concurrent group write survives a create retry; a direct create returns the direct thread', function()
   local groups = store('groups').value.groups
   groups['g-concurrent'] = {name = 'Concurrent', members = {'alice', 'bob'}}
-  local raced
-  with_injection({match = {writes = 'groups'}, ops = {{key = 'groups', value = {groups = groups}}}}, 1, function()
-    raced = alice:call('messaging.thread_create', {key = 'create-race', title = 'Raced', members = {'bob'}})
+  local raced = with_injection({match = {writes = 'groups'}, ops = {{key = 'groups', value = {groups = groups}}}}, 1, function()
+    return alice:call('messaging.thread_create', {key = 'create-race', title = 'Raced', members = {'bob'}})
   end)
   expect(store('groups').value.groups['g-concurrent']).to_be_truthy()
   expect(store('groups').value.groups[raced.id]).to_be_truthy()
@@ -142,9 +141,8 @@ test('archive from the menu keeps other archived threads, the draft and unread d
   draft_before = store(draft_key)
   local menu = user:view('/forms/thread-menu')
   menu:render()
-  local op
-  with_injection({match = {writes = 'thread-archive/' .. part('user')}, ops = {{key = 'thread-archive/' .. part('user'), value = {ids = {team = true}}}}}, 1, function()
-    op = menu:action('thread_menu', 'archive', {item_id = 'archive'})
+  local op = with_injection({match = {writes = 'thread-archive/' .. part('user')}, ops = {{key = 'thread-archive/' .. part('user'), value = {ids = {team = true}}}}}, 1, function()
+    return menu:action('thread_menu', 'archive', {item_id = 'archive'})
   end)
   expect(op.result).to_equal({panel = {command = 'threads'}})
   local archived = store('thread-archive/' .. part('user')).value.ids

@@ -48,9 +48,8 @@ test('a member change in the form keeps delivered mail and an unrelated concurre
   expect(find(H.node(f:render(), 'thread_members').fields, 'member_bob').value).to_be(true)
   local groups = store('groups').value
   groups.groups['g-concurrent-members'] = {name = 'Concurrent group', members = {'bob', 'user'}}
-  local op
-  with_injection({match = {op_prefix = 'members/'}, ops = {{key = 'groups', value = groups}}}, 1, function()
-    op = f:action('thread_members', 'submit', {values = {member_alice = true, member_charlie = true}}, 'change-members')
+  local op = with_injection({match = {op_prefix = 'members/'}, ops = {{key = 'groups', value = groups}}}, 1, function()
+    return f:action('thread_members', 'submit', {values = {member_alice = true, member_charlie = true}}, 'change-members')
   end)
   expect(op.result).to_equal({close_form = true})
   expect(store('groups').value.groups['g-concurrent-members'], 'the retry keeps an unrelated group').to_be_truthy()
@@ -100,9 +99,8 @@ end)
 test('a send whose membership snapshot goes stale uses the new members on retry', function()
   local groups = store('groups').value
   groups.groups[editable.id].members = {'alice', 'bob', 'user'}
-  local raced
-  with_injection({match = {op_key = 'send/' .. part('alice') .. part('membership-race')}, ops = {{key = 'groups', value = groups}}}, 1, function()
-    raced = alice:call('messaging.send', {to = editable.id, body = 'Membership race', key = 'membership-race'})
+  local raced = with_injection({match = {op_key = 'send/' .. part('alice') .. part('membership-race')}, ops = {{key = 'groups', value = groups}}}, 1, function()
+    return alice:call('messaging.send', {to = editable.id, body = 'Membership race', key = 'membership-race'})
   end)
   expect(store(box('bob')).value.ids[raced.id]).to_be(true)
   expect((store(box('charlie')).value or {ids = {}}).ids[raced.id]).to_be(nil)

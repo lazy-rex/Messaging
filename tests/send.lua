@@ -66,8 +66,8 @@ test('a mailbox conflict retry keeps the concurrent entry', function()
   write({{key = 'message/injected-message', value = {id = 'injected-message', from = 'alice', to = 'bob', body = 'concurrent', at = '2026-01-01T00:00:00Z'}}})
   local current = store(box('bob')).value.ids
   current['injected-message'] = true
-  with_injection({match = {writes = box('bob')}, ops = {{key = box('bob'), value = {ids = current}}}}, 1, function()
-    third = alice:call('messaging.send', {key = 'conflict-once', body = 'hello', to = 'bob'})
+  third = with_injection({match = {writes = box('bob')}, ops = {{key = box('bob'), value = {ids = current}}}}, 1, function()
+    return alice:call('messaging.send', {key = 'conflict-once', body = 'hello', to = 'bob'})
   end)
   expect(ids_of('bob')).to_equal(sorted({'injected-message', third.id}))
 end)
@@ -101,9 +101,8 @@ test('the retry budget is bounded and saves no operation', function()
 end)
 
 test('a batch that another invocation already committed returns the saved result', function()
-  local replay
-  with_injection({match = {op_key = 'send/' .. part('alice') .. part('committed-before-batch')}, replay = true}, 1, function()
-    replay = alice:call('messaging.send', {key = 'committed-before-batch', body = 'hello', to = 'bob'})
+  local replay = with_injection({match = {op_key = 'send/' .. part('alice') .. part('committed-before-batch')}, replay = true}, 1, function()
+    return alice:call('messaging.send', {key = 'committed-before-batch', body = 'hello', to = 'bob'})
   end)
   expect(replay.id).to_be('send/' .. part('alice') .. part('committed-before-batch'))
 end)
@@ -186,9 +185,7 @@ test('a definite hub failure ends a view send; a transient one is retried', func
     local saved = v:draft('composer', 'Code check ' .. key, H.node(v:render(), 'composer').draft_revision or '0', key .. '-draft')
     expect(saved.status, 'draft ' .. key).to_be('succeeded')
     spec.match = {op_key = 'send/' .. part('user') .. part(key)}
-    local op
-    with_injection(spec, 1, function() op = v:send('composer', 'Code check ' .. key, saved.result.draft_revision, key) end)
-    return op
+    return with_injection(spec, 1, function() return v:send('composer', 'Code check ' .. key, saved.result.draft_revision, key) end)
   end
   local definite = send_with('code-definite', {fail = 'Definite refusal'})
   expect(definite.status, 'a definite code is not retried').to_be('failed')
