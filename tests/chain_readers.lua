@@ -129,3 +129,45 @@ test('a segment missing on every read ends with unavailable', function()
   write({{key = seg_key(key, '0', 0), delete = true}})
   expect_error(function() alice:call('messaging.history', {thread = 'bob', limit = 50}) end, 'unavailable')
 end)
+
+-- The read hook (hub 6c48bf7): inject{match = {reads = key}} commits its ops after the hub built
+-- the reply of a get of key, so the reader has the old data and its next read sees the change.
+
+test('a chain replaced after the reader consumed a segment: the whole read starts again', function()
+  local ids = {}
+  for i = 1, 11 do ids[i] = bob:call('messaging.send', {to = 'user', body = 'r' .. i, key = 'race-' .. i}).id end
+  local key = tail_key('bob', 'user')
+  chain(key, '0', ids, {3, 3, 3})
+  -- After segment 2 is read, an alias migration replaces chain 0 with chain 1, packed otherwise.
+  local ops = {}
+  for k = 0, 2 do ops[#ops + 1] = {key = seg_key(key, '0', k), delete = true} end
+  ops[#ops + 1] = {key = seg_key(key, '1', 0), value = {ids = slice(ids, 1, 4)}}
+  ops[#ops + 1] = {key = seg_key(key, '1', 1), value = {ids = slice(ids, 5, 8)}}
+  ops[#ops + 1] = {key = key, value = {ids = slice(ids, 9, 11), seg = 2, chain = '1', frozen = 8}}
+  local id = inject({match = {reads = seg_key(key, '0', 2)}, ops = ops})
+  local h = bob:call('messaging.history', {thread = 'user', limit = 50})
+  expect(injection(id).consumed, 'the reader read segment 2 of the old chain').to_be(1)
+  local newest_first = {}
+  for i = 11, 1, -1 do newest_first[#newest_first + 1] = ids[i] end
+  expect(ids_of(h.messages), 'no repeated and no missing message').to_equal(newest_first)
+end)
+
+test('a join send guards the tail that its backfill read', function()
+  local g, old, new, key = legacy_group('chain-guard')
+  local v = user:open('thread/' .. g.id)
+  v:render()
+  local saved = v:draft('composer', 'joining', '0', 'chain-guard-draft')
+  -- After the backfill reads the delivery record of old, another writer appends a message without
+  -- a delivery snapshot. The send must not commit a backfill that misses it.
+  local raced = {id = 'raced-legacy', from = 'alice', to = g.id, body = 'raced', at = '2026-10-19T00:00:00Z'}
+  local id = inject({match = {reads = 'delivery/' .. part(old)}, ops = {
+    {key = 'message/raced-legacy', value = raced},
+    {key = key, value = {ids = {new, 'raced-legacy'}, seg = 1, frozen = 1}},
+  }})
+  local op = v:send('composer', 'joining', saved.result.draft_revision, 'chain-guard-send')
+  expect(op.status).to_be('succeeded')
+  expect(injection(id).consumed).to_be(1)
+  expect(store('delivery/' .. part('raced-legacy')).value, 'the retry backfills the raced message').to_equal({ids = {'bob'}})
+  expect(store('delivery/' .. part(old)).value).to_equal({ids = {'bob'}})
+  expect(store(key).value).to_equal({ids = {new, 'raced-legacy', op.result.message_id}, seg = 1, frozen = 1})
+end)
