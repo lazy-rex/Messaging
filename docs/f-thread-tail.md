@@ -74,11 +74,14 @@ revision adds them. Nothing is implemented. Read README "Size limits" first.
   commits nothing. No loop, and no ID is dropped.
 - A normal thread (tail at or under the target before the append) needs one step: the prefix is
   every ID except the newest.
-- A legacy tail over the target (for example a 60 KB fixture) needs several steps. Each step is a
-  valid state. A crash or a failure between steps leaves a valid chain; the next append continues.
-  A step batch is also measured against the request limit. A step that cannot fit (only possible
-  with one ID near the request limit) is `invalid_input`, and the thread accepts no more appends,
-  as today. About 60 KB is a tested fixture, not a guarantee for every legacy record.
+- A legacy tail over the target (for example the planned 60 KB fixture) needs several steps. Each
+  step is a valid state. A crash or a failure between steps leaves a valid chain; the next append
+  continues.
+- A step batch is measured against the request limit. It carries the new segment and the whole
+  remaining tail, so the first step of a large legacy tail is about as large as the tail itself.
+  A step that cannot fit is `invalid_input`, and the thread accepts no more appends, as today. A
+  tail of many ordinary IDs near the request limit can do this, not only one large ID. The 60 KB
+  case is a planned fixture until its test passes; it is not a guarantee for every legacy record.
 - The step batches write no message, mailbox or operation record. A conflict in a step or in the
   send batch retries from a new read, as today, within the existing `attempts` bound for the whole
   send.
@@ -150,7 +153,7 @@ one segment read for each segment. This is accepted for F1; a position index is 
   count are the same as before the freeze. Then a retry of the send succeeds.
 - History and view history across 3 segments: newest first for `messaging.history` with exact
   `before`/`next_before`; oldest first for each `view.history` page with message-ID `before`.
-- A legacy tail of about 60 KB (a fixture, not a guarantee): the first send freezes in steps and
+- A legacy tail of about 60 KB (a planned fixture, not a guarantee): the first send freezes in steps and
   succeeds (today it fails).
 - A failure between legacy steps (an injected definite failure of the second step batch): the
   chain is valid (one segment, the tail still over the target, `seg = 1`); history is complete; a
