@@ -639,6 +639,58 @@ local function chain_ids(tail, segment)
   return out
 end
 
+-- tail_limit is the packing target of a tail and of a segment, in encoded bytes of {ids = ...}.
+-- It is not a rejection limit: an ID over it gets a segment alone, and a tail of one ID never
+-- freezes. The only rejection is the request limit that hub() measures.
+local tail_limit = 8192
+
+-- ids_size is the encoded size of {"ids":[...]}: the item sizes, the commas and 10 bytes.
+local function ids_size(item_sizes, n)
+  local total = 10 + math.max(n - 1, 0)
+  for i = 1, n do total = total + item_sizes[i] end
+  return total
+end
+
+-- prepare_tail runs freeze steps on the thread of a and b until the tail with next_id fits
+-- tail_limit, or the tail is one ID. A step is one batch: the longest oldest prefix at or under
+-- tail_limit, at least one ID and never the newest, becomes segment seg; the tail keeps the rest.
+-- The decision uses the size only, so a tail that a failure left over the target continues with
+-- the same steps. Steps have their own conflict bound: a successful step does not use the
+-- caller's attempts. Returns the tail of the last read.
+local function prepare_tail(a, b, next_id)
+  local conflicts = 0
+  while true do
+    local key, rev, tail = thread(a, b)
+    local n = #tail.ids
+    if n <= 1 then return key, rev, tail end
+    local sizes = {}
+    for i, id in ipairs(tail.ids) do sizes[i] = encoded_size(id) end
+    sizes[n + 1] = encoded_size(next_id)
+    if ids_size(sizes, n + 1) <= tail_limit then return key, rev, tail end
+    local take, size = 1, 10 + sizes[1]
+    while take < n - 1 and size + 1 + sizes[take + 1] <= tail_limit do
+      take = take + 1
+      size = size + 1 + sizes[take]
+    end
+    local frozen, rest = {}, {}
+    for i = 1, n do
+      if i <= take then frozen[#frozen + 1] = tail.ids[i] else rest[#rest + 1] = tail.ids[i] end
+    end
+    local after = {ids = rest, seg = tail.seg + 1, chain = tail.chain, frozen = tail.frozen + take}
+    local stored = hub('hub.store.batch', {ops = {
+      {key = segment_key(key, tail.chain, tail.seg), value = {ids = frozen}, if_rev = '0'},
+      {key = key, value = tail_value(after), if_rev = rev},
+    }})
+    if stored.conflict then
+      if stored.conflict.kind ~= 'revision' then fail('internal', 'Unexpected thread freeze conflict') end
+      conflicts = conflicts + 1
+      if conflicts >= attempts then fail('unavailable', 'The thread changed during a freeze; retry') end
+    elseif type(stored.revs) ~= 'table' then
+      fail('internal', 'Invalid store batch result')
+    end
+  end
+end
+
 local function identify(ev)
   local principal = ev.requester and ev.requester.principal
   if not principal or principal.kind ~= 'peer' or type(principal.pid) ~= 'number' then
@@ -840,7 +892,7 @@ local function send(agent, args)
       ops[#ops + 1] = {key = box_key, value = {ids = self_ids}, if_rev = rev}
       ops[#ops + 1] = {notify = {agent = agent, pending = true}}
     end
-    local thread_key, thread_rev, tail = thread(agent, args.to)
+    local thread_key, thread_rev, tail = prepare_tail(agent, args.to, id)
     tail.ids[#tail.ids + 1] = id
     ops[#ops + 1] = {key = thread_key, value = tail_value(tail), if_rev = thread_rev}
     local stored = hub('hub.store.batch', {
@@ -1333,7 +1385,8 @@ local function change_members(user, peer, input, operation_key, context)
     if not g or not is_member(g, user) then fail('refused', 'Only a member changes this group') end
     local added = {}
     for _, id in ipairs(members) do if not is_member(g, id) then added[#added + 1] = id end end
-    -- The backfill reads the whole chain. Its tail revision guards the batch below.
+    -- Freeze first; then the backfill reads the whole chain, and its tail revision guards the batch.
+    prepare_tail(user, peer.id, 'member-notice/' .. op_key)
     local thread_key, thread_rev, tail, ids = with_chain(user, peer.id, function(key, rev, tail, segment)
       return key, rev, tail, chain_ids(tail, segment)
     end)
@@ -2118,6 +2171,8 @@ local function view_send(args)
     if draft_rev ~= args.draft_revision or draft_text ~= args.text then
       fail('draft_conflict', 'The saved draft differs from the text to send')
     end
+    -- Freeze first. A group join then reads the chain for its backfill and guards that tail read.
+    local prepared = {prepare_tail(user, peer.id, id)}
     local targets, guard, membership_ops, read = ui_recipients(user, peer)
     message.recipients = targets
     local ops = membership_ops or {}
@@ -2129,10 +2184,7 @@ local function view_send(args)
       ops[#ops + 1] = {key = box_key, value = {ids = ids}, if_rev = box_rev}
       ops[#ops + 1] = {notify = {agent = to, pending = true}}
     end
-    if not read then
-      local key, rev, tail = thread(user, peer.id)
-      read = {key = key, rev = rev, tail = tail}
-    end
+    if not read then read = {key = prepared[1], rev = prepared[2], tail = prepared[3]} end
     local thread_key, thread_rev, tail = read.key, read.rev, read.tail
     tail.ids[#tail.ids + 1] = id
     ops[#ops + 1] = {key = thread_key, value = tail_value(tail), if_rev = thread_rev}
