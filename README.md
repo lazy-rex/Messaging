@@ -62,6 +62,7 @@ lazyrex-hub test -file send.lua
 | homes.lua | Thread homes, reopen tokens, panel order, redirects, sessions, moves. |
 | home_views.lua | The open view of a homed thread: focus, a user close, a closed tab across a hub restart, reopens by a message and by Threads…, the draft across a menu form. |
 | migration.lua, migration_order.lua | Identity migration, old retries, renames, short names. |
+| identity_mail.lua | Mail across identity reports: migration with the same cursor, an identity that never joined, /clear and resume, a hub crash. |
 | observer.lua | Read-only observation, the group join, long history in pages. |
 | thread_menu.lua | Rename, members and move as tools and as UI forms. |
 | readsize_send.lua | Size admission: encoded sizes as the hub stores them, the body limit on both send paths, key and reply_to, replay before limits, a batch that cannot fit, the notice title. |
