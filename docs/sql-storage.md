@@ -46,6 +46,23 @@ waits for draft 2, which comes with a prototype:
 - Rows with NULL decode in Lua with holes: index rows by column number, never `ipairs`.
 - Ordering of `hub.sql.*` with `hub.store.*` (the import reads key-value and writes SQL) is not in
   draft 1; the import does not depend on it beyond the fence and the source check.
+- A notice's `pending` must come from the transaction, not from a read before it (reviewer): an ack
+  that computed "no unread" before a send committed would clear the send's wake-up. Two ways:
+  (a) the hub takes the value from a query statement of the batch (proposed: `{agent, pending_from
+  = <statement index>}`, the first cell of that query); (b) Messaging adds a guarded no-op write
+  that proves the precomputed value: `UPDATE clock SET n = n WHERE (EXISTS (SELECT 1 FROM
+  deliveries WHERE agent = ? AND acked = 0)) = ?`, `expect_changes = 1`. (a) is cleaner; (b) works
+  on draft 1 but marks views that depend on `clock`. Plan: (a) if draft 2 has it, else (b).
+- Messaging removes its outbox and timer only after the hub outbox has its full lifecycle: retry of
+  a transient hub.db failure without another call, a durable apply receipt, commit-order replay,
+  order with `hub.store.batch` notices, and a defined rule for unknown, absent and superseded
+  agents (reviewer).
+- After the transport key expires, a retry is not replay-safe on the hub side; Messaging's own
+  `operations` table is what makes its actions safe to retry.
+- `complete = false` with fewer rows than `LIMIT` is a partial page: the read continues from the
+  last returned row, never from `high`.
+- Release gates for the Messaging cutover: a stopped (or coordinated) backup of hub.db and the SQL
+  file that keeps the import states, and the hub's replacement linearization proof.
 
 Decision (user, 2026-10-21): each plugin gets its own SQLite database, run by the hub, through hub
 actions. Messaging keeps its current semantics exactly:
