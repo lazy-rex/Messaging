@@ -405,6 +405,14 @@ local function get(keys)
   return result.records
 end
 
+-- lookup returns the record of key: from records (a prefix scan that holds key's family; absent
+-- means rev '0') when given, else from one hub.store.get. declare_tabs passes records, so its
+-- reads do not grow with the number of peers.
+local function lookup(key, records)
+  if records then return records[key] or {rev = '0'} end
+  return get({key})[key]
+end
+
 local function mailbox(agent)
   local key = 'mailbox/' .. part(agent)
   local record = get({key})[key]
@@ -541,13 +549,13 @@ local function thread_key(a, b)
   return 'thread/' .. part(a) .. part(b)
 end
 
-local function thread_home(a, b)
+local function thread_home(a, b, records)
   local suffix = thread_key(a, b):sub(8)
   if a == 'user' and observed_direct_parts(b) then
     suffix = b < a and (part(b) .. part(a)) or (part(a) .. part(b))
   end
   local key = 'thread-meta/' .. suffix
-  local record = get({key})[key]
+  local record = lookup(key, records)
   return type(record.value) == 'table' and record.value.home_session or nil, key, record.rev
 end
 
@@ -563,9 +571,9 @@ local function count_field(v)
   return v == nil or (type(v) == 'number' and v >= 0 and v % 1 == 0)
 end
 
-local function thread(a, b)
+local function thread(a, b, records)
   local key = thread_key(a, b)
-  local record = get({key})[key]
+  local record = lookup(key, records)
   local tail = {ids = {}, seg = 0, chain = '0', frozen = 0}
   if record.rev ~= '0' then
     local v = record.value
@@ -1137,9 +1145,9 @@ local function display_name(a)
 end
 
 -- Only explicit user opens create a marker. Roster membership does not create a tab.
-local function opened_thread(user, peer)
+local function opened_thread(user, peer, records)
   local key = 'thread-open/' .. part(user) .. part(canonical_thread_id(peer))
-  local record = get({key})[key]
+  local record = lookup(key, records)
   return record.rev ~= '0' and type(record.value) == 'table' and record.value.opened == true, key, record.rev
 end
 
@@ -1155,19 +1163,19 @@ local function remember_thread_open(user, peer)
   fail('unavailable', 'The thread changed; retry the open')
 end
 
-local function thread_title(user, peer)
+local function thread_title(user, peer, records)
   local key = 'thread-title/' .. part(user) .. part(peer.id)
-  local record = get({key})[key]
+  local record = lookup(key, records)
   if record.rev ~= '0' and type(record.value) == 'table'
     and type(record.value.title) == 'string' and record.value.title:match('%S') then return record.value.title end
   return display_name(peer)
 end
 
-local function observed_direct_peer(id)
+local function observed_direct_peer(id, records)
   local pair = observed_direct_parts(id)
   if not pair then return nil end
   local key = 'thread/' .. part(pair[1]) .. part(pair[2])
-  local record = get({key})[key]
+  local record = lookup(key, records)
   if record.rev == '0' or type(record.value) ~= 'table' or type(record.value.ids) ~= 'table' or #record.value.ids == 0 then return nil end
   local names = {}
   for _, a in ipairs(participants) do if not a.alias_of then names[a.id] = display_name(a) end end
@@ -1175,7 +1183,25 @@ local function observed_direct_peer(id)
     observer = true, readonly = true}
 end
 
-local function peers(user)
+-- tab_records reads, with one prefix scan per family (paged), every record that the thread lists
+-- read for each peer of user: the thread tails, the homes (thread-meta), and user's opened marks
+-- and titles. The number of hub requests does not grow with the number of peers.
+local function tab_records(user)
+  local records = {}
+  for _, prefix in ipairs({'thread/', 'thread-meta/', 'thread-open/' .. part(user), 'thread-title/' .. part(user)}) do
+    local after
+    repeat
+      local page = hub('hub.store.scan', {prefix = prefix, after = after})
+      for key, record in pairs(page.records or {}) do records[key] = record end
+      after = page.next
+    until not after
+  end
+  return records
+end
+
+-- peers lists the threads of user. records: optional scan records (see lookup). direct_only: no
+-- observed agent-to-agent threads (a caller that resolves one by its ID first).
+local function peers(user, records, direct_only)
   local list = {}
   for _, a in ipairs(participants) do
     if a.id ~= user and not a.alias_of then list[#list + 1] = a end
@@ -1189,23 +1215,30 @@ local function peers(user)
   end
   table.sort(created, function(x, y) return x.name < y.name or (x.name == y.name and x.id < y.id) end)
   for _, g in ipairs(created) do list[#list + 1] = g end
-  if user == 'user' then
-    local after, seen, observed = nil, {}, {}
-    repeat
-      local page = hub('hub.store.scan', {prefix = 'thread/', after = after})
-      for key, record in pairs(page.records or {}) do
-        local pair = key:match('^thread/') and parts(key:sub(8))
-        if pair and #pair == 2 and pair[1] ~= '' and pair[2] ~= '' and pair[1] ~= user and pair[2] ~= user
-          and type(record.value) == 'table' and type(record.value.ids) == 'table' and #record.value.ids > 0 then
-          local id = observed_direct_id(pair[1], pair[2])
-          if not seen[id] then
-            local peer = observed_direct_peer(id)
-            if peer then observed[#observed + 1] = peer; seen[id] = true end
-          end
+  if user == 'user' and not direct_only then
+    -- The observed agent-to-agent threads come from the thread tails: records (a scan that holds
+    -- thread/), or one scan here. observed_direct_peer reads the same records, not one get each.
+    if not records then
+      records = {}
+      local after
+      repeat
+        local page = hub('hub.store.scan', {prefix = 'thread/', after = after})
+        for key, record in pairs(page.records or {}) do records[key] = record end
+        after = page.next
+      until not after
+    end
+    local seen, observed = {}, {}
+    for key, record in pairs(records) do
+      local pair = key:match('^thread/') and parts(key:sub(8))
+      if pair and #pair == 2 and pair[1] ~= '' and pair[2] ~= '' and pair[1] ~= user and pair[2] ~= user
+        and type(record.value) == 'table' and type(record.value.ids) == 'table' and #record.value.ids > 0 then
+        local id = observed_direct_id(pair[1], pair[2])
+        if not seen[id] then
+          local peer = observed_direct_peer(id, records)
+          if peer then observed[#observed + 1] = peer; seen[id] = true end
         end
       end
-      after = page.next
-    until not after
+    end
     table.sort(observed, function(a, b) return a.name < b.name or (a.name == b.name and a.id < b.id) end)
     for _, peer in ipairs(observed) do list[#list + 1] = peer end
   end
@@ -1221,7 +1254,7 @@ local function thread_peer(route, user)
   end
   if peer then peer = resolve_recipient(peer) end
   if not peer then fail('invalid_input', 'Not a thread route: ' .. tostring(route)) end
-  for _, a in ipairs(peers(user)) do
+  for _, a in ipairs(peers(user, nil, true)) do
     if a.id == peer then return a end
   end
   fail('invalid_input', 'Unknown thread: ' .. peer)
@@ -1260,10 +1293,11 @@ local function thread_list(agent, args)
   local _, _, archived = archived_threads(agent)
   local counts = unread_counts(agent)
   local list = {}
-  for _, peer in ipairs(peers(agent)) do
+  local records, created = tab_records(agent), stored_groups()
+  for _, peer in ipairs(peers(agent, records)) do
     if not archived[peer.id] or args.include_archived then
-      local g = peer.group and group(peer.id) or nil
-      list[#list + 1] = {id = peer.id, title = thread_title(agent, peer), members = g and g.members or {agent, peer.id},
+      local g = peer.group and (builtin[peer.id] and group(peer.id) or created[peer.id]) or nil
+      list[#list + 1] = {id = peer.id, title = thread_title(agent, peer, records), members = g and g.members or {agent, peer.id},
         group = peer.group == true, observer = peer.observer or nil, readonly = peer.readonly or nil,
         archived = archived[peer.id] == true, unread = peer.observer and 0 or (counts[peer.id] or 0)}
     end
@@ -1546,8 +1580,9 @@ local function render_home(user, context)
   local placement = hub('hub.ui.describe', {plugin = 'messaging'})
   local redirects = placement.home_redirects or {}
   local current, other = {}, {}
-  for _, peer in ipairs(peers(user)) do
-    local home = thread_home(user, peer.id)
+  local records = tab_records(user)
+  for _, peer in ipairs(peers(user, records)) do
+    local home = thread_home(user, peer.id, records)
     local session = home and (redirects[home] or home) or placement.default_session_id
     local target = context and session == context.session_id and current or other
     target[#target + 1] = peer
@@ -1561,7 +1596,7 @@ local function render_home(user, context)
   local items, archived_items, observed_items = {}, {}, {}
   for _, a in ipairs(ordered) do
     local n = a.observer and 0 or (counts[a.id] or 0)
-    local item = {id = a.id, label = thread_title(user, a), detail = n > 0 and (n .. ' unread') or 'No unread messages',
+    local item = {id = a.id, label = thread_title(user, a, records), detail = n > 0 and (n .. ' unread') or 'No unread messages',
       action = archived[a.id] and {name = 'restore', label = 'Restore', enabled = true, tool = 'messaging.thread_archive'}
         or {name = 'open', label = 'Open', enabled = true, user_only = 'navigation'}}
     if a.observer then item.detail = a.readonly and 'Read-only direct thread' or 'Send a message to join' end
@@ -1977,15 +2012,16 @@ local function declare_tabs(user)
   local _, _, archived = archived_threads(user)
   local function title(name, n) return n > 0 and (name .. ' (' .. n .. ')') or name end
   local tabs = {}
-  for _, a in ipairs(peers(user)) do
+  local records = tab_records(user)
+  for _, a in ipairs(peers(user, records)) do
     if not archived[a.id] then
-      local home = thread_home(user, a.id)
-      local _, _, tail = thread(user, a.id)
+      local home = thread_home(user, a.id, records)
+      local _, _, tail = thread(user, a.id, records)
       local ids = tail.ids -- never empty after the first message (F1)
-      if (not a.observer and (a.group or #ids > 0)) or opened_thread(user, a.id) then
+      if (not a.observer and (a.group or #ids > 0)) or opened_thread(user, a.id, records) then
         -- A thread with a composer opens as a transcript pane over the composer when the hub enables
         -- it (spikes/04-scrollback). A read-only direct thread has no composer: it keeps one view.
-        tabs[#tabs + 1] = {key = 'thread/' .. a.id, title = title(thread_title(user, a), a.observer and 0 or (counts[a.id] or 0)), route = '/thread/' .. a.id,
+        tabs[#tabs + 1] = {key = 'thread/' .. a.id, title = title(thread_title(user, a, records), a.observer and 0 or (counts[a.id] or 0)), route = '/thread/' .. a.id,
           session_id = home, revision = a.observer and '' or (ids[#ids] or ''), status = not a.observer and unread_status(counts[a.id] or 0) or nil,
           layout = not a.readonly and 'transcript' or nil}
       end

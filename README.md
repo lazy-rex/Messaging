@@ -80,6 +80,7 @@ lazyrex-hub test -file send.lua
 | chain_freeze.lua | F1 writers: the freeze boundary (also with escaped IDs), an interrupted freeze, legacy tails in steps, oversized IDs, races with appends, backfills and view sends. |
 | chain_migration.lua, chain_migration_limits.lua, chain_migration_decimal.lua | F1 alias migration: merged chains, a second migration, a conflict, a torn scan, a batch over the limit, chain numbers above 2^53. |
 | chain_growth.lua | F1 growth: 2000 messages, every send commits, history to the oldest message. |
+| tab_reads.lua | The tab declaration reads: the number of hub reads does not grow with the number of peers (needs hub.test.calls). |
 
 `lazyrex.json` is the test manifest. `tests/parity_fixture.lua` renders the thread menu forms for
 the parity sweep.
