@@ -27,6 +27,26 @@ Open for revision 3 (reviewer, on 19838cb):
   alias migration changes `sender`, `recipient` and the thread columns, so the fill must handle
   that change (or fence it) and not assume the same bytes.
 
+Hub contract draft 1 (LazyRex docs/sql.md, db1e004, and fa8e1f7), for revision 3. Revision 3
+waits for draft 2, which comes with a prototype:
+
+- Notices: the hub owns the outbox (`hub.sql.batch` `notices: [{agent, pending}]`, applied in
+  commit order). If draft 2 keeps it with a durable receipt, Messaging drops `notice_outbox`, the
+  timer and the notice versions. Until then, the plugin outbox above stays the plan.
+- Every guard stays inside the transaction (`expect_changes`; an assertion as a guarded no-op write
+  or `expect_rows` if the hub adds it). Serial hub calls do not make a read and a later batch
+  atomic (hub reviewers, 2026-10-21); Messaging does not rely on it.
+- The hub `key` is a bounded retry cache for a byte-identical batch. Messaging keeps its own
+  permanent `operations` table: a retried send has a new `at` and possibly a new canonical sender.
+- Rex Lua is Lua 5.1 (hub lead, observed on 0.0.1792158932-g88fd41): integers above 2^53 travel as
+  decimal text. Messaging reads revisions with `CAST(x AS TEXT)` and passes them as `{"int": "..."}`.
+- `hub.sql.query` returns whole rows up to `max_bytes` with `complete = false`, and `too_large`
+  `{row = 0, bytes}` for a first row that does not fit: the read uses both (byte-aware selection,
+  then the two-step fill).
+- Rows with NULL decode in Lua with holes: index rows by column number, never `ipairs`.
+- Ordering of `hub.sql.*` with `hub.store.*` (the import reads key-value and writes SQL) is not in
+  draft 1; the import does not depend on it beyond the fence and the source check.
+
 Decision (user, 2026-10-21): each plugin gets its own SQLite database, run by the hub, through hub
 actions. Messaging keeps its current semantics exactly:
 
