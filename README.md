@@ -12,6 +12,10 @@ Check this repository out next to LazyRex, and add the plugin to the hub config:
 
 The plugin loads its other files from its own directory, so keep them together.
 
+Plugin args (hub config `plugins[].args`):
+
+- `gallery` (boolean, default false): declare the Gallery tab. The Gallery is a live preview of every control, with sample messages. It is for renderer work, not for users.
+
 ## Size limits
 
 What a Lua plugin sends is at most 64 KiB in one control message (LazyRex docs/rex-protocol.md,

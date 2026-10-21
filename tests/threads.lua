@@ -24,6 +24,12 @@ test('roster agents get no empty direct tab; member groups keep theirs', functio
   expect(has_tab('thread/team')).to_be(true)
 end)
 
+-- C5 (fresh-install audit): a new user read the Gallery's sample messages as real data. The test
+-- manifest sets no gallery arg, as a default install.
+test('the default install declares no Gallery tab', function()
+  expect(has_tab('gallery')).to_be(false)
+end)
+
 -- B4 (fresh-install audit): the renderer refuses a history node with page_size < 1 (hub
 -- view/schema.go). The harness does not apply that check, so the test reads the node itself.
 test('an empty thread renders a history node with a positive page_size', function()

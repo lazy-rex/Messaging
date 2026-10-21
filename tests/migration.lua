@@ -198,17 +198,3 @@ test('two different drafts stop a migration until one is removed', function()
   expect(store('thread-title/' .. part('user') .. part(charlie_id)).value.title).to_be('Latest title')
   expect(store('thread-title/' .. part('user') .. part('charlie')).rev).to_be('0')
 end)
-
-test('a tab rename of a view that is not a thread is refused', function()
-  -- Panels and forms are not tabs, so the hub never renames them. The gallery is a tab.
-  local g = user:open('gallery')
-  local title = g:render().title
-  g:rename_tab('Inbox')
-  local e = wait('the tab_rename event', function()
-    for _, x in ipairs(H.hub('hub.test.events', {event = 'tab_rename'}).events or {}) do
-      if x.route == '/gallery' then return x end
-    end
-  end)
-  expect(e.ok, 'the plugin refuses view.rename for a route that is not a thread').to_be(false)
-  expect(g:render().title).to_be(title)
-end)

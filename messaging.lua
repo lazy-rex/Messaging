@@ -1844,7 +1844,11 @@ local function view_render(args)
   return {tree = render_thread(args.user, args.route)}
 end
 
--- declare_tabs declares conversation tabs and the gallery.
+-- The gallery shows sample messages. A new user can read them as real data, so its tab exists only
+-- when the plugin arg gallery is true (hub config plugins[].args).
+local gallery_tab = rex.args.gallery == true
+
+-- declare_tabs declares conversation tabs and, if gallery_tab, the gallery.
 local function declare_tabs(user)
   local counts, total = unread_counts(user)
   local _, _, archived = archived_threads(user)
@@ -1864,7 +1868,7 @@ local function declare_tabs(user)
       end
     end
   end
-  tabs[#tabs + 1] = {key = 'gallery', title = 'Gallery', route = gallery_route}
+  if gallery_tab then tabs[#tabs + 1] = {key = 'gallery', title = 'Gallery', route = gallery_route} end
   hub('hub.ui.tabs', {tabs = tabs})
 end
 
