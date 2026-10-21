@@ -1,6 +1,6 @@
 # Messaging storage on hub.sql (proposed)
 
-Status: proposal, revision 1, 2026-10-21. Not implemented. It depends on the `hub.sql` contract,
+Status: proposal, revision 2, 2026-10-21. Not implemented. It depends on the `hub.sql` contract,
 which the hub lead writes now. Where this plan needs a `hub.sql` feature, it says "needs H<n>" (see
 "What Messaging needs from hub.sql"). H1-H10 are dependencies, not capabilities that exist. F2
 (docs/f2-unread.md) is cancelled; this plan replaces it.
@@ -10,6 +10,12 @@ fence and source-revision records for the import; chunked import of large bodies
 for every unread change; rows and the final cursor from one statement; the `team` audience; a
 set-based alias migration (thread and peer keys become columns); a proof that the clock is above
 every issued value; rollback after the cutover is not supported.
+
+Revision 1 (4b7c6c2): the reviewer asked for six lifecycle changes. Revision 2 has: start-up
+states read before any key-value access, a guarded fence reset and a two-commit cutover; a clock
+bump for every revision, with an exhaustion error; an outbox timer and terminal-refusal rule; a
+two-step read for oversized rows; staged alias merges; an ack that changes nothing writes nothing.
+Revision 2 is targeted; the next full revision follows the hub contract.
 
 Decision (user, 2026-10-21): each plugin gets its own SQLite database, run by the hub, through hub
 actions. Messaging keeps its current semantics exactly:
@@ -132,8 +138,15 @@ Lua numbers lose precision above 2^53. The plugin never passes a revision as a L
 
 ## Operations
 
-Each operation is one `hub.sql.batch` (one transaction). "Bump" is `UPDATE clock SET n = n + 1`; a
-later statement of the same batch uses `(SELECT n FROM clock)` as "clock". A guarded statement has
+Each operation is one `hub.sql.batch` (one transaction). "Bump" is an assertion `SELECT 1 FROM
+clock WHERE n < 9223372036854775807` (expected 1 row, else the batch fails with `clock_exhausted`;
+an increment past 2^63 - 1 would make the value REAL), then `UPDATE clock SET n = n + 1`. A later
+statement of the same batch uses `(SELECT n FROM clock)` as "clock".
+
+**Every batch that gives out a new revision bumps the clock** and uses the new value: a message
+`seq`, a draft `rev`, a title or home `set_rev`, a gallery `rev`, a notice version. So two writes
+never share a revision, and an `UPDATE ... WHERE rev = <base>` fails for the second of two saves
+from one base, even with no message between them. A guarded statement has
 an expected change count; a different count rolls the whole batch back with `conflict` and the
 statement index (needs H2). An **assertion** is a query with an expected row count (needs H2). On
 `conflict` the plugin reads again and retries, at most `attempts` times, as today.
@@ -190,10 +203,24 @@ ORDER BY m.seq;
 - Why it is safe: every message committed after the snapshot has `seq` > `high`. A separate clock
   query could return a clock above a message that the rows query did not see; this plan has none.
 - This needs H4 to return one statement's result from one snapshot, inside one reply, or a typed
-  error. If the result does not fit, the plugin repeats with a smaller `LIMIT` (at least 1). One
-  row larger than a hub.sql reply: the plugin reads that message in parts (`substr` of the body,
-  each a statement of its own, the body is immutable) and then `shrink`s it, so the agent gets
-  today's prefix and `truncated`. It never vanishes.
+  error. If the result does not fit, the plugin repeats with a smaller `LIMIT` (at least 1).
+- **Oversized rows.** The statement above fails before it returns any row if one row is larger
+  than a hub.sql reply. So the read has two steps:
+  1. **Selection** (one statement, the snapshot of the read): the same query, but with bounded
+     columns only: `seq`, `high`, and for each text column its byte length
+     (`length(CAST(x AS BLOB))`) and a prefix `substr(CAST(x AS BLOB), 1, 1024)`. This result is
+     small for every row, so it fits one reply for `LIMIT` rows.
+  2. **Fill**: for each selected row whose full size fits the agent page, the plugin reads its
+     columns by `seq` (messages are immutable, so a later statement returns the same bytes). For a
+     row that does not fit, it reads only the bytes that the page needs (`substr` on the BLOB cast,
+     so offsets are bytes, not characters; the cut is made UTF-8-safe in Lua with `utf8_cut`).
+  - The page and its continuation come from the selection: `next_cursor` is `high` of the
+    selection, or the last item's `seq`. A concurrent ack between the steps does not remove a
+    selected message from this page (the fill reads `messages`, not `deliveries`); the next read
+    does not return it again. A selected message is never dropped or skipped.
+  - Today's markers stay: a body too large gives a prefix with `truncated` and `body_bytes`;
+    metadata too large gives `metadata_too_large` and `bytes`; an ID too large gives `id_prefix`
+    and `id_bytes` (`shrink`, unchanged). The byte lengths come from the selection.
 - A concurrent ack removes rows from later reads, as today. An alias migration changes `agent`
   but not `seq`, so a cursor stays valid.
 
@@ -201,14 +228,14 @@ ORDER BY m.seq;
 
 | Action | hub.sql |
 | --- | --- |
-| `messaging.ack` | Validate in Lua: each ID has a delivery row for the agent (today's `addressed`), else `refused`. Batch: bump; `UPDATE deliveries SET acked = 1 WHERE agent = ? AND acked = 0 AND seq IN (SELECT seq FROM messages WHERE id IN (SELECT value FROM json_each(?)))` (needs H6); outbox. No statement sets `acked = 0`. |
-| `view.seen` | Batch: bump; one `UPDATE deliveries SET acked = 1` with today's filter (group: `recipient = peer`; direct: `recipient = user AND sender = peer`); outbox. The reply `acked` is its change count (needs H2). |
+| `messaging.ack` | Validate the whole request first, in Lua, as today: the argument shape, then each ID has a delivery row for the agent (today's `addressed`), else `refused` and no effect. An empty list, or a list with no unread delivery (one query), is a no-op: no batch, no bump, no notice (send.lua tests that an ack writes nothing then). Else the batch: bump; `UPDATE deliveries SET acked = 1 WHERE agent = ? AND acked = 0 AND seq IN (SELECT seq FROM messages WHERE id IN (SELECT value FROM json_each(?)))` (needs H6), expected at least 1, else `conflict` and a new read (a concurrent ack: then the no-op); outbox. No statement sets `acked = 0`. |
+| `view.seen` | The same no-op rule. Else the batch: bump; one `UPDATE deliveries SET acked = 1` with today's filter (group: `recipient = peer`; direct: `recipient = user AND sender = peer`); outbox. The reply `acked` is its change count (needs H2). |
 | `messaging.history` | `SELECT ... WHERE thread = ? AND seq < CAST(? AS INTEGER) ORDER BY seq DESC LIMIT ?`, one statement, fitted as today. Group history needs current membership (team: the roster). |
 | unread counts, tabs, thread list | `GROUP BY` over the agent's unread deliveries; homes, titles, opened, archived: one query each. |
 | `thread_members` | Batch: update `group_members` (current, pos); insert the member notice and its deliveries (`added` only); bump and outbox. No backfill (every message has its rows). |
-| draft save | `UPDATE drafts ... WHERE rev = CAST(? AS INTEGER)` expected 1, or `INSERT` (expected 1, no conflict) when the base is `0`. The operation result gets the new revision with `json_set(?, '$.draft_revision', CAST((SELECT n FROM clock) AS TEXT))`. |
+| draft save | Bump; `UPDATE drafts SET text = ?, rev = clock ... WHERE rev = CAST(? AS INTEGER)` expected 1, or `INSERT` (expected 1, no conflict) when the base is `0`. The operation result gets the new revision with `json_set(?, '$.draft_revision', CAST((SELECT n FROM clock) AS TEXT))`. |
 | view send | Send, plus the draft clear: `UPDATE drafts SET text = '', rev = clock ... WHERE rev = ?` expected 1, else `draft_conflict`. |
-| create, archive, rename, move | One row each + the operation row, in one batch. |
+| create, archive, rename, move | One row each + the operation row, in one batch. A title or a home gets `set_rev` = clock after a bump. |
 
 Operation keys and fingerprints stay exactly as today, and so does `normalized_fingerprint`.
 
@@ -235,11 +262,20 @@ notices, so this plan makes no claim of atomicity across them. It uses an outbox
    agent (needs H5). Without H5, two flushes (two actions of one instance, or an old and a new
    instance) can apply `false` after a newer `true`. This plan does not claim that one instance
    flushes serially; it depends on H5, and on H8 for the old instance.
-4. At start, the plugin flushes the whole outbox in pages, **after** it starts to serve calls. A
-   failed flush does not stop the plugin:
-   - the hub refuses the agent (not in the roster): the row is deleted and logged once; there is
-     no notice to set (today the hub refuses that notify op too);
-   - a transient error: the row stays; the next flush (after the next action) tries again.
+4. **Retry without traffic.** A flush runs after each committed batch, and also from a timer
+   (`rex.every`; observed in the reviewer lab, 2026-10-20, docs/rex-protocol.md "Plugin timers"),
+   so a failed notice is retried even if nobody acts. The timer is armed at start; it flushes only
+   when the outbox has rows, with a backoff from 1 s to 60 s per failing agent (kept in Lua; reset
+   after a success). Rex runs handlers one at a time, so a timer flush and an action flush do not
+   run at the same time in one instance; the version guard (H5) covers the rest. The start-up
+   flush is paged and runs after the plugin starts to serve calls. A failed flush never stops the
+   plugin.
+   - A transient error: the row stays; the timer tries again.
+   - The hub refuses the agent: the row is deleted only if the agent is an alias (`alias_of` in
+     `hub.agents`, immutable). An alias's unread state moves to its identity in the alias
+     migration, which writes the identity's outbox row. Any other refusal (an agent that is absent
+     now and can come back) keeps the row: the timer retries it with the longest backoff, and a
+     roster change (`hub.changed agents`) retries it at once.
 5. A batch of 100 recipients makes 100 outbox rows, so 100 notice calls. A batched notice call
    (a list of `{agent, pending, version}`) is proposed for H5.
 
@@ -248,26 +284,42 @@ rolled-back batch declares nothing.
 
 ## Identity aliases
 
-One batch for each set of new aliases, with set-based statements only (constant request size; the
-row work is bounded by the hub's statement time limit, H2/H3). For each alias `x` of identity `y`
-(SQL parameters):
+One batch for each alias, with set-based statements only: the SQL text is constant per alias, and
+several aliases are several batches, in sorted order (one alias per batch keeps the request bounded;
+each batch is atomic and leaves a valid state). The row work is bounded by the hub's statement time
+limit (H2/H3).
+
+**Order inside the batch.** A direct `UPDATE` of a key column fails on the first collision with an
+existing key, before any `ON CONFLICT` clause can apply. So each keyed table is merged in three
+steps, never with an `UPDATE` of its key:
+
+1. Stage: `INSERT INTO <table> (<target key>, <values>) SELECT <canonical key>, <values> FROM
+   <table> WHERE <key names x> ON CONFLICT (<key>) DO UPDATE SET <the winner rule>`. The canonical
+   key is computed in the SELECT: `y` for `x` in each column, and a pair sorted with
+   `min(a', b')`, `max(a', b')`. If several source rows map to one target, SQLite applies them
+   one at a time, and the winner rule decides each one, so the result does not depend on the order.
+2. Delete the source rows: `DELETE FROM <table> WHERE <key names x>`. (A source row whose key does
+   not change has no `x` in it, so it is not deleted.)
+3. `messages` has no keyed thread columns, so it is a plain `UPDATE` (no collision is possible).
+
+For each alias `x` of identity `y` (SQL parameters):
 
 - `messages`: `UPDATE ... SET sender = y WHERE sender = x`; the same for `recipient`.
-- Threads (messages, homes): `SET thread_a = y WHERE thread_kind = 'direct' AND thread_a = x`, the
-  same for `thread_b`, then re-sort the pair: `UPDATE ... SET thread_a = thread_b, thread_b =
-  thread_a WHERE thread_a > thread_b` (SQLite reads the old row for every expression). A
-  `thread_homes` row that collides with an existing one: `INSERT ... ON CONFLICT DO UPDATE` with
-  today's rule: a `moved` row with the newest `set_rev` wins; else the row with the oldest
-  `set_rev` wins. `set_rev` moves with the value.
-- Peers (titles, opened, archived, drafts): the same for `viewer`, `peer_a`, `peer_b` (an `agent`
-  peer and an `observed` pair). Titles: the newest `set_rev` wins. Opened and archived: the union.
-  Drafts: an assertion first, expected 0 rows: two non-empty drafts with different text for one
-  target; a row means `migration_conflict`, and the batch rolls back (today's rule). Else the
-  non-empty text wins.
-- `deliveries`: the union. `INSERT INTO deliveries SELECT y, seq, acked FROM deliveries WHERE agent
-  = x ON CONFLICT (agent, seq) DO UPDATE SET acked = min(acked, excluded.acked)`, then delete the
-  `x` rows. A message unread under either name stays unread (today: the mailbox union).
-- `group_members`: the union: one row for `y`, `pos` = the lower one (today keeps the first
+- Threads in `messages`: `UPDATE` the pair to `min(a', b'), max(a', b')` where `a' = (CASE a WHEN
+  x THEN y ELSE a END)` (the same for `b'`), `WHERE thread_kind = 'direct' AND (thread_a = x OR
+  thread_b = x)`. One statement; SQLite reads the old row for every expression.
+- `thread_homes`: stage and delete. The winner rule is today's: a `moved` row with the newest
+  `set_rev` wins; else the row with the oldest `set_rev` wins. `set_rev` moves with the value.
+- Peers (titles, opened, archived, drafts): stage and delete, with the canonical `viewer`,
+  `peer_a`, `peer_b` (an `agent` peer, and an `observed` pair re-sorted). Titles: the newest
+  `set_rev` wins. Opened and archived: the union (`DO NOTHING`). Drafts: first an assertion,
+  expected 0 rows: two rows that map to one target, both with non-empty text, and different text;
+  a row means `migration_conflict`, and the batch rolls back (today's rule). Else the non-empty
+  text wins (with its `rev`).
+- `deliveries`: stage and delete. `INSERT INTO deliveries SELECT y, seq, acked FROM deliveries
+  WHERE agent = x ON CONFLICT (agent, seq) DO UPDATE SET acked = min(acked, excluded.acked)`, then
+  delete the `x` rows. A message unread under either name stays unread (today: the mailbox union).
+- `group_members`: stage and delete: one row for `y`, `pos` = the lower one (today keeps the first
   occurrence), `current` = the higher one. Past members are canonical too.
 - `operations.owner` stays: `prior_operation` searches the owners of the identity and its aliases,
   as today, in `operations` and then in the key-value fallback.
@@ -278,14 +330,31 @@ is not needed: `aliases_applied` commits in the same batch.
 
 ## Migration from the key-value store (one time)
 
-### Order at start
+### States at start
 
-1. `refresh_participants`, then today's key-value `migrate_aliases` (unchanged code), so the source
-   is canonical for every alias known now. The import does not merge aliases. A key that is still
-   not canonical, or two source records with one canonical key, stops the import with
-   `migration_conflict` and the keys.
-2. The import (below), if the cutover marker is absent.
-3. The SQL alias migration for aliases that appear later.
+The plugin reads its state **before** it touches the key-value store. The state comes from two
+records: the SQL `meta` row `import` and the key-value fence record `sql-import` (below).
+
+| State | How the plugin knows | What it does at start |
+| --- | --- | --- |
+| fresh | no SQL `import` row, no fence | `refresh_participants`; today's key-value `migrate_aliases` (unchanged code), so the source is canonical; write the fence (f0); save `{state = importing, f0, aliases = A0}` in SQL; import. |
+| importing | SQL `importing` | Source check (below). Unchanged: continue from the progress. Changed: reset. No key-value `migrate_aliases` (it would change the source). |
+| verified | SQL `verified` | Source check again; then write the cutover fence (f1, below). |
+| fence written | fence `{state = 'cutover'}`, SQL not `done` | f1 = the fence record's own revision (read it; it is not lost in a crash). Source check against f1 (every source revision below f1, equal to `import_source`); then the SQL `done` batch. |
+| done | SQL `done` | SQL only. No key-value access, except the read-only operation fallback. A key-value alias limit or a stale key-value record cannot block a start. |
+
+- A0 is the alias set at the fence. The import canonicalizes with A0 only. An alias that appears
+  during the import is not applied to the source: its records import under the old name, and the
+  SQL alias migration merges them after `done` (it has no `aliases_applied` row).
+- A key that is not canonical under A0, or two source records with one canonical key, stops the
+  import with `migration_conflict` and the keys.
+- Reset (the source changed): first the plugin rewrites the fence with `if_rev` = the fence's
+  current revision (never `if_rev = 0` against an existing record); its new revision is the new
+  f0. Then one SQL batch deletes every imported row and sets `{state = importing, f0 = new f0,
+  progress = start}`. A crash between the two leaves SQL with the old f0 and the old rows; the
+  next start finds the same change and resets again. The fence is not a source record, so its
+  rewrite alone never counts as a change.
+- After `done`, new aliases go through the SQL alias migration.
 
 ### The source fence
 
@@ -302,8 +371,8 @@ The key-value store gives each written record a revision from one global counter
   the same batch as its rows.
 - **Resume**: before it continues, the import checks that the source did not change: every
   `import_source` row still has its revision and no family record has a revision above `f0`. A
-  change (an old release wrote, or a record was deleted) drops every imported row and starts again
-  with a new fence. `INSERT OR IGNORE` is not used: every insert is a plain insert, so a duplicate
+  change (an old release wrote, or a record was deleted) is a reset (see "States at start"). A
+  deleted record that the import has not reached yet is found by the verification. `INSERT OR IGNORE` is not used: every insert is a plain insert, so a duplicate
   is an error, never a silent "equal".
 - **Verification** (before the cutover) is a full scan of the families: the set of keys and
   revisions equals `import_source`, and every revision is at or below `f0`. Then the content checks
@@ -355,16 +424,17 @@ A mismatch stops the start with `migration_conflict` and the key; nothing is cut
 
 ### Cutover
 
-One batch:
+Two commits in two stores, in this order. A crash between them is the state "fence written".
 
-- The clock: the plugin first writes the fence record again (`sql-import` `{state = 'cutover'}`,
-  if_rev = its revision) and gets its revision `f1`. Every value that Messaging gave out before
-  (read `next_cursor` = a mailbox or message revision, history `before`/`next_before` = message
-  revisions, `draft_revision`, `set_rev`) is a key-value revision, and the key-value counter gave
-  each one out before `f1`. So every one is below `f1`. `clock.n = f1`.
-- The meta row `cutover = done`; outbox rows for every agent with an unread delivery.
+1. **Key-value**: the plugin rewrites the fence record (`sql-import` `{state = 'cutover'}`,
+   `if_rev` = its revision). Its new revision is f1. Every value that Messaging gave out before
+   (read `next_cursor` = a mailbox or message revision, history `before`/`next_before` = message
+   revisions, `draft_revision`, `set_rev`) is a key-value revision that the global counter gave
+   out before f1. So every one is below f1.
+2. **SQL**, one batch: `clock.n = f1`; the meta row `import = done`; outbox rows for every agent
+   with an unread delivery.
 
-After this batch the plugin reads and writes SQL only. The fence record stays, so a later start of
+After step 2 the plugin reads and writes SQL only. The fence record stays, so a later start of
 this release never writes the key-value families.
 
 ### Old operation keys
@@ -440,8 +510,12 @@ Sent to the coordinator and the Hub thread 2026-10-21; aligned with the reviewer
   (with H5); an alias union where a message is unread under one name only, colliding homes,
   titles and drafts, and an observed pair; import: a crash at each phase and resume, a source
   change during the import (an old release writes), a chunked large body with a crash between
-  chunks, a `record_too_large` source, a verification mismatch, acked messages stay acked;
-  `since`, `before` and `draft_revision` values from before the cutover; integers above 2^53.
+  chunks, a `record_too_large` source, a verification mismatch, acked messages stay acked, a crash
+  before the f1 fence write and a crash after it (before SQL `done`), a restart in `done` with a
+  stale key-value alias state; `since`, `before` and `draft_revision` values from before the
+  cutover; integers above 2^53; two draft saves from one base with no send between them (the
+  second is `draft_conflict`); a repeated and an empty ack write nothing; a notice that fails once
+  with no later action (the timer delivers it); an oversized row in a read with a concurrent ack.
 
 ## Order of commits (proposed)
 
