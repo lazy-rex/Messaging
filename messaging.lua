@@ -1526,7 +1526,8 @@ local function render_thread(user, route)
     nodes = {
       {id = 'thread_menu', type = 'menu', label = 'Thread…', action = {name = 'open', enabled = true, user_only = 'navigation'}},
       -- has_more: older messages exist. The transcript pane fetches them with view.history.
-      {id = 'history', type = 'history', messages = messages, has_more = has_more, page_size = #messages},
+      -- The renderer refuses a page_size below 1, so an empty thread sends 1.
+      {id = 'history', type = 'history', messages = messages, has_more = has_more, page_size = math.max(1, #messages)},
       {id = 'composer', type = 'composer', label = 'Message', text = text, draft_revision = draft_rev,
         save_action = {name = 'save', label = 'Save', enabled = true, user_only = 'draft is UI state'},
         send_action = {name = 'send', label = 'Send', enabled = true, tool = 'messaging.send'}},

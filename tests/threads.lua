@@ -24,6 +24,14 @@ test('roster agents get no empty direct tab; member groups keep theirs', functio
   expect(has_tab('thread/team')).to_be(true)
 end)
 
+-- B4 (fresh-install audit): the renderer refuses a history node with page_size < 1 (hub
+-- view/schema.go). The harness does not apply that check, so the test reads the node itself.
+test('an empty thread renders a history node with a positive page_size', function()
+  local history = H.node(user:open('thread/team'):render(), 'history')
+  expect(#history.messages).to_be(0)
+  expect(history.page_size >= 1, 'page_size ' .. tostring(history.page_size)).to_be(true)
+end)
+
 test('an explicit open declares the empty direct thread once (view.open through the hub)', function()
   user:open('thread/alice'):render()
   expect(has_tab('thread/alice')).to_be(true)
