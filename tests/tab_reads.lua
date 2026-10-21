@@ -2,7 +2,8 @@
 -- hub.changed agents. It read about four records with one hub.store.get each for every peer
 -- (home, thread tail, opened, title), and peers() read every observed thread again after its own
 -- scan. Live, with about a hundred identities, that was tens of thousands of gets per minute
--- (coordinator, 2026-10-21). The reads must not grow with the number of peers.
+-- (coordinator, 2026-10-21). The gets must not grow with the number of peers. The scans of the
+-- families still grow with their pages (500 records or 512 KiB); this fixture does not fill them.
 --
 -- The count needs hub.test.calls (hub branch hub/test-calls). On a harness without H.calls, or a
 -- hub that refuses the action as unknown, the file has one test named SKIP and measures nothing.
@@ -40,7 +41,7 @@ local function groups(n)
   write({{key = 'groups', value = {groups = list}}})
 end
 
-test('a send declares the tabs with a number of reads that does not grow with the peers', function()
+test('a send declares the tabs with a number of gets that does not grow with the peers', function()
   groups(5)
   local few_gets, few_scans = reads(function() alice:call('messaging.send', {to = 'user', body = 'one', key = 'reads-1'}) end)
   groups(60)

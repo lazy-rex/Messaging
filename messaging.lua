@@ -407,7 +407,7 @@ end
 
 -- lookup returns the record of key: from records (a prefix scan that holds key's family; absent
 -- means rev '0') when given, else from one hub.store.get. declare_tabs passes records, so its
--- reads do not grow with the number of peers.
+-- gets do not grow with the number of peers.
 local function lookup(key, records)
   if records then return records[key] or {rev = '0'} end
   return get({key})[key]
@@ -1185,7 +1185,8 @@ end
 
 -- tab_records reads, with one prefix scan per family (paged), every record that the thread lists
 -- read for each peer of user: the thread tails, the homes (thread-meta), and user's opened marks
--- and titles. The number of hub requests does not grow with the number of peers.
+-- and titles. The gets no longer grow with the number of peers. The scans still grow with the
+-- size of those families: one request per page (500 records or 512 KiB).
 local function tab_records(user)
   local records = {}
   for _, prefix in ipairs({'thread/', 'thread-meta/', 'thread-open/' .. part(user), 'thread-title/' .. part(user)}) do
