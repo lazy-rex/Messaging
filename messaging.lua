@@ -147,8 +147,9 @@ local function with_set_rev(source)
   return value
 end
 
--- migrate_chain is defined with the thread chains (F1), after the helpers that it uses.
-local migrate_chain
+-- migrate_chain and migration_records are defined with the thread chains (F1), after the helpers
+-- that they use.
+local migrate_chain, migration_records
 
 local function migrate_aliases()
   local names = {}
@@ -170,12 +171,7 @@ local function migrate_aliases()
   for _, id in ipairs(names) do key = key .. part(id) .. part(aliases[id]) end
   if hub('hub.store.op', {key = key}).found then return end
   for _ = 1, attempts do
-    local records, after = {}, nil
-    repeat
-      local page = hub('hub.store.scan', {after = after})
-      for k, record in pairs(page.records or {}) do records[k] = record end
-      after = page.next
-    until not after
+    local records = migration_records(names)
     local targets, changed, notices = {}, {}, {}
     -- Collect all contributors before changing a key. Existing canonical records participate too.
     for old, record in pairs(records) do
@@ -718,6 +714,82 @@ end
 -- chain finds its segments missing and starts again. Returns the tail value and the ops: the new
 -- segments (if_rev '0') and the deletion of every old segment (if_rev = the scanned revision).
 -- Returns nil if the scan has a tail without one of its segments: the caller scans again.
+-- migration_records reads the records that an alias migration of names can change, and no others
+-- (M1; a full-store scan read every message body and passed the hub reply limit). Per family of
+-- keys that hold agent IDs, a prefix scan keeps a record only if canonical_key changes its key, or
+-- if it is an archive whose value names an aliased peer. Direct reads, each through
+-- message_records (bounded requests, single reads after reply_too_large): the canonical targets,
+-- the canonical mailbox of each alias (its pending notice), groups, and the segments of each kept
+-- thread. Last, the revision of each message in those threads, for the merge order: a chunk of
+-- keys at a time, and only the revision is kept. The atomic batch is not bounded by this.
+local migration_families = {'mailbox/', 'thread/', 'thread-archive/', 'draft/', 'thread-title/', 'thread-meta/', 'thread-open/', 'thread-page/'}
+
+local function names_alias(value)
+  if type(value) ~= 'table' or type(value.ids) ~= 'table' then return false end
+  for id in pairs(value.ids) do
+    if type(id) == 'string' and canonical_thread_id(id) ~= id then return true end
+  end
+  return false
+end
+
+migration_records = function(names)
+  local records, wanted, seen = {}, {}, {}
+  local function want(k)
+    if not seen[k] then seen[k] = true; wanted[#wanted + 1] = k end
+  end
+  local function read(keys)
+    for k, r in pairs(message_records(keys)) do
+      if r.rev ~= '0' then records[k] = r end
+    end
+  end
+  for _, prefix in ipairs(migration_families) do
+    local after
+    repeat
+      local page = hub('hub.store.scan', {prefix = prefix, after = after})
+      for k, record in pairs(page.records or {}) do
+        local target = canonical_key(k)
+        if target ~= k or (prefix == 'thread-archive/' and names_alias(record.value)) then
+          records[k] = record
+          want(target)
+        end
+      end
+      after = page.next
+    until not after
+  end
+  for _, id in ipairs(names) do want('mailbox/' .. part(aliases[id])) end
+  want('groups')
+  local keys = {}
+  for _, k in ipairs(wanted) do if not records[k] then keys[#keys + 1] = k end end
+  read(keys)
+  -- Segments of every thread tail read above. A missing one stays absent: migrate_chain then
+  -- reports a torn scan.
+  local ids = {}
+  keys = {}
+  for k, record in pairs(records) do
+    local v = record.value
+    if k:match('^thread/') and type(v) == 'table' then
+      local chain = type(v.chain) == 'string' and v.chain or '0'
+      for i = 0, (type(v.seg) == 'number' and v.seg or 0) - 1 do keys[#keys + 1] = segment_key(k, chain, i) end
+      if type(v.ids) == 'table' then for _, id in ipairs(v.ids) do if type(id) == 'string' then ids[#ids + 1] = id end end end
+    end
+  end
+  read(keys)
+  for k, record in pairs(records) do
+    if k:match('^thread%-seg/') and type(record.value) == 'table' and type(record.value.ids) == 'table' then
+      for _, id in ipairs(record.value.ids) do if type(id) == 'string' then ids[#ids + 1] = id end end
+    end
+  end
+  -- Message revisions: 8 keys per chunk; the bodies of a chunk are dropped before the next.
+  for first = 1, #ids, 8 do
+    local chunk = {}
+    for i = first, math.min(first + 7, #ids) do chunk[#chunk + 1] = 'message/' .. ids[i] end
+    for k, r in pairs(message_records(chunk)) do
+      if r.rev ~= '0' then records[k] = {rev = r.rev} end
+    end
+  end
+  return records
+end
+
 migrate_chain = function(target, contributors, records)
   local seen, ids, ops, top, segmented = {}, {}, {}, '0', false
   for _, source in ipairs(contributors) do
