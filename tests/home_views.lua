@@ -169,3 +169,26 @@ test('a moved thread and an agent thread keep their sessions across a hub restar
   expect(tab(t).session_id).to_be(A)
   expect(wait('the agent thread after the restart', function() return one_view(t) end).session_id, 'the agent thread stays in the agent session').to_be(A)
 end)
+
+-- Ported from the hub's one-tab-migration-lab.mjs (phase 6, item 9 of the coverage map): New
+-- Thread from one session with another open session chosen. The group is declared in the chosen
+-- session, opens there, gets the focus there, and its Rex tab shows the title.
+test('New Thread into another open session declares, opens, focuses and titles it there', function()
+  local before = active(B)
+  user:command('new_thread', pane_in(here))
+  local f = user:view('/forms/new-thread', nil, here)
+  f:render()
+  local op = f:action('new_thread', 'submit', {values = {session_id = B, session_name = '', title = 'Group in B',
+    member_alice = true, member_bob = true}}, 'hv-create-in-b')
+  expect(op.status).to_be('succeeded')
+  local t = op.result.navigate
+  expect(t:sub(1, 9)).to_be('thread/g-')
+  expect(tab(t).session_id, 'declared in the chosen session').to_be(B)
+  local opened = wait('the group view in B', function() local x = one_view(t); if x and x.session_id == B then return x end end)
+  expect(opened.window_id ~= before, 'a new tab').to_be(true)
+  focused(B, opened.window_id)
+  local v = user:view(t, nil, B)
+  expect(v:render().title).to_be('Group in B')
+  wait('the tab label', function() if v:tab_label() == 'Group in B' then return true end end)
+  expect(#open_views(t), 'no view in the source session').to_be(1)
+end)
