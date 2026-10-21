@@ -66,6 +66,50 @@ test('a tail at exactly the target after the append does not freeze; one byte ov
   expect(store(over_key).value).to_equal({ids = {old[35], next_over}, seg = 1, frozen = 34})
 end)
 
+-- The hub's encoder writes '<' as <: 6 bytes. esc_size is the encoded {"ids":[...]} of IDs
+-- of ASCII and '<'. esc_ids returns n IDs that, with next_id after them, encode to exactly total
+-- bytes, each mostly '<': their raw size is far under the target.
+local function esc_len(id) local _, n = id:gsub('<', ''); return #id + 5 * n end
+local function esc_size(ids)
+  local s = 10 + math.max(#ids - 1, 0)
+  for _, id in ipairs(ids) do s = s + esc_len(id) + 2 end
+  return s
+end
+local function esc_ids(tag, n, total, next_id)
+  local sum = total - 10 - n - (esc_len(next_id) + 2) - 2 * n
+  local out, used = {}, 0
+  for i = 1, n do
+    local len = i < n and math.floor(sum / n) or sum - used
+    local head = tag .. i .. '-'
+    local rest = len - #head
+    out[i] = head .. string.rep('<', math.floor(rest / 6)) .. string.rep('x', rest % 6)
+    used = used + len
+  end
+  assert(esc_size(concat(out, {next_id})) == total, 'fixture size')
+  return out
+end
+
+test('escaped IDs: the target counts encoded bytes, as the hub does', function()
+  local exact_key, next_exact = tail_key('alice', 'bob'), send_id('bob', 'esc<0')
+  local old = esc_ids('e', 35, 8192, next_exact)
+  expect(size_of(concat(old, {next_exact})) < 2000, 'the raw size is far under the target').to_be(true)
+  write({{key = exact_key, value = {ids = old}}})
+  bob:call('messaging.send', {to = 'alice', body = 'exact', key = 'esc<0'})
+  expect(store(exact_key).value, 'no freeze at 8192 encoded bytes').to_equal({ids = concat(old, {next_exact})})
+
+  -- In a full run the first test froze this thread: keep its chain fields, so the next segment is new.
+  local over_key, next_over = tail_key('alice', 'charlie'), send_id('charlie', 'esc<1')
+  local before = store(over_key).value or {}
+  local seg, done = before.seg or 0, before.frozen or 0
+  old = esc_ids('o', 35, 8193, next_over)
+  write({{key = over_key, value = {ids = old, seg = before.seg, frozen = before.frozen}}})
+  charlie:call('messaging.send', {to = 'alice', body = 'over', key = 'esc<1'})
+  local frozen = {}
+  for i = 1, 34 do frozen[i] = old[i] end
+  expect(store(seg_key(over_key, '0', seg)).value, 'one encoded byte over freezes').to_equal({ids = frozen})
+  expect(store(over_key).value).to_equal({ids = {old[35], next_over}, seg = seg + 1, frozen = done + 34})
+end)
+
 -- fill sends from alice to user until the next send (key next_key) needs a freeze.
 local function fill(next_key)
   local key, ids, n = tail_key('alice', 'user'), {}, 0

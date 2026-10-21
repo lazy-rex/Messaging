@@ -77,7 +77,7 @@ lazyrex-hub test -file send.lua
 | readsize_send.lua | Size admission: encoded sizes as the hub stores them, the body limit on both send paths, key and reply_to, replay before limits, a batch that cannot fit, the notice title. |
 | readsize_legacy.lua | Stored messages over the limits: body prefix, metadata markers, long IDs, `thread_id_too_large`, packed reads, `key_too_large`. |
 | chain_readers.lua | F1 readers: history and view history across segments, the menu count, the tab revision, writers keep the chain fields, backfills from segments, a missing segment. |
-| chain_freeze.lua | F1 writers: the freeze boundary, an interrupted freeze, legacy tails in steps, oversized IDs, races with appends, backfills and view sends. |
+| chain_freeze.lua | F1 writers: the freeze boundary (also with escaped IDs), an interrupted freeze, legacy tails in steps, oversized IDs, races with appends, backfills and view sends. |
 | chain_migration.lua, chain_migration_limits.lua, chain_migration_decimal.lua | F1 alias migration: merged chains, a second migration, a conflict, a torn scan, a batch over the limit, chain numbers above 2^53. |
 | chain_growth.lua | F1 growth: 2000 messages, every send commits, history to the oldest message. |
 
