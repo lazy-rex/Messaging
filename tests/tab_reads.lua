@@ -3,6 +3,24 @@
 -- (home, thread tail, opened, title), and peers() read every observed thread again after its own
 -- scan. Live, with about a hundred identities, that was tens of thousands of gets per minute
 -- (coordinator, 2026-10-21). The reads must not grow with the number of peers.
+--
+-- The count needs hub.test.calls (hub branch hub/test-calls). On a harness without H.calls, or a
+-- hub that refuses the action as unknown, the file has one test named SKIP and measures nothing.
+-- The harness shows a passing test's name only with -v; the SKIP is not a measurement.
+
+local function calls_missing()
+  if not H.calls then return 'the harness has no H.calls' end
+  local ok, err = pcall(H.calls, 'none')
+  if ok then return nil end
+  local text = type(err) == 'table' and tostring(err.code) .. ': ' .. tostring(err.message) or tostring(err)
+  if text:find('unknown') or text:find('not_supported') then return 'the hub refuses hub.test.calls (' .. text .. ')' end
+  error(err, 0)
+end
+local missing = calls_missing()
+if missing then
+  test('SKIP: ' .. missing .. '; the tab read count is not measured', function() end)
+  return
+end
 
 local alice = agent('alice')
 
