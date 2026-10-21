@@ -92,3 +92,23 @@ test('move as a tool sets the thread home; the UI form does the same', function(
   expect(op.status).to_be('succeeded')
   expect(store(home).value.home_session).to_be(s2)
 end)
+
+-- Ported from the hub's one-tab-migration-lab.mjs (phase 3, items 4 and 5 of the coverage map):
+-- the menu form reports blocked/question to the renderer, which writes it as the pane status, and
+-- the menu lists Move to session, which opens the move form.
+test('the thread menu form waits for input and lists Move to session', function()
+  local g = the_group()
+  local v = user:open('thread/' .. g.id)
+  v:render()
+  expect(v:action('thread_menu', 'open', {}).effects).to_be('done')
+  local menu = user:view('/forms/thread-menu')
+  local tree = menu:render()
+  expect(menu:get().status, 'the snapshot that the renderer gets').to_equal({state = 'blocked', kind = 'question', msg = 'Waiting for input'})
+  local move
+  for _, item in ipairs(H.node(tree, 'thread_menu').items) do if item.id == 'move' then move = item end end
+  expect(move.label).to_be('Move to session…')
+  expect(menu:action('thread_menu', 'move', {item_id = 'move'}).effects).to_be('done')
+  local f = user:view('/forms/thread-move')
+  expect(f:render().title).to_be('Move to session')
+  expect(f:get().status).to_equal({state = 'blocked', kind = 'question', msg = 'Waiting for input'})
+end)
