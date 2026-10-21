@@ -78,7 +78,7 @@ lazyrex-hub test -file send.lua
 | readsize_legacy.lua | Stored messages over the limits: body prefix, metadata markers, long IDs, `thread_id_too_large`, packed reads, `key_too_large`. |
 | chain_readers.lua | F1 readers: history and view history across segments, the menu count, the tab revision, writers keep the chain fields, backfills from segments, a missing segment. |
 | chain_freeze.lua | F1 writers: the freeze boundary, an interrupted freeze, legacy tails in steps, oversized IDs, races with appends, backfills and view sends. |
-| chain_migration.lua, chain_migration_limits.lua | F1 alias migration: merged chains, a second migration, a conflict, a torn scan, a batch over the limit. |
+| chain_migration.lua, chain_migration_limits.lua, chain_migration_decimal.lua | F1 alias migration: merged chains, a second migration, a conflict, a torn scan, a batch over the limit, chain numbers above 2^53. |
 | chain_growth.lua | F1 growth: 2000 messages, every send commits, history to the oldest message. |
 
 `lazyrex.json` is the test manifest. `tests/parity_fixture.lua` renders the thread menu forms for

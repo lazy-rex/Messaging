@@ -59,6 +59,15 @@ local aliases, participants = {}, {}
 local function canonical(id) return aliases[id] or id end
 local function later(a, b) return #a > #b or (#a == #b and a > b) end
 
+-- decimal_next returns the decimal string s + 1, exactly. s has digits only and no leading zero.
+-- Not tonumber: a Lua number loses precision above 2^53.
+local function decimal_next(s)
+  local i = #s
+  while i >= 1 and s:sub(i, i) == '9' do i = i - 1 end
+  if i == 0 then return '1' .. string.rep('0', #s) end
+  return s:sub(1, i - 1) .. string.char(s:byte(i) + 1) .. string.rep('0', #s - i)
+end
+
 local function parts(text)
   local out, pos = {}, 1
   while pos <= #text do
@@ -702,11 +711,14 @@ end
 -- segments (if_rev '0') and the deletion of every old segment (if_rev = the scanned revision).
 -- Returns nil if the scan has a tail without one of its segments: the caller scans again.
 migrate_chain = function(target, contributors, records)
-  local seen, ids, ops, top, segmented = {}, {}, {}, 0, false
+  local seen, ids, ops, top, segmented = {}, {}, {}, '0', false
   for _, source in ipairs(contributors) do
     local v = source.record.value
     local seg, chain = v.seg or 0, v.chain or '0'
-    top = math.max(top, tonumber(chain))
+    -- Compare chain numbers as decimal strings, without leading zeros (thread() allows them).
+    local number = chain:gsub('^0+', '')
+    if number == '' then number = '0' end
+    if later(number, top) then top = number end
     if seg > 0 then segmented = true end
     local lists = {}
     for k = 0, seg - 1 do
@@ -729,7 +741,7 @@ migrate_chain = function(target, contributors, records)
     if ra.rev == rb.rev then return a < b end
     return later(rb.rev, ra.rev)
   end)
-  local chain = tostring(top + (segmented and 1 or 0))
+  local chain = segmented and decimal_next(top) or top
   local sizes = {}
   for i, id in ipairs(ids) do sizes[i] = encoded_size(id) end
   local n, first, seg = #ids, 1, 0
