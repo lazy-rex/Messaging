@@ -17,6 +17,16 @@ bump for every revision, with an exhaustion error; an outbox timer and terminal-
 two-step read for oversized rows; staged alias merges; an ack that changes nothing writes nothing.
 Revision 2 is targeted; the next full revision follows the hub contract.
 
+Open for revision 3 (reviewer, on 19838cb):
+
+- The first-fence crash: the key-value fence `{state = 'importing'}` exists, but the SQL `import`
+  row was never committed (an orphan fence). Recover it explicitly, with a defined alias set, and
+  test it. The SQL `done` state takes precedence over any key-value state.
+- The selection query of an oversized read: 1 KiB prefixes do not make `LIMIT` rows fit one reply.
+  Keep byte-aware sizing and reduction for it too. Only `body` and `id` are immutable: the SQL
+  alias migration changes `sender`, `recipient` and the thread columns, so the fill must handle
+  that change (or fence it) and not assume the same bytes.
+
 Decision (user, 2026-10-21): each plugin gets its own SQLite database, run by the hub, through hub
 actions. Messaging keeps its current semantics exactly:
 
