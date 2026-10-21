@@ -582,3 +582,22 @@ Sent to the coordinator and the Hub thread 2026-10-21; aligned with the reviewer
 
 Each commit keeps the suite green against a hub with `hub.sql`. Commits 1-4 run only on a fresh
 database; commit 5 makes the plugin safe for a store with data. No release before commit 5.
+
+## Plugin SDK v0 (user decision, 2026-10-21)
+
+The public face of `hub.sql` becomes part of a Lua Plugin SDK that the hub ships. The hub lead
+owns its design. Adopted for draft 2, from Messaging's input (hub lead, 2026-10-21):
+
+- Each action handler is one transaction. It begins at the handler's first SQL call, read or
+  write (`BEGIN DEFERRED`), so the reads that decide a write are in its snapshot. It commits on
+  return and rolls back on an error. A long handler can opt out (the Messaging import does, with a
+  transaction per bounded step).
+- `app.notice(agent, pending)` is queued into the handler's transaction (the hub outbox). It
+  replaces `pending_from`.
+- An action can opt out of the SDK result store; the store also takes a caller-given key and
+  fingerprint (Messaging's agent keys and normalized fingerprints).
+- Draft 2 lab tests: a timer or an event during a handler's wait on a Rex call, the rollback of an
+  old instance's open transaction at retirement, the commit before the reply, the 10 s limit.
+
+Revision 3 retargets this plan to the SDK when its contract is published: most guards, retries and
+the plugin outbox then go away, and the schema, the semantics, the import and the alias merge stay.
