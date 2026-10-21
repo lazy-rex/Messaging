@@ -128,3 +128,44 @@ test('a thread menu form keeps the thread draft', function()
   expect(composer.text).to_be('unsent draft')
   expect(composer.draft_revision).to_be(rev)
 end)
+
+-- Ported from the hub's one-tab-migration-lab.mjs (phases 4 and 5, item 8 of the coverage map):
+-- Move to session with a draft to a new session, and an agent's new thread in the agent's session.
+-- Both keep their session across a hub restart; the moved thread keeps its draft.
+local function session_label(id)
+  for _, s in ipairs(rex.call('session.list', {}).sessions or {}) do
+    if s.session_id == id then return s.label end
+  end
+end
+local function draft_text(v) return H.node(v:render(), 'composer').text end
+
+test('a moved thread and an agent thread keep their sessions across a hub restart', function()
+  local v = user:view('thread/alice')
+  expect(v:action('thread_menu', 'open', {}).effects).to_be('done')
+  local menu = user:view('/forms/thread-menu', nil, here)
+  menu:render()
+  expect(menu:action('thread_menu', 'move', {item_id = 'move'}).effects).to_be('done')
+  local form = user:view('/forms/thread-move', nil, here)
+  form:render()
+  local op = form:action('move_thread', 'submit', {values = {session_id = '@new', session_name = 'Moved home'}}, 'hv-move')
+  expect(op.status).to_be('succeeded')
+  local moved = wait('thread/alice in the new session', function()
+    local x = one_view('thread/alice')
+    if x and session_label(x.session_id) == 'Moved home' then return x end
+  end)
+  expect(draft_text(user:view('thread/alice', nil, moved.session_id)), 'the draft moves with the thread').to_be('unsent draft')
+
+  local A = session('Agent home')
+  local charlie = agent('charlie', {session = A})
+  local g = charlie:call('messaging.thread_create', {members = {'user', 'bob'}, title = 'Agent thread', key = 'hv-agent'})
+  local t = 'thread/' .. g.id
+  wait('the agent thread declared in its session', function() if tab(t) and tab(t).session_id == A then return true end end)
+  expect(wait('the agent thread open', function() return one_view(t) end).session_id).to_be(A)
+
+  hub:restart()
+  local after = wait('thread/alice after the restart', function() return one_view('thread/alice') end)
+  expect(after.session_id, 'the moved thread stays in its new session').to_be(moved.session_id)
+  expect(draft_text(user:view('thread/alice', nil, moved.session_id)), 'the draft after the restart').to_be('unsent draft')
+  expect(tab(t).session_id).to_be(A)
+  expect(wait('the agent thread after the restart', function() return one_view(t) end).session_id, 'the agent thread stays in the agent session').to_be(A)
+end)
