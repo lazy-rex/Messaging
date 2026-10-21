@@ -61,6 +61,12 @@ waits for draft 2, which comes with a prototype:
   `operations` table is what makes its actions safe to retry.
 - `complete = false` with fewer rows than `LIMIT` is a partial page: the read continues from the
   last returned row, never from `high`.
+- User decision (2026-10-21): the plugin-facing interface is small (exec, query, a transaction
+  helper), through a Lua helper that the hub ships (for example `lazyrex.sql`: rows keyed by column
+  name, NULL as nil, retry keys generated). Messaging's storage layer (commit 1) uses that helper,
+  and the advanced options (`expect_changes`, `notices`, `pending_from`, `{"int"}` tags) where this
+  plan needs them. Open for draft 2: how a plugin loads the helper (today a plugin loads files only
+  from its own directory).
 - Release gates for the Messaging cutover: a stopped (or coordinated) backup of hub.db and the SQL
   file that keeps the import states, and the hub's replacement linearization proof.
 
