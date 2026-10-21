@@ -2220,10 +2220,6 @@ for name in pairs(view_handlers) do
   actions[#actions + 1] = {name = name, kind = 'client', title = name,
     args = name == 'hub.changed' and {type = 'object', properties = {what = {type = 'string'}}, required = {'what'}} or view_args}
 end
--- Lab test hook: replace the declared tabs, for example to open one route in two tabs.
--- Not exported to agents.
-actions[#actions + 1] = {name = 'lab.tabs', kind = 'client', title = 'Declare tabs (lab test)',
-  args = {type = 'object', properties = {tabs = {type = 'array'}}, required = {'tabs'}}}
 -- Only the hub can assert the original caller for a forwarded public action.
 actions[#actions + 1] = {name = 'hub.forward', kind = 'client', title = 'Forward an agent action',
   args = {type = 'object', properties = {action = {type = 'string'}, args = {type = 'object'}, requester_pid = {type = 'integer'}},
@@ -2256,7 +2252,6 @@ rex.on('client_perform_requested', function(ctx, ev)
     refresh_participants()
     migrate_aliases()
     local args = ev.args or {}
-    if ev.action == 'lab.tabs' then return hub('hub.ui.tabs', {tabs = args.tabs}) end
     if view_handlers[ev.action] then
       if not ev.requester or ev.requester.client_id ~= hub_id then fail('refused', 'Only the hub calls view actions') end
       return view_handlers[ev.action](args)

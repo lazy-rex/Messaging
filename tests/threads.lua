@@ -30,6 +30,16 @@ test('the default install declares no Gallery tab', function()
   expect(has_tab('gallery')).to_be(false)
 end)
 
+-- The plugin had a lab action lab.tabs that passed caller args to hub.ui.tabs with no requester
+-- check: any Rex client could replace the user's tab set.
+test('a Rex client that is not the hub cannot declare tabs', function()
+  local client = H.hub('hub.test.status', {}).plugins.messaging.client_id
+  local before = H.tabs()
+  local ok = pcall(H.perform, client, 'lab.tabs', {tabs = {{key = 'thread/team', title = 'Replaced', route = '/thread/team'}}})
+  expect(ok, 'the call is refused').to_be(false)
+  expect(H.tabs(), 'the tab set is unchanged').to_equal(before)
+end)
+
 -- B4 (fresh-install audit): the renderer refuses a history node with page_size < 1 (hub
 -- view/schema.go). The harness does not apply that check, so the test reads the node itself.
 test('an empty thread renders a history node with a positive page_size', function()
