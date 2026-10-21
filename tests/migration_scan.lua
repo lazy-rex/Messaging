@@ -47,8 +47,19 @@ end)
 -- Needs hub.test.calls (hub branch hub/test-calls); without it, a test named SKIP.
 local c_id = 'claude:conversation-c'
 local charlie = agent('charlie')
-if not H.calls or not pcall(H.calls, 'none') then
-  test('SKIP: no hub.test.calls; the migration request evidence is not measured', function() end)
+-- Only a missing capability skips (as in tab_reads.lua). Another error of hub.test.calls fails the
+-- file: it must not turn the evidence into a SKIP.
+local function calls_missing()
+  if not H.calls then return 'the harness has no H.calls' end
+  local ok, err = pcall(H.calls, 'none')
+  if ok then return nil end
+  local text = type(err) == 'table' and tostring(err.code) .. ': ' .. tostring(err.message) or tostring(err)
+  if text:find('unknown') or text:find('not_supported') then return 'the hub refuses hub.test.calls (' .. text .. ')' end
+  error(err, 0)
+end
+local missing = calls_missing()
+if missing then
+  test('SKIP: ' .. missing .. '; the migration request evidence is not measured', function() end)
   return
 end
 
