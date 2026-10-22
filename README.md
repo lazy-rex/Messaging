@@ -12,9 +12,11 @@ Check this repository out next to LazyRex, and add the plugin to the hub config:
 
 The plugin loads its other files from its own directory, so keep them together.
 
+Messaging runs on the LazyRex Plugin SDK v0. Its `lazyrex.json` has `"sdk": "0"`, so the hub starts it through the SDK launcher (`sdk/lua/boot.lua`). A hub without the launcher cannot start it.
+
 Plugin args (hub config `plugins[].args`):
 
-- `gallery` (default: absent): `"gallery": "true"` declares the Gallery tab. The hub config holds arg values as strings; Rex gives the plugin the boolean `true` (observed in a lab check, 2026-10-21). The Gallery is a live preview of every control, with sample messages. It is for renderer work, not for users.
+- `gallery` (default: absent): `"gallery": "true"` declares the Gallery tab and serves its view (`/gallery`). Without it, the route is unknown. The hub config holds arg values as strings; Rex gives the plugin the boolean `true` (observed in a lab check, 2026-10-21). The Gallery is a live preview of every control, with sample messages. It is for renderer work, not for users.
 
 ## Size limits
 

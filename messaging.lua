@@ -1,11 +1,10 @@
 -- Durable messaging. The hub owns storage and replaces this process after a restart.
-local hub_id = assert(rex.args.hub_client_id, 'hub_client_id is required')
-local instance_id = assert(rex.args.instance_id, 'instance_id is required')
+-- The LazyRex Plugin SDK does the registration and the dispatch. The hub starts this file through
+-- the SDK launcher (lazyrex.json "sdk": "0"), which puts the SDK in package.path.
+local app = require('lazyrex').plugin('messaging')
+local hub_id = app.hub_id
 local attempts = 4 -- Bound revision-conflict retries; this is not a delivery guarantee.
-
-local function fail(code, message)
-  error({code = code, message = message})
-end
+local fail = app.fail
 
 -- A hub error keeps its code. Only an error without a code, or with a transient code, becomes
 -- 'unavailable' (retryable): a definite refusal must end an operation, not repeat it.
@@ -839,18 +838,6 @@ migrate_chain = function(target, contributors, records)
   local rest = {}
   for i = first, n do rest[#rest + 1] = ids[i] end
   return tail_value({ids = rest, seg = seg, chain = chain, frozen = first - 1}), ops
-end
-
-local function identify(ev)
-  local principal = ev.requester and ev.requester.principal
-  if not principal or principal.kind ~= 'peer' or type(principal.pid) ~= 'number' then
-    fail('refused', 'A local requester PID is required')
-  end
-  local result = hub('hub.identify', {pid = principal.pid})
-  if result.found ~= true or type(result.agent) ~= 'string' or result.agent == '' then
-    fail('refused', 'The hub does not recognize this agent')
-  end
-  return result.agent, result.session_id
 end
 
 local function saved_result(saved, fingerprint)
@@ -2064,20 +2051,15 @@ local function render_form(args)
   fail('invalid_input', 'Unknown form route')
 end
 
-local function view_render(args)
-  if args.route:sub(1, 7) == '/forms/' then
-    local tree = render_form(args)
-    tree.status = {state = 'blocked', kind = 'question', msg = 'Waiting for input'}
-    return {tree = tree}
-  end
-  if args.route == gallery_route then return {tree = render_gallery()} end
-  if args.route == '/panels/threads' then return {tree = render_home(args.user, args.context)} end
-  return {tree = render_thread(args.user, args.route)}
+local function form_view(args)
+  local tree = render_form(args)
+  tree.status = {state = 'blocked', kind = 'question', msg = 'Waiting for input'}
+  return tree
 end
 
--- The gallery shows sample messages. A new user can read them as real data, so its tab exists only
--- when the plugin arg gallery is true (hub config plugins[].args).
-local gallery_tab = rex.args.gallery == true
+-- The gallery shows sample messages. A new user can read them as real data, so its tab and its
+-- view exist only when the plugin arg gallery is true (hub config plugins[].args).
+local gallery_tab = app.args.gallery == true
 
 -- declare_tabs declares conversation tabs and, if gallery_tab, the gallery.
 local function declare_tabs(user)
@@ -2227,7 +2209,6 @@ local function view_action(args)
     end
     fail('invalid_input', 'Unknown thread menu action')
   end
-  if args.route == gallery_route then return gallery_action(args) end
   if args.node_id == '$back' then return {panel = {command = 'threads'}} end
   if (args.node_id == 'threads' or args.node_id == 'observed_threads') and args.action == 'open' then
     local peer = type(args.input) == 'table' and args.input.item_id
@@ -2249,7 +2230,6 @@ end
 
 -- view_seen: the user looks at this thread. Acknowledge the user's unread messages in it.
 local function view_seen(args)
-  if args.route == '/panels/threads' or args.route == gallery_route or args.route:sub(1, 7) == '/forms/' then return {acked = 0} end
   local peer = thread_peer(args.route, args.user)
   if peer.observer then return {acked = 0} end
   local _, _, unread = mailbox(args.user)
@@ -2268,7 +2248,6 @@ local function view_seen(args)
 end
 
 local function view_draft_save(args)
-  if args.route == gallery_route then return gallery_draft_save(args) end
   local peer = thread_peer(args.route, args.user)
   if peer.readonly then fail('refused', 'This direct thread is read-only') end
   if type(args.text) ~= 'string' or type(args.base_revision) ~= 'string' then fail('invalid_input', 'text and base_revision are required') end
@@ -2327,7 +2306,6 @@ local function ui_recipients(user, peer)
 end
 
 local function view_send(args)
-  if args.route == gallery_route then return gallery_send(args) end
   local peer = thread_peer(args.route, args.user)
   if peer.readonly then fail('refused', 'This direct thread is read-only') end
   if type(args.text) ~= 'string' or args.text == '' or type(args.draft_revision) ~= 'string' then
@@ -2384,160 +2362,137 @@ local function view_send(args)
   fail('unavailable', 'Mailbox changed; retry with the same operation key')
 end
 
+-- Agent actions. fn(agent, args, source session) runs the action; declares: it can change a thread.
 local actions = {
-  {name = 'messaging.send', kind = 'client', title = 'Send a message',
+  {name = 'messaging.send', fn = send, declares = true, title = 'Send a message',
     description = 'Send a message to an agent, to "user" (the human), or to the group "team" (everyone else). Choose a key before sending. After an unknown outcome, retry the same key and content. Set reply_to to acknowledge the message you answer. Set reply_expected=false for an informational message. Use ack for routine receipts. Limits: body at most 16384 bytes encoded as JSON, key at most 200 bytes, reply_to at most 512 bytes, and the whole message must fit one read page (48 KB).',
     args = {type = 'object', properties = {
       to = {type = 'string', minLength = 1}, body = {type = 'string', minLength = 1}, key = {type = 'string', minLength = 1},
       reply_to = {type = 'string', minLength = 1}, reply_expected = {type = 'boolean'}
     }, required = {'to', 'body', 'key'}, additionalProperties = false}},
-  {name = 'messaging.read', kind = 'client', title = 'Read messages',
+  {name = 'messaging.read', fn = read, title = 'Read messages',
     description = 'Read your unacknowledged messages. Reading does not acknowledge them. Optional thread filters by recipient/group ID. Pass next_cursor as since to get later arrivals; keep a cursor per filter. Omit since for recovery. A reply holds at most 48 KB: if more is true, call again with since = next_cursor. An older message larger than one reply arrives with a prefix of its body, truncated = true and body_bytes (the full body size). If even its other fields do not fit, it arrives as {cursor, id, metadata_too_large = true, bytes}; if its ID does not fit either, id_prefix and id_bytes replace id, and that message cannot be acknowledged. An empty list can appear as {}.',
     args = {type = 'object', properties = {thread = {type = 'string', minLength = 1}, since = {type = 'string', pattern = '^(0|[1-9][0-9]*)$'}}, additionalProperties = false}},
-  {name = 'messaging.ack', kind = 'client', title = 'Acknowledge messages',
+  {name = 'messaging.ack', fn = ack, declares = true, title = 'Acknowledge messages',
     description = 'Acknowledge handled messages without sending a receipt reply. Safe to retry. An empty list changes nothing.',
     args = {type = 'object', properties = {ids = {type = 'array', items = {type = 'string', minLength = 1}}},
       required = {'ids'}, additionalProperties = false}},
-  {name = 'messaging.thread_list', kind = 'client', title = 'List threads',
+  {name = 'messaging.thread_list', fn = thread_list, title = 'List threads',
     description = 'List your direct and group threads with unread counts. Set include_archived=true to include archived threads.',
     args = {type = 'object', properties = {include_archived = {type = 'boolean'}}, additionalProperties = false}},
-  {name = 'messaging.thread_create', kind = 'client', title = 'Create a thread',
+  {name = 'messaging.thread_create', fn = thread_create, declares = true, title = 'Create a thread',
     description = 'Create a thread with yourself and selected roster members. The home defaults to your current session. Set session_id for an open session or new_session for a new name. An existing direct thread keeps its home. Retry with the same key and content.',
     args = {type = 'object', properties = {members = {type = 'array', items = {type = 'string', minLength = 1}}, title = {type = 'string'}, session_id = {type = 'string', minLength = 1}, new_session = {type = 'string', minLength = 1}, key = {type = 'string', minLength = 1}},
       required = {'members', 'key'}, additionalProperties = false}},
-  {name = 'messaging.history', kind = 'client', title = 'Read thread history',
+  {name = 'messaging.history', fn = history, title = 'Read thread history',
     description = 'Read a page of thread history, newest messages first. Current group members can read all history. This does not acknowledge or backfill unread mail. Default 20 messages, maximum 50. A page holds at most 48 KB, so it can hold fewer messages; next_before is set when older messages exist. An older message larger than one page arrives as in messaging.read: a body prefix with truncated = true and body_bytes, or a metadata_too_large marker. A thread whose ID is too long for one page fails with thread_id_too_large. Pass next_before as before only when you need older context.',
     args = {type = 'object', properties = {thread = {type = 'string', minLength = 1}, before = {type = 'string', pattern = '^[1-9][0-9]*$'}, limit = {type = 'integer', minimum = 1, maximum = 50}},
       required = {'thread'}, additionalProperties = false}},
-  {name = 'messaging.thread_archive', kind = 'client', title = 'Archive or restore a thread',
+  {name = 'messaging.thread_archive', fn = thread_archive, declares = true, title = 'Archive or restore a thread',
     description = 'Archive a thread for yourself without deleting history or drafts or changing delivery. Set archived=false to restore. Choose a key and retry with the same content after an unknown outcome.',
     args = {type = 'object', properties = {thread = {type = 'string', minLength = 1}, archived = {type = 'boolean'}, key = {type = 'string', minLength = 1}},
       required = {'thread', 'key'}, additionalProperties = false}},
-  {name = 'messaging.thread_rename', kind = 'client', title = 'Rename a thread',
+  {name = 'messaging.thread_rename', fn = thread_rename, declares = true, title = 'Rename a thread',
     description = 'Set your title of a thread. Other participants keep their own titles. Choose a key and retry with the same content after an unknown outcome.',
     args = {type = 'object', properties = {thread = {type = 'string', minLength = 1}, title = {type = 'string', minLength = 1}, key = {type = 'string', minLength = 1}},
       required = {'thread', 'title', 'key'}, additionalProperties = false}},
-  {name = 'messaging.thread_members', kind = 'client', title = 'Change thread members',
+  {name = 'messaging.thread_members', fn = thread_members, declares = true, title = 'Change thread members',
     description = 'Set the members of a group thread that you are in (you stay a member). New members can read full history; old messages do not become unread for them. For a direct thread, a larger selection creates a new group and returns its id. The team group cannot change. Choose a key and retry with the same content after an unknown outcome.',
     args = {type = 'object', properties = {thread = {type = 'string', minLength = 1}, members = {type = 'array', items = {type = 'string', minLength = 1}}, key = {type = 'string', minLength = 1}},
       required = {'thread', 'members', 'key'}, additionalProperties = false}},
-  {name = 'messaging.thread_move', kind = 'client', title = 'Move a thread to a session',
+  {name = 'messaging.thread_move', fn = thread_move, declares = true, title = 'Move a thread to a session',
     description = 'Set the Rex session where the thread opens for you. Set session_id for an open session or new_session for a new name; with neither, your current session. Choose a key and retry with the same content after an unknown outcome.',
     args = {type = 'object', properties = {thread = {type = 'string', minLength = 1}, session_id = {type = 'string', minLength = 1}, new_session = {type = 'string', minLength = 1}, key = {type = 'string', minLength = 1}},
       required = {'thread', 'key'}, additionalProperties = false}}
 }
-local exports = {}
-for _, action in ipairs(actions) do exports[#exports + 1] = action.name end
--- View actions: only the hub calls them. They are not exported to agents.
-local view_handlers = {['view.open'] = function(args)
-  if args.user ~= 'user' then fail('refused', 'Only the user opens a UI thread') end
-  local peer = thread_peer(args.route, args.user)
-  remember_thread_open(args.user, peer.id)
-  declare_tabs(args.user)
-  return {}
-end, ['view.history'] = function(args)
+
+-- Storage stays in hub.store until the hub runs hub.sql. No handler uses app.db, so each one runs
+-- with tx = false and store = false (docs/plugin-sdk.md): the SDK sends no hub.sql call. A call
+-- first reads the roster and applies new aliases. A call that can change a thread declares the
+-- tabs again after it; a failed declaration fails the call.
+local ui_user = 'user'
+local plain = {tx = false, store = false}
+local function handler(fn, declares)
+  return function(ctx, args)
+    refresh_participants()
+    migrate_aliases()
+    local result = fn(ctx, args)
+    if declares then declare_tabs(ui_user) end
+    return result
+  end
+end
+
+-- Agent actions. The SDK identifies the agent and gives its session and its key in ctx.
+for _, a in ipairs(actions) do
+  local fn = a.fn
+  app.action(a.name, a.args, handler(function(ctx, args)
+    args.key = ctx.key
+    return fn(ctx.agent, args, ctx.session_id)
+  end, a.declares), {title = a.title, description = a.description, tx = false, store = false})
+end
+
+-- Views: only the hub calls them, for the user.
+local function view(fn, declares) return handler(function(_, args) return fn(args) end, declares) end
+app.view('/thread/*', {
+  render = view(function(args) return render_thread(args.user, args.route) end),
+  ['view.open'] = view(function(args)
+    local peer = thread_peer(args.route, args.user)
+    remember_thread_open(args.user, peer.id)
+    declare_tabs(args.user)
+    return {}
+  end),
   -- A page of messages older than args.before, for the transcript pane.
-  if type(args.before) ~= 'string' or args.before == '' then fail('invalid_input', 'before is required') end
-  local messages, has_more = history_page(args.user, thread_peer(args.route, args.user), args.before, page_budget)
-  return {messages = messages, has_more = has_more}
-end, ['view.rename'] = view_rename, ['view.render'] = view_render, ['view.action'] = view_action,
-  ['view.draft.save'] = view_draft_save, ['view.send'] = view_send, ['view.seen'] = view_seen}
+  ['view.history'] = view(function(args)
+    if type(args.before) ~= 'string' or args.before == '' then fail('invalid_input', 'before is required') end
+    local messages, has_more = history_page(args.user, thread_peer(args.route, args.user), args.before, page_budget)
+    return {messages = messages, has_more = has_more}
+  end),
+  ['view.rename'] = view(view_rename, true),
+  ['view.action'] = view(view_action, true),
+  ['view.draft.save'] = view(view_draft_save),
+  ['view.send'] = view(view_send, true),
+  ['view.seen'] = view(view_seen, true),
+}, plain)
+app.view('/panels/threads', {
+  render = view(function(args) return render_home(args.user, args.context) end),
+  ['view.action'] = view(view_action, true),
+}, plain)
+app.view('/forms/*', {render = view(form_view), ['view.action'] = view(view_action, true)}, plain)
+if gallery_tab then
+  app.view(gallery_route, {
+    render = function() return render_gallery() end,
+    ['view.action'] = function(_, args) return gallery_action(args) end,
+    ['view.draft.save'] = function(_, args) return gallery_draft_save(args) end,
+    ['view.send'] = function(_, args) return gallery_send(args) end,
+  }, plain)
+end
 
 -- hub.changed: the hub sends one for each change of agents, workers and plugins, and does not
 -- coalesce them. Only agents changes the tabs. A declaration for each one queued the plugin: on
 -- the live hub after release 2 (2026-10-22), bursts of about 30 per 10 s met declarations of about
--- 1 s each, and the 16-request queue filled. So the handler only schedules one declaration
--- (rex.after) and replies at once; a burst gets one or two declarations. The schedule state is a
--- table field, not a captured local (pcall rule, see chain_reader).
+-- 1 s each, and the 16-request queue filled. So the handler only schedules one declaration and
+-- replies at once; a burst gets one or two declarations. The schedule state is a table field, not
+-- a captured local (pcall rule, see chain_reader). The SDK logs a failed declaration; the next
+-- action or agents change declares the tabs again.
 local tabs_schedule = {pending = false}
 local tabs_delay = 0.25
-view_handlers['hub.changed'] = function(args)
-  if args.what ~= 'agents' or tabs_schedule.pending then return {} end
+app.on('hub.changed', function(args)
+  if args.what ~= 'agents' or tabs_schedule.pending then return end
   tabs_schedule.pending = true
-  rex.after(tabs_delay, function()
+  app.after(tabs_delay, function()
     tabs_schedule.pending = false
-    local ok, err = pcall(function()
-      refresh_participants()
-      migrate_aliases()
-      declare_tabs('user')
-    end)
-    -- The next action or agents change declares the tabs again.
-    if not ok then rex.log('messaging: tab declaration after hub.changed failed: ' .. tostring(type(err) == 'table' and err.message or err)) end
-  end)
-  return {}
-end
-local view_args = {type = 'object', properties = {route = {type = 'string'}, user = {type = 'string'}}, required = {'route', 'user'}}
-for name in pairs(view_handlers) do
-  actions[#actions + 1] = {name = name, kind = 'client', title = name,
-    args = name == 'hub.changed' and {type = 'object', properties = {what = {type = 'string'}}, required = {'what'}} or view_args}
-end
--- Only the hub can assert the original caller for a forwarded public action.
-actions[#actions + 1] = {name = 'hub.forward', kind = 'client', title = 'Forward an agent action',
-  args = {type = 'object', properties = {action = {type = 'string'}, args = {type = 'object'}, requester_pid = {type = 'integer'}},
-    required = {'action', 'args', 'requester_pid'}, additionalProperties = false}}
-rex.call('client.keymap', {actions = actions})
-local registration = hub('hub.register', {plugin = 'messaging', instance_id = instance_id, exports = exports,
-  commands = {{id = 'new_thread', title = 'New Thread…', description = 'Start a conversation with agents', keywords = {'message', 'conversation'}, route = '/forms/new-thread', action = 'messaging.thread_create'},
-    {id = 'threads', title = 'Threads…', description = 'List all threads, with this session first', keywords = {'message', 'conversation'}, surface = 'panel', landing = true, route = '/panels/threads', user_only = 'navigation'}}})
-if type(registration.generation) ~= 'string' then fail('internal', 'Missing hub generation') end
--- Spike 3 has one UI user. Each conversation has one tab.
-local ui_user = 'user'
-refresh_participants()
-migrate_aliases()
-declare_tabs(ui_user)
-rex.on('client_perform_requested', function(ctx, ev)
-  local call_id = ev.call_id
-  local ok, result = pcall(function()
-    if ev.action == 'hub.forward' then
-      if not ev.requester or ev.requester.client_id ~= hub_id then fail('refused', 'Only the hub forwards agent actions') end
-      local forwarded = ev.args or {}
-      local exported = false
-      for _, name in ipairs(exports) do if name == forwarded.action then exported = true end end
-      if not exported then fail('refused', 'The forwarded action is not exported') end
-      if type(forwarded.requester_pid) ~= 'number' or forwarded.requester_pid <= 0 or forwarded.requester_pid % 1 ~= 0 then
-        fail('invalid_input', 'A positive requester PID is required')
-      end
-      ev = {action = forwarded.action, args = forwarded.args,
-        requester = {principal = {kind = 'peer', pid = forwarded.requester_pid}}}
-    end
-    -- hub.changed only schedules work, so it does not pay for the reads below.
-    if ev.action == 'hub.changed' then
-      if not ev.requester or ev.requester.client_id ~= hub_id then fail('refused', 'Only the hub calls view actions') end
-      return view_handlers['hub.changed'](ev.args or {})
-    end
     refresh_participants()
     migrate_aliases()
-    local args = ev.args or {}
-    if view_handlers[ev.action] then
-      if not ev.requester or ev.requester.client_id ~= hub_id then fail('refused', 'Only the hub calls view actions') end
-      return view_handlers[ev.action](args)
-    end
-    local agent, source_session = identify(ev)
-    if type(args) ~= 'table' then fail('refused', 'Arguments must be an object') end
-    if ev.action == 'messaging.send' then return send(agent, args) end
-    if ev.action == 'messaging.read' then return read(agent, args) end
-    if ev.action == 'messaging.history' then return history(agent, args) end
-    if ev.action == 'messaging.thread_list' then return thread_list(agent, args) end
-    if ev.action == 'messaging.thread_create' then return thread_create(agent, args, source_session) end
-    if ev.action == 'messaging.thread_archive' then return thread_archive(agent, args) end
-    if ev.action == 'messaging.thread_rename' then return thread_rename(agent, args) end
-    if ev.action == 'messaging.thread_members' then return thread_members(agent, args, source_session) end
-    if ev.action == 'messaging.thread_move' then return thread_move(agent, args, source_session) end
-    if ev.action == 'messaging.ack' then return ack(agent, args) end
-    fail('not_supported', 'Unknown messaging action')
-  end)
-  if ok and (ev.action == 'messaging.send' or ev.action == 'messaging.ack'
-    or ev.action == 'messaging.thread_create' or ev.action == 'messaging.thread_archive'
-    or ev.action == 'messaging.thread_rename' or ev.action == 'messaging.thread_members' or ev.action == 'messaging.thread_move'
-    or ev.action == 'view.rename' or ev.action == 'view.action' or ev.action == 'view.send' or ev.action == 'view.seen') then
-    local tabs_ok, tabs_error = pcall(declare_tabs, ui_user)
-    if not tabs_ok then ok = false; result = tabs_error end
-  end
-  if ok then
-    rex.call('client.reply', {call_id = call_id, result = result})
-  else
-    local failure = type(result) == 'table' and result or {code = 'internal', message = tostring(result)}
-    rex.call('client.reply', {call_id = call_id, error = failure})
-  end
-end)
-rex.call('client.set_label', {label = 'lazyrex-plugin:messaging'})
+    declare_tabs(ui_user)
+  end, {tx = false})
+end, {tx = false})
+
+for _, command in ipairs({{id = 'new_thread', title = 'New Thread…', description = 'Start a conversation with agents', keywords = {'message', 'conversation'}, route = '/forms/new-thread', action = 'messaging.thread_create'},
+    {id = 'threads', title = 'Threads…', description = 'List all threads, with this session first', keywords = {'message', 'conversation'}, surface = 'panel', landing = true, route = '/panels/threads', user_only = 'navigation'}}) do app.command(command) end
+
+-- Spike 3 has one UI user. Each conversation has one tab.
+app.start(function()
+  refresh_participants()
+  migrate_aliases()
+  declare_tabs(ui_user)
+end, {tx = false})
