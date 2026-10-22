@@ -2046,9 +2046,9 @@ for _, command in ipairs({{id = 'new_thread', title = 'New Thread…', descripti
 
 -- Spike 3 has one UI user. Each conversation has one tab.
 -- The import runs in steps: each step is one transaction or one page of a check (import.lua).
--- The start runs steps for at most start_seconds (os.clock: wall time since start in gopher-lua),
--- so a done or small import ends before the first call (calls wait in the plugin's queue for that
--- bounded time). A larger import continues in
+-- The start runs steps until start_seconds have passed (os.clock: wall time since start in
+-- gopher-lua), so a done or small import ends before the first call. The time is checked between
+-- steps, so the start can take one step longer; calls wait in the plugin's queue for that time. A larger import continues in
 -- timer steps; between them the plugin answers calls, and each fails with unavailable until the
 -- import is done. A failed import stops; every call then fails with its error, meta import_error
 -- holds the error, the plugin keeps running, and the next start continues.

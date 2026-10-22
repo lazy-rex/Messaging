@@ -4,7 +4,9 @@
 local function gallery(key) return rex.json.decode(sql('SELECT value FROM gallery WHERE key = ?', {key})[1].value) end
 
 test('the Gallery tab is declared with the gallery arg', function()
-  expect(tab('gallery').route).to_be('/gallery')
+  -- The plugin declares its tabs when its start import is done, after its registration.
+  local t = wait('the Gallery tab', function() return tab('gallery') end)
+  expect(t.route).to_be('/gallery')
 end)
 
 test('the Gallery renders, and keeps its actions, draft and send', function()

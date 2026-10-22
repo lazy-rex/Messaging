@@ -14,7 +14,7 @@ return function(env)
   local FENCE = 'sql-import'
   local STEP = 50 -- source records in one step (one transaction)
   local CHUNK = 30000 -- encoded bytes of one body part in import_body
-  local LARGE = 40000 -- a message whose encoded body is larger is imported in chunks
+  local LARGE = 40000 -- a message whose body and other fields are larger is imported in parts
   -- The families in import order: groups first (the audience fallback), messages before mailboxes.
   -- The thread chains give no rows: they are sources of the verification, so the source check
   -- covers them.
@@ -28,27 +28,56 @@ return function(env)
     fail('migration_conflict', message .. (key and (': ' .. key) or ''))
   end
 
-  -- batches cuts a list of strings into lists of at most BATCH encoded bytes: each list goes into
-  -- one request as JSON, and a request holds at most 64 KiB with its SQL text. An item larger than
-  -- BATCH alone stops the import.
-  local BATCH = 48000
-  local function batches(list)
-    local out, block, size = {}, {}, 2
+  -- A request holds at most 64 KiB, encoded. REQUEST is the part for the parameters; the rest
+  -- (about 5.5 KB) holds the SQL text and the envelope.
+  local REQUEST = 60000
+
+  -- batches cuts a list of strings into lists that go into one request each, as the JSON text of
+  -- the list (json_each(?)). The request encodes that text again as a string parameter, so an item
+  -- costs the encoded size of its own JSON text (a quote is 1 byte, then 2 in the JSON text, then 4
+  -- in the request). reserve: the encoded bytes of the other parameters. Escaping is per
+  -- character, so the sum is exact. An item larger than one request alone stops the import.
+  local function batches(list, reserve)
+    local budget = REQUEST - (reserve or 0)
+    local out, block, size = {}, {}, 4 -- the quotes of the parameter and the brackets of the list
     for _, item in ipairs(list) do
-      local cost = encoded_size(item) + 1
-      if cost + 2 > BATCH then conflict('A key or ID is too large for one request', utf8_cut(item, 200)) end
-      if size + cost > BATCH then out[#out + 1] = block; block, size = {}, 2 end
+      local cost = encoded_size(json(item)) - 2 + 1 -- its JSON text without the outer quotes, and a comma
+      if 4 + cost > budget then conflict('A key or ID is too large for one request', utf8_cut(item, 200)) end
+      if size + cost > budget then out[#out + 1] = block; block, size = {}, 4 end
       block[#block + 1] = item
       size = size + cost
     end
     if #block > 0 then out[#out + 1] = block end
     return out
   end
-  -- fits stops the import when the values of one row are larger than one request.
-  local function fits(key, ...)
-    local size = 0
-    for i = 1, select('#', ...) do size = size + encoded_size(select(i, ...) or '') end
-    if size > LARGE then conflict('A record is too large for one request', key) end
+
+  -- with_text calls fn(expr, param) for a row with one text value of any size. A text that fits
+  -- one request with the row's other values (reserve: their encoded bytes) goes as a parameter
+  -- (expr '?'). A larger text goes into import_body in parts, in this transaction, and expr reads it
+  -- back; the part row is deleted after fn. No legacy value is refused for its size.
+  local function with_text(key, text, reserve, fn)
+    if encoded_size(text) + reserve <= REQUEST then return fn('?', text) end
+    local part_key = 'text/' .. key
+    db.exec('DELETE FROM import_body WHERE key = ?', part_key)
+    local offset = 0
+    while offset < #text do
+      local piece = utf8_cut(text:sub(offset + 1), CHUNK)
+      while encoded_size(piece) > CHUNK do piece = utf8_cut(piece, math.floor(#piece / 2)) end
+      if piece == '' then conflict('A text cannot be cut', key) end
+      -- || gives TEXT, also for two BLOBs: the CAST keeps the stored text a BLOB.
+      db.exec([[INSERT INTO import_body (key, body) VALUES (?, CAST(? AS BLOB))
+        ON CONFLICT (key) DO UPDATE SET body = CAST(body || excluded.body AS BLOB)]], part_key, piece)
+      offset = offset + #piece
+    end
+    local result = fn('(SELECT CAST(body AS TEXT) FROM import_body WHERE key = ?)', part_key)
+    db.exec('DELETE FROM import_body WHERE key = ?', part_key)
+    return result
+  end
+  -- size of the other values of a row, for with_text.
+  local function size(...)
+    local n = 0
+    for i = 1, select('#', ...) do n = n + encoded_size(select(i, ...) or '') end
+    return n
   end
 
   -- meta -----------------------------------------------------------------------------------------
@@ -122,10 +151,12 @@ return function(env)
       ON CONFLICT (gid, agent) DO UPDATE SET pos = min(pos, excluded.pos), current = max(current, excluded.current)]],
       gid, agent, pos, current)
   end
-  local function title(viewer, peer, text, rev)
-    db.exec([[INSERT INTO thread_titles (viewer, peer, title, set_rev) VALUES (?, ?, ?, CAST(? AS INTEGER))
-      ON CONFLICT (viewer, peer) DO UPDATE SET title = excluded.title, set_rev = excluded.set_rev
-      WHERE excluded.set_rev > thread_titles.set_rev]], viewer, peer, text, rev)
+  local function title(viewer, peer, text, rev, key)
+    with_text(key, text, size(viewer, peer, rev), function(expr, p)
+      db.exec([[INSERT INTO thread_titles (viewer, peer, title, set_rev) VALUES (?, ?, ]] .. expr .. [[, CAST(? AS INTEGER))
+        ON CONFLICT (viewer, peer) DO UPDATE SET title = excluded.title, set_rev = excluded.set_rev
+        WHERE excluded.set_rev > thread_titles.set_rev]], viewer, peer, p, rev)
+    end)
   end
   local function draft(viewer, peer, text, rev, key)
     local old = db.first('SELECT text, CAST(rev AS TEXT) AS rev FROM drafts WHERE viewer = ? AND peer = ?', viewer, peer)
@@ -134,10 +165,12 @@ return function(env)
       local wins = (text ~= '' and old.text == '') or (text == old.text and later(rev, old.rev))
       if not wins then return end
     end
-    db.exec([[INSERT INTO drafts (viewer, peer, text, rev) VALUES (?, ?, ?, CAST(? AS INTEGER))
-      ON CONFLICT (viewer, peer) DO UPDATE SET text = excluded.text, rev = excluded.rev]], viewer, peer, text, rev)
+    with_text(key, text, size(viewer, peer, rev), function(expr, p)
+      db.exec([[INSERT INTO drafts (viewer, peer, text, rev) VALUES (?, ?, ]] .. expr .. [[, CAST(? AS INTEGER))
+        ON CONFLICT (viewer, peer) DO UPDATE SET text = excluded.text, rev = excluded.rev]], viewer, peer, p, rev)
+    end)
   end
-  local function home(a, b, session, moved, rev)
+  local function home(a, b, session, moved, rev, key)
     local old = db.first('SELECT moved, CAST(set_rev AS TEXT) AS set_rev FROM thread_homes WHERE thread_a = ? AND thread_b = ?', a, b)
     if old then
       -- The newest move wins; without a move, the first home wins.
@@ -146,9 +179,11 @@ return function(env)
       else wins = old.moved == 0 and later(old.set_rev, rev) end
       if not wins then return end
     end
-    db.exec([[INSERT INTO thread_homes (thread_a, thread_b, home_session, moved, set_rev) VALUES (?, ?, ?, ?, CAST(? AS INTEGER))
-      ON CONFLICT (thread_a, thread_b) DO UPDATE SET home_session = excluded.home_session, moved = excluded.moved,
-        set_rev = excluded.set_rev]], a, b, session, moved, rev)
+    with_text(key, session, size(a, b, rev) + 4, function(expr, p)
+      db.exec([[INSERT INTO thread_homes (thread_a, thread_b, home_session, moved, set_rev) VALUES (?, ?, ]] .. expr .. [[, ?, CAST(? AS INTEGER))
+        ON CONFLICT (thread_a, thread_b) DO UPDATE SET home_session = excluded.home_session, moved = excluded.moved,
+          set_rev = excluded.set_rev]], a, b, p, moved, rev)
+    end)
   end
 
   -- The audience -----------------------------------------------------------------------------------
@@ -209,7 +244,7 @@ return function(env)
     local key = 'delivery/' .. part(m.id)
     local delivery = m.recipients == nil and kv_get({key})[key] or nil
     -- The audience has no duplicates; a row from an earlier record cannot exist (a new seq).
-    for _, block in ipairs(batches(audience(m, delivery, groups))) do
+    for _, block in ipairs(batches(audience(m, delivery, groups), size(r.rev))) do
       db.exec('INSERT INTO deliveries (agent, seq, acked) SELECT value, CAST(? AS INTEGER), 1 FROM json_each(?)', r.rev, json(block))
     end
   end
@@ -222,8 +257,9 @@ return function(env)
     if type(r.value) ~= 'table' or type(r.value.groups) ~= 'table' then conflict('Invalid groups record', r.key) end
     for gid, g in pairs(r.value.groups) do
       if type(g) ~= 'table' or type(g.name) ~= 'string' or type(g.members) ~= 'table' then conflict('Invalid group', gid) end
-      fits('groups ' .. utf8_cut(gid, 200), gid, g.name)
-      db.exec('INSERT INTO groups (gid, name) VALUES (?, ?)', gid, g.name)
+      with_text('groups/' .. gid, g.name, size(gid), function(expr, p)
+        db.exec('INSERT INTO groups (gid, name) VALUES (?, ' .. expr .. ')', gid, p)
+      end)
       local pos = 0
       for _, id in ipairs(g.members) do pos = pos + 1; member(gid, c(str(id, gid, 'member')), pos, 1) end
       for _, id in ipairs(g.past_members or {}) do pos = pos + 1; member(gid, c(str(id, gid, 'member')), pos, 0) end
@@ -241,7 +277,7 @@ return function(env)
     end
     if #ids == 0 then return end
     local changed = 0
-    for _, block in ipairs(batches(ids)) do
+    for _, block in ipairs(batches(ids, size(agent))) do
       changed = changed + db.exec([[UPDATE deliveries SET acked = 0 WHERE agent = ?
         AND seq IN (SELECT m.seq FROM messages m JOIN json_each(?) j ON m.id = j.value)]], agent, json(block)).changes
     end
@@ -253,16 +289,14 @@ return function(env)
     if type(v) ~= 'table' or type(v.home_session) ~= 'string' then conflict('Invalid thread home', r.key) end
     if a:sub(1, 2) == 'd-' then a = c_thread(a)
     elseif a ~= '' then a, b = sorted(c(a), c(b)) end
-    fits(r.key, a, b, v.home_session)
-    home(a, b, v.home_session, v.moved == true and 1 or 0, type(v.set_rev) == 'string' and v.set_rev or r.rev)
+    home(a, b, v.home_session, v.moved == true and 1 or 0, type(v.set_rev) == 'string' and v.set_rev or r.rev, r.key)
   end
   import_record['thread-title/'] = function(r)
     local viewer, peer = pair2(r.key:sub(#'thread-title/' + 1), r.key)
     local v = r.value
     -- Today a title without a visible character shows the display name: no row.
     if type(v) ~= 'table' or type(v.title) ~= 'string' or not v.title:match('%S') then return end
-    fits(r.key, viewer, peer, v.title)
-    title(c(viewer), c_thread(peer), v.title, type(v.set_rev) == 'string' and v.set_rev or r.rev)
+    title(c(viewer), c_thread(peer), v.title, type(v.set_rev) == 'string' and v.set_rev or r.rev, r.key)
   end
   import_record['thread-open/'] = function(r)
     local viewer, peer = pair2(r.key:sub(#'thread-open/' + 1), r.key)
@@ -281,12 +315,13 @@ return function(env)
   import_record['draft/'] = function(r)
     local viewer, peer = pair2(r.key:sub(#'draft/' + 1), r.key)
     local text = type(r.value) == 'table' and type(r.value.text) == 'string' and r.value.text or ''
-    fits(r.key, viewer, peer, text)
     draft(c(viewer), c_thread(peer), text, r.rev, r.key)
   end
   import_record['gallery/'] = function(r)
-    fits(r.key, r.key, json(r.value))
-    db.exec('INSERT INTO gallery (key, value, rev) VALUES (?, ?, CAST(? AS INTEGER))', r.key:sub(#'gallery/' + 1), json(r.value), r.rev)
+    local key = r.key:sub(#'gallery/' + 1)
+    with_text(r.key, json(r.value), size(key, r.rev), function(expr, p)
+      db.exec('INSERT INTO gallery (key, value, rev) VALUES (?, ' .. expr .. ', CAST(? AS INTEGER))', key, p, r.rev)
+    end)
   end
   -- Provenance only: the source check covers it; aliases_applied comes from M.
   import_record['identity-migrated/'] = function() end
@@ -294,15 +329,16 @@ return function(env)
   import_record['thread/'] = function() end
   import_record['thread-seg/'] = function() end
 
-  -- The message family has large records: a body over LARGE goes into import_body in parts.
+  -- The message family has large records: a message over LARGE goes into import_body in parts.
   local function source(key, rev) db.exec("INSERT INTO import_source (key, rev, complete) VALUES (?, ?, 1)", key, rev) end
 
   -- message_step imports one message record, or one part of a large one. It returns true when the
   -- record is complete.
   local function message_step(r, p, groups)
     local m = message_value(r)
-    local rest = {id = m.id, from = m.from, to = m.to, reply_to = m.reply_to, at = m.at, recipients = m.recipients}
-    if encoded_size(rest) > LARGE then conflict('A message has fields too large for one request', r.key) end
+    -- The row's own fields; the recipients go into deliveries in byte batches.
+    local rest = {id = m.id, from = m.from, to = m.to, reply_to = m.reply_to, at = m.at}
+    if encoded_size(rest) > REQUEST then conflict('A message has fields too large for one request', r.key) end
     -- Inline: the body and the other fields go into one request together.
     if encoded_size(rest) + encoded_size(m.body) <= LARGE then
       insert_message(r, m, '?', m.body, groups)
@@ -364,11 +400,10 @@ return function(env)
   local function ops_step(p)
     local page = hub('hub.store.ops_scan', {after = p.after or '', limit = STEP})
     for _, op in ipairs(page.ops or {}) do
-      local result = json(op.result)
-      if encoded_size(op.key) + encoded_size(op.fingerprint) + encoded_size(result) > LARGE then
-        conflict('A saved operation is too large for one request', op.key)
-      end
-      db.exec('INSERT INTO operations (key, owner, fingerprint, result) VALUES (?, ?, ?, ?)', op.key, owner(op.key), op.fingerprint, result)
+      local who = owner(op.key)
+      with_text('ops/' .. op.key, json(op.result), size(op.key, who, op.fingerprint), function(expr, p)
+        db.exec('INSERT INTO operations (key, owner, fingerprint, result) VALUES (?, ?, ?, ' .. expr .. ')', op.key, who, op.fingerprint, p)
+      end)
       db.exec('INSERT INTO import_ops (key) VALUES (?)', op.key)
       p.after = op.key
     end
@@ -474,7 +509,8 @@ return function(env)
   -- threads_task: each key-value chain maps through M to one SQL thread, ascends in seq, and the
   -- union of the chains of a thread equals its SQL messages.
   local function threads_task()
-    -- cur: the chain in progress {key, a, b, v, seg (next segment), ids, blocks, block (next), last}.
+    -- cur: the chain in progress {key, a, b, v, seg (next segment), blocks (of one segment), block
+    -- (next), tail (the record's own IDs are in blocks), last}.
     -- union: part(a) .. part(b) -> {n = distinct IDs, ids = set}. groups_after: the SQL page cursor.
     local t = {after = nil, cur = nil, scanned = false, union = {}, groups_after = nil}
     -- One unit for each call: a chain record, one segment, one lookup batch, or one SQL page.
@@ -489,25 +525,27 @@ return function(env)
         if a ~= '' then a, b = sorted(c(a), c(b)) end
         local v = r.value
         if type(v) ~= 'table' or type(v.ids) ~= 'table' then conflict('Invalid thread record', r.key) end
-        t.cur = {key = r.key, a = a, b = b, v = v, seg = 0, ids = {}}
+        t.cur = {key = r.key, a = a, b = b, v = v, seg = 0}
         return nil
       end
       local cur = t.cur
       if cur then
-        if cur.seg < (cur.v.seg or 0) then
-          local key = 'thread-seg/' .. cur.key:sub(#'thread/' + 1) .. '/' .. (cur.v.chain or '0') .. '/' .. cur.seg
-          local seg = kv_get({key})[key]
-          if seg.rev == '0' or type(seg.value) ~= 'table' or type(seg.value.ids) ~= 'table' then conflict('A thread segment is missing', key) end
-          for _, id in ipairs(seg.value.ids) do cur.ids[#cur.ids + 1] = id end
-          cur.seg = cur.seg + 1
-          return nil
+        -- The batches of one segment are checked before the next segment is read; the chain
+        -- record's own IDs come last. last and the union carry over.
+        local block = cur.blocks and cur.blocks[cur.block]
+        if not block then
+          if cur.seg < (cur.v.seg or 0) then
+            local key = 'thread-seg/' .. cur.key:sub(#'thread/' + 1) .. '/' .. (cur.v.chain or '0') .. '/' .. cur.seg
+            local seg = kv_get({key})[key]
+            if seg.rev == '0' or type(seg.value) ~= 'table' or type(seg.value.ids) ~= 'table' then conflict('A thread segment is missing', key) end
+            cur.blocks, cur.block, cur.seg = batches(seg.value.ids), 1, cur.seg + 1
+            return nil
+          end
+          if not cur.tail then
+            cur.blocks, cur.block, cur.tail = batches(cur.v.ids), 1, true
+            return nil
+          end
         end
-        if not cur.blocks then
-          for _, id in ipairs(cur.v.ids) do cur.ids[#cur.ids + 1] = id end
-          cur.blocks, cur.block = batches(cur.ids), 1
-          return nil
-        end
-        local block = cur.blocks[cur.block]
         if block then
           local found = seq_of_ids(block)
           local k = part(cur.a) .. part(cur.b)

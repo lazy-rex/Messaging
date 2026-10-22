@@ -311,14 +311,38 @@ test('long IDs go into requests by byte size: 200 messages with 1000-byte IDs', 
   expect(sql("SELECT count(*) AS n FROM messages WHERE id LIKE 'kv/long/%'")[1].n).to_be(200)
   expect(sql("SELECT count(*) AS n FROM deliveries d JOIN messages m ON m.seq = d.seq WHERE m.id LIKE 'kv/long/%' AND d.acked = 0")[1].n).to_be(40)
 end)
-test('a draft larger than one request stops the import with its key', function()
-  local key = 'draft/' .. part('user') .. part('bob')
-  write({{key = key, value = {text = string.rep('d', 50000)}}})
-  reimport('importing')
-  local e = wait('the import error', function() return sql("SELECT value FROM meta WHERE key = 'import_error'")[1] end)
-  expect(e.value:find('A record is too large for one request: ' .. key, 1, true) ~= nil, e.value).to_be(true)
-  write({{key = key, delete = true}})
+test('values that need more than one request import exactly; nothing is refused for its size', function()
+  -- A 50000-byte draft: under the record limit of the key-value release.
+  local draft_key = 'draft/' .. part('user') .. part('bob')
+  local draft_text = string.rep('d', 50000)
+  -- A Gallery value of 20000 quotes: 40000 bytes in its record, about 80000 as a JSON text
+  -- parameter (each quote is escaped twice). It goes into the insert in parts.
+  local gallery_value = {text = string.rep('"', 20000)}
+  -- IDs with quotes and backslashes: the batches count their encoding twice (the reviewer's case).
+  local ids = {}
+  for n = 1, 100 do ids[n] = 'kv/esc/' .. string.format('%03d', n) .. string.rep('"', 225) .. string.rep('\\', 225) end
+  local ops = {}
+  for n, id in ipairs(ids) do
+    ops[#ops + 1] = {key = 'message/' .. id, value = {id = id, from = 'charlie', to = 'user', body = 'escaped ' .. n, at = at}}
+    if #ops == 10 then write(ops); ops = {} end
+  end
+  local pair = part(charlie_id) .. part('user')
+  for k = 0, 3 do
+    local seg = {}
+    for n = k * 25 + 1, k * 25 + 25 do seg[#seg + 1] = ids[n] end
+    write({{key = 'thread-seg/' .. pair .. '/0/' .. k, value = {ids = seg}}})
+  end
+  write({{key = 'thread/' .. pair, value = {ids = {}, seg = 4, chain = '0'}}})
+  -- One record in each write: each fits one request, as the key-value release wrote it.
+  write({{key = draft_key, value = {text = draft_text}}})
+  write({{key = 'gallery/escaped', value = gallery_value}})
   reimport()
+  expect(sql('SELECT length(text) AS n, text = ? AS same FROM drafts WHERE viewer = ? AND peer = ?', {draft_text, 'user', 'bob'})[1])
+    .to_equal({n = 50000, same = 1})
+  local g = sql("SELECT value FROM gallery WHERE key = 'escaped'")[1]
+  expect(rex.json.decode(g.value)).to_equal(gallery_value)
+  expect(sql("SELECT count(*) AS n FROM messages WHERE id LIKE 'kv/esc/%'")[1].n).to_be(100)
+  expect(#sql("SELECT key FROM import_body")).to_be(0)
 end)
 test('an orphan fence (a crash before the import began) begins a new import', function()
   write({{key = 'sql-import', value = {state = 'importing'}}})
@@ -360,7 +384,8 @@ test('a late alias whose merge has a draft conflict keeps the import verified un
   local bob_id = 'claude:conversation-bob'
   -- A crash after verified, with two different drafts of the user: one for bob, one for the
   -- identity that bob is about to get.
-  write_sql("INSERT INTO drafts (viewer, peer, text, rev) VALUES ('user', 'bob', 'draft for bob', 1)")
+  write_sql([[INSERT INTO drafts (viewer, peer, text, rev) VALUES ('user', 'bob', 'draft for bob', 1)
+    ON CONFLICT (viewer, peer) DO UPDATE SET text = excluded.text, rev = excluded.rev]])
   write_sql('INSERT INTO drafts (viewer, peer, text, rev) VALUES (?, ?, ?, 2)', {'user', bob_id, 'another draft'})
   write_sql("UPDATE meta SET value = 'verified' WHERE key = 'import'")
   write({{key = 'sql-import', value = {state = 'importing'}}})
