@@ -31,6 +31,8 @@ local function has_id(list, id) return find(list, id) ~= nil end
 
 local alice_id, bob_id, charlie_id = 'claude:conversation-a', 'codex:conversation-b', 'claude:conversation-c'
 local bob_home = session('Bob home')
+-- Thread homes are real sessions: the hub places a tab in its home.
+local first_home, later_home = session('first alias home'), session('later alias home')
 local alice = agent('alice', {title = 'alice tab'})
 local bob = agent('bob', {title = 'bob tab', session = bob_home})
 local charlie = agent('charlie', {title = 'charlie tab'})
@@ -52,8 +54,8 @@ test('legacy data before the identities exist', function()
   sql_write([[INSERT INTO messages (seq, id, sender, recipient, thread_a, thread_b, body, at)
     SELECT n, 'canonical-before-migration', 'user', ?, ?, 'user', 'existing canonical mail', '2026-10-17T00:00:00Z' FROM clock]], {bob_id, bob_id})
   sql_write("INSERT INTO deliveries (agent, seq, acked) SELECT ?, seq, 0 FROM messages WHERE id = 'canonical-before-migration'", {bob_id})
-  sql_write("INSERT INTO thread_homes (thread_a, thread_b, home_session, moved, set_rev) VALUES ('alice', 'bob', 'session:first-alias-home', 0, 1)")
-  sql_write("INSERT INTO thread_homes (thread_a, thread_b, home_session, moved, set_rev) VALUES (?, ?, 'session:later-alias-home', 0, 2)", {alice_id, bob_id})
+  sql_write("INSERT INTO thread_homes (thread_a, thread_b, home_session, moved, set_rev) VALUES ('alice', 'bob', ?, 0, 1)", {first_home})
+  sql_write("INSERT INTO thread_homes (thread_a, thread_b, home_session, moved, set_rev) VALUES (?, ?, ?, 0, 2)", {alice_id, bob_id, later_home})
 end)
 
 test('migration moves mailboxes, groups, drafts, archives and homes to the identities', function()
@@ -64,7 +66,7 @@ test('migration moves mailboxes, groups, drafts, archives and homes to the ident
   expect(m.from).to_be(alice_id)
   expect(m.to).to_be(bob_id)
   expect(has_id(migrated.messages, 'canonical-before-migration')).to_be(true)
-  expect(home(alice_id, bob_id).home_session, 'the first alias home wins').to_be('session:first-alias-home')
+  expect(home(alice_id, bob_id).home_session, 'the first alias home wins').to_be(first_home)
   expect(home('alice', 'bob')).to_be(nil)
   expect(unread('bob') + unread('alice'), 'no delivery keeps a legacy name').to_be(0)
   local moved = message(retry_result.id)

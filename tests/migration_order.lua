@@ -42,15 +42,17 @@ local function migrated(name)
     if sql('SELECT 1 AS x FROM aliases_applied WHERE alias = ?', {name})[1] then return true end
   end)
 end
+-- Thread homes are real sessions: the hub places a tab in its home.
+local homes = {ab_first = session('ab first'), bc_first = session('bc first'), ab_later = session('ab later'), bc_later = session('bc later')}
 local moved_to
 
 test('the first migrations carry the legacy homes with their age', function()
-  put_home('alice', 'bob', 'session:ab-first')
-  put_home('bob', 'charlie', 'session:bc-first')
+  put_home('alice', 'bob', homes.ab_first)
+  put_home('bob', 'charlie', homes.bc_first)
   put_title('bob', 'alice', 'Legacy title')
   local ab_rev, bc_rev = home('alice', 'bob').set_rev, home('bob', 'charlie').set_rev
-  put_home(a_id, b_id, 'session:ab-later')
-  put_home(b_id, c_id, 'session:bc-later')
+  put_home(a_id, b_id, homes.ab_later)
+  put_home(b_id, c_id, homes.bc_later)
   put_title(a_id, b_id, 'Canonical A')
   -- Two-alias titles: an owner renames a peer before either identity exists.
   alice:call('messaging.thread_rename', {thread = 'bob', title = 'Alice legacy', key = 'alice-legacy'})
@@ -62,10 +64,10 @@ test('the first migrations carry the legacy homes with their age', function()
   charlie:report({kind = 'claude', conversation_id = 'conversation-c'})
   migrated('charlie')
   local ab = home(a_id, 'bob')
-  expect(ab.home_session).to_be('session:ab-first')
+  expect(ab.home_session).to_be(homes.ab_first)
   expect(ab.set_rev, 'a carried home keeps its first revision').to_be(ab_rev)
   local bc = home('bob', c_id)
-  expect(bc.home_session).to_be('session:bc-first')
+  expect(bc.home_session).to_be(homes.bc_first)
   expect(bc.set_rev).to_be(bc_rev)
   expect(title(a_id, 'bob').title, 'the owner migration carries the title').to_be('Alice legacy')
   expect(title(c_id, 'bob').title).to_be('Charlie legacy')
@@ -84,7 +86,7 @@ end)
 test('the last migration: the first inherited home wins; the explicit move stays', function()
   bob:report({kind = 'codex', conversation_id = 'conversation-b'})
   migrated('bob')
-  expect(home(a_id, b_id).home_session, 'no move: the first home wins over the later canonical home').to_be('session:ab-first')
+  expect(home(a_id, b_id).home_session, 'no move: the first home wins over the later canonical home').to_be(homes.ab_first)
   local bc = home(b_id, c_id)
   expect(bc.home_session, 'the explicit move wins over the inherited homes').to_be(moved_to)
   expect(bc.moved, 'the move stays marked for later merges').to_be(1)

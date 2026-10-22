@@ -122,12 +122,13 @@ end)
 -- Each handler is one SQL transaction, so two first homes cannot race. A home that exists before
 -- the creation stays.
 test('an existing home stays when the thread is created', function()
+  local winner = session('winner home')
   write_sql([[INSERT INTO thread_homes (thread_a, thread_b, home_session, moved, set_rev)
-    VALUES ('bob', 'user', 'session:winner', 0, (SELECT n FROM clock))]])
+    VALUES ('bob', 'user', ?, 0, (SELECT n FROM clock))]], {winner})
   local op = new_thread(nil, {member_bob = true}, 'home-race')
   expect(op.result).to_equal({navigate = 'thread/bob'})
-  expect(home_of('bob', 'user')).to_be('session:winner')
-  expect(home_tab('bob').session_id).to_be('session:winner')
+  expect(home_of('bob', 'user')).to_be(winner)
+  expect(home_tab('bob').session_id).to_be(winner)
 end)
 
 test('an agent creates in its pane session by default; explicit and new sessions; replays', function()
