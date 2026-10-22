@@ -1,0 +1,235 @@
+-- The one-time import from the key-value store (docs/sql-storage.md revision 4, "Migration").
+-- Each test writes key-value records as the key-value release wrote them, empties the SQL state
+-- (rows, the import meta, the fence), and restarts the hub: the plugin then starts with data in
+-- the key-value store and none in SQL, and imports it at start.
+
+local function part(s) return #s .. ':' .. s end
+local alice, bob, charlie = agent('alice'), agent('bob'), agent('charlie')
+local at = '2026-10-20T00:00:00Z'
+
+-- write_sql runs sql_write; while the plugin holds a transaction, it waits.
+local function write_sql(q, p)
+  local out = wait('a SQL fixture write', function()
+    local ok, r = pcall(sql_write, q, p)
+    if ok then return {r} end
+    local text = type(r) == 'table' and tostring(r.code) .. ': ' .. tostring(r.message) or tostring(r)
+    if not text:find('busy', 1, true) then return {nil, r} end -- another error: no retry
+  end)
+  if out[2] ~= nil then error(out[2], 0) end
+  return out[1]
+end
+
+local TABLES = {'deliveries', 'messages', 'group_members', 'groups', 'thread_homes', 'thread_titles', 'thread_opened',
+  'thread_archived', 'drafts', 'operations', 'aliases_applied', 'gallery', 'import_source', 'import_ops', 'import_body'}
+local function import_state() return (sql("SELECT value FROM meta WHERE key = 'import'")[1] or {}).value end
+
+-- reimport empties the SQL state and the fence, and restarts the hub: the plugin imports the
+-- key-value records at start. It returns when the import state is `want` (default done).
+local function reimport(want)
+  for _, t in ipairs(TABLES) do write_sql('DELETE FROM ' .. t) end
+  write_sql("DELETE FROM meta WHERE key LIKE 'import%'")
+  write({{key = 'sql-import', delete = true}})
+  hub:restart()
+  return wait('the import', function()
+    if import_state() == (want or 'done') then return true end
+    local e = sql("SELECT value FROM meta WHERE key = 'import_error'")[1]
+    if e and not want then error('the import failed: ' .. e.value, 0) end
+  end)
+end
+
+-- msg writes a message record as the key-value release did and returns its revision.
+local function msg(id, from, to, body, extra)
+  local v = {id = id, from = from, to = to, body = body, at = at}
+  for k, x in pairs(extra or {}) do v[k] = x end
+  write({{key = 'message/' .. id, value = v}})
+  return store('message/' .. id).rev
+end
+local function chain(a, b, ids)
+  if a ~= '' and b < a then local t = a; a = b; b = t end
+  write({{key = 'thread/' .. part(a) .. part(b), value = {ids = ids}}})
+end
+local function box(agent_id, ids)
+  local set = {}
+  for _, id in ipairs(ids) do set[id] = true end
+  write({{key = 'mailbox/' .. part(agent_id), value = {ids = set}}})
+end
+local function deliveries(id)
+  local out = {}
+  for _, r in ipairs(sql('SELECT d.agent, d.acked FROM deliveries d JOIN messages m ON m.seq = d.seq WHERE m.id = ? ORDER BY d.agent', {id})) do
+    out[#out + 1] = r.agent .. '=' .. r.acked
+  end
+  return out
+end
+
+local revs = {}
+test('a key-value store imports: messages, audiences, unread, threads, groups, viewer state, gallery, operations', function()
+  revs.d1 = msg('kv/d1', 'alice', 'bob', 'direct one')
+  revs.d2 = msg('kv/d2', 'bob', 'alice', 'direct two', {reply_to = 'kv/d1', reply_expected = false})
+  chain('alice', 'bob', {'kv/d1', 'kv/d2'})
+  write({{key = 'groups', value = {groups = {['g-kv'] = {name = 'KV group', members = {'alice', 'bob', 'user'}, past_members = {'charlie'}}}}}})
+  revs.g1 = msg('kv/g1', 'alice', 'g-kv', 'to the group', {recipients = {'bob', 'user', 'charlie'}})
+  -- No recipients: the delivery snapshot is the audience.
+  revs.g2 = msg('kv/g2', 'bob', 'g-kv', 'snapshot')
+  write({{key = 'delivery/' .. part('kv/g2'), value = {ids = {'alice', 'user'}}}})
+  -- No recipients and no snapshot: today's fallback, the current members without the sender.
+  revs.g3 = msg('kv/g3', 'alice', 'g-kv', 'fallback')
+  chain('', 'g-kv', {'kv/g1', 'kv/g2', 'kv/g3'})
+  box('bob', {'kv/d1', 'kv/g1'})
+  box('user', {'kv/g3'})
+  -- The home must be a real session: the hub attaches it to place the thread's tab.
+  local home = session('kv-home')
+  write({
+    {key = 'thread-meta/' .. part('alice') .. part('user'), value = {home_session = home, moved = true, set_rev = '3'}},
+    {key = 'thread-title/' .. part('user') .. part('g-kv'), value = {title = 'Imported title'}},
+    {key = 'thread-open/' .. part('user') .. part('alice'), value = {opened = true}},
+    {key = 'thread-archive/' .. part('user'), value = {ids = {['g-old'] = true}}},
+    {key = 'draft/' .. part('user') .. part('g-kv'), value = {text = 'a saved draft'}},
+    {key = 'gallery/state', value = {last = 'kv state'}},
+  })
+  put_operation({key = 'send/' .. part('alice') .. part('kv-key'), fingerprint = 'send-v2/' .. part('bob') .. part('direct one') .. part(''),
+    result = {id = 'kv/d1', key = 'kv-key'}})
+  local draft_rev = store('draft/' .. part('user') .. part('g-kv')).rev
+  reimport()
+
+  expect(deliveries('kv/d1')).to_equal({'bob=0'})
+  expect(deliveries('kv/d2')).to_equal({'alice=1'})
+  expect(deliveries('kv/g1')).to_equal({'bob=0', 'charlie=1', 'user=1'})
+  expect(deliveries('kv/g2')).to_equal({'alice=1', 'user=1'})
+  expect(deliveries('kv/g3')).to_equal({'bob=1', 'user=0'})
+  local d2 = sql('SELECT CAST(seq AS TEXT) AS seq, reply_to, reply_expected, thread_a, thread_b FROM messages WHERE id = ?', {'kv/d2'})[1]
+  expect(d2).to_equal({seq = revs.d2, reply_to = 'kv/d1', reply_expected = 0, thread_a = 'alice', thread_b = 'bob'})
+  -- The cursor of an imported message is its key-value revision.
+  local read = bob:call('messaging.read', {})
+  expect(#read.messages).to_be(2)
+  expect(read.messages[1].cursor).to_be(revs.d1)
+  expect(sql("SELECT gid, agent, pos, current FROM group_members ORDER BY pos")).to_equal({
+    {gid = 'g-kv', agent = 'alice', pos = 1, current = 1}, {gid = 'g-kv', agent = 'bob', pos = 2, current = 1},
+    {gid = 'g-kv', agent = 'user', pos = 3, current = 1}, {gid = 'g-kv', agent = 'charlie', pos = 4, current = 0}})
+  expect(sql('SELECT home_session, moved, CAST(set_rev AS TEXT) AS set_rev FROM thread_homes')).to_equal({{home_session = home, moved = 1, set_rev = '3'}})
+  expect(sql('SELECT title FROM thread_titles')).to_equal({{title = 'Imported title'}})
+  expect(sql('SELECT viewer, peer FROM thread_opened')).to_equal({{viewer = 'user', peer = 'alice'}})
+  expect(sql('SELECT viewer, peer FROM thread_archived')).to_equal({{viewer = 'user', peer = 'g-old'}})
+  expect(sql('SELECT text, CAST(rev AS TEXT) AS rev FROM drafts')).to_equal({{text = 'a saved draft', rev = draft_rev}})
+  -- A draft_revision from before the cutover still matches.
+  local v = user:open('thread/g-kv')
+  v:render()
+  expect(v:draft('composer', 'edited', draft_rev, 'kv-draft-edit').status).to_be('succeeded')
+  -- A saved operation from before the cutover replays.
+  expect(alice:call('messaging.send', {to = 'bob', body = 'direct one', key = 'kv-key'})).to_equal({id = 'kv/d1', key = 'kv-key'})
+  -- The clock continues above every key-value revision.
+  local sent = alice:call('messaging.send', {to = 'bob', body = 'after the cutover', key = 'after-cutover'})
+  local seq = sql('SELECT CAST(seq AS TEXT) AS seq FROM messages WHERE id = ?', {sent.id})[1].seq
+  expect(#seq > #store('sql-import').rev or seq > store('sql-import').rev, 'a new seq is above f1').to_be(true)
+  expect(notice('bob').pending).to_be(true)
+end)
+
+test('a body larger than one request is imported in parts', function()
+  local body = string.rep('<', 9000) .. string.rep('x', 5000) -- 59000 encoded bytes
+  msg('kv/large', 'alice', 'charlie', body, {recipients = {'charlie'}})
+  chain('alice', 'charlie', {'kv/large'})
+  reimport()
+  local r = sql('SELECT length(body) AS n, body = ? AS same FROM messages WHERE id = ?', {body, 'kv/large'})[1]
+  expect(r).to_equal({n = #body, same = 1})
+  expect(#sql('SELECT key FROM import_body')).to_be(0)
+end)
+
+-- craft writes an import in progress, as a crash leaves it: the fence and the meta rows, no rows.
+local function craft(meta_rows)
+  for _, t in ipairs(TABLES) do write_sql('DELETE FROM ' .. t) end
+  write_sql("DELETE FROM meta WHERE key LIKE 'import%'")
+  for k, v in pairs(meta_rows) do write_sql('INSERT INTO meta (key, value) VALUES (?, ?)', {k, v}) end
+end
+local function meta(key) return (sql('SELECT value FROM meta WHERE key = ?', {key})[1] or {}).value end
+local function wait_done()
+  return wait('the import', function()
+    if import_state() == 'done' then return true end
+    local e = sql("SELECT value FROM meta WHERE key = 'import_error'")[1]
+    if e then error('the import failed: ' .. e.value, 0) end
+  end)
+end
+
+test('a resumed import keeps the roster of its start for the team fallback', function()
+  msg('kv/t1', 'alice', 'team', 'to the team')
+  chain('', 'team', {'kv/t1'})
+  write({{key = 'sql-import', value = {state = 'importing'}}})
+  -- charlie, bob and the user are on the roster now; the import started when only alice and bob were.
+  craft({import = 'importing', import_f0 = store('sql-import').rev, import_aliases = '{}', import_roster = '["alice","bob"]',
+    import_progress = '{"phase":"families","family":1}'})
+  hub:restart()
+  wait_done()
+  expect(deliveries('kv/t1')).to_equal({'bob=1'})
+end)
+
+test('a saved operation added after the verification resets the import', function()
+  reimport()
+  local f0 = meta('import_f0')
+  put_operation({key = 'send/' .. part('bob') .. part('ops-late'), fingerprint = 'send-v2/' .. part('alice') .. part('late') .. part(''),
+    result = {id = 'kv/late', key = 'ops-late'}})
+  -- A crash after verified: an old release ran and saved one more operation, and no record changed.
+  write_sql("UPDATE meta SET value = 'verified' WHERE key = 'import'")
+  write({{key = 'sql-import', value = {state = 'importing'}}})
+  hub:restart()
+  wait_done()
+  expect(meta('import_f0') ~= f0, 'the import began again').to_be(true)
+  expect(#sql('SELECT key FROM operations WHERE key = ?', {'send/' .. part('bob') .. part('ops-late')})).to_be(1)
+end)
+
+test('a mailbox entry without a delivery stops the import, and every call is refused', function()
+  box('charlie', {'kv/d1'}) -- kv/d1 went to bob only
+  for _, t in ipairs(TABLES) do write_sql('DELETE FROM ' .. t) end
+  write_sql("DELETE FROM meta WHERE key LIKE 'import%'")
+  write({{key = 'sql-import', delete = true}})
+  hub:restart()
+  local e = wait('the import error', function() return sql("SELECT value FROM meta WHERE key = 'import_error'")[1] end)
+  expect(e.value:find('migration_conflict', 1, true) ~= nil, e.value).to_be(true)
+  expect_error(function() bob:call('messaging.read', {}) end, 'importing')
+  write({{key = 'mailbox/' .. part('charlie'), delete = true}})
+  reimport()
+end)
+
+local charlie_id = 'claude:conversation-charlie'
+test('an alias in the hub maps every imported name to its identity; old operations and notices follow', function()
+  charlie:report({kind = 'claude', conversation_id = 'conversation-charlie'})
+  -- The key-value release moved mailboxes and threads to the identity; messages keep the old name.
+  msg('kv/c1', 'charlie', 'bob', 'from charlie')
+  msg('kv/c2', 'bob', 'charlie', 'to charlie')
+  msg('kv/c3', 'bob', 'charlie', 'to the old name')
+  chain(charlie_id, 'bob', {'kv/c1', 'kv/c2', 'kv/c3'})
+  -- Two mailboxes meet under M: their unread sets merge.
+  box(charlie_id, {'kv/c2'})
+  box('charlie', {'kv/c3'})
+  put_operation({key = 'send/' .. part('charlie') .. part('charlie-key'), fingerprint = 'send-v2/' .. part('bob') .. part('from charlie') .. part(''),
+    result = {id = 'kv/c1', key = 'charlie-key'}})
+  -- A notice from before the import: the import replaces SQL, and alice has no unread mail in it.
+  bob:call('messaging.send', {to = 'alice', body = 'only in SQL', key = 'live-to-alice'})
+  expect(notice('alice').pending).to_be(true)
+  reimport()
+  local m = sql('SELECT sender, recipient FROM messages WHERE id = ?', {'kv/c1'})[1]
+  expect(m).to_equal({sender = charlie_id, recipient = 'bob'})
+  expect(deliveries('kv/c2')).to_equal({charlie_id .. '=0'})
+  expect(deliveries('kv/c3')).to_equal({charlie_id .. '=0'})
+  expect(sql("SELECT identity FROM aliases_applied WHERE alias = 'charlie'")).to_equal({{identity = charlie_id}})
+  -- A retry under the identity finds the operation saved under the alias.
+  expect(charlie:call('messaging.send', {to = 'bob', body = 'from charlie', key = 'charlie-key'})).to_equal({id = 'kv/c1', key = 'charlie-key'})
+  expect(notice('charlie').pending == true, 'no pending notice under the alias').to_be(false)
+  expect(notice(charlie_id).pending).to_be(true)
+  expect(notice('alice').pending, 'the cutover clears an agent with all mail acknowledged').to_be(false)
+end)
+
+test('an alias that appears after the verification merges at the cutover', function()
+  local alice_id = 'claude:conversation-alice'
+  msg('kv/a1', 'alice', 'bob', 'from alice')
+  chain('alice', 'bob', {'kv/d1', 'kv/d2', 'kv/a1'})
+  reimport()
+  alice:report({kind = 'claude', conversation_id = 'conversation-alice'})
+  wait('the merge of alice', function() return sql("SELECT 1 AS x FROM aliases_applied WHERE alias = 'alice'")[1] end)
+  -- Back to the state of a crash after verified, before the alias: alice's rows under the old name.
+  write_sql("UPDATE messages SET sender = 'alice', thread_a = 'alice', thread_b = 'bob' WHERE id = 'kv/a1'")
+  write_sql("DELETE FROM aliases_applied WHERE alias = 'alice'")
+  write_sql("UPDATE meta SET value = 'verified' WHERE key = 'import'")
+  write({{key = 'sql-import', value = {state = 'importing'}}})
+  hub:restart()
+  wait_done()
+  expect(sql('SELECT sender, thread_a, thread_b FROM messages WHERE id = ?', {'kv/a1'})[1]).to_equal({sender = alice_id, thread_a = 'bob', thread_b = alice_id})
+  expect(sql("SELECT identity FROM aliases_applied WHERE alias = 'alice'")).to_equal({{identity = alice_id}})
+end)

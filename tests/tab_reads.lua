@@ -23,6 +23,8 @@ if missing then
 end
 
 local alice = agent('alice')
+-- The plugin imports at start (import.lua), in its own transactions: a direct SQL write waits for it.
+wait('the import at start', function() return (sql("SELECT value FROM meta WHERE key = 'import'")[1] or {}).value == 'done' end)
 
 -- statements counts the plugin's hub.sql.query and hub.sql.exec calls during fn, up to its tab
 -- declaration (hub.ui.tabs). The declaration reads before it calls hub.ui.tabs; the hub then

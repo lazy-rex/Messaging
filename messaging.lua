@@ -130,6 +130,11 @@ db.migrate {function()
     'CREATE TABLE operations (key TEXT PRIMARY KEY, owner TEXT NOT NULL, fingerprint TEXT NOT NULL, result TEXT NOT NULL)',
     'CREATE TABLE aliases_applied (alias TEXT PRIMARY KEY, identity TEXT NOT NULL)',
     'CREATE TABLE gallery (key TEXT PRIMARY KEY, value TEXT NOT NULL, rev INTEGER NOT NULL)',
+    -- The import from the key-value store (import.lua): the source records with their revisions,
+    -- the saved operations, and large bodies in parts.
+    'CREATE TABLE import_source (key TEXT PRIMARY KEY, rev TEXT NOT NULL, complete INTEGER NOT NULL)',
+    'CREATE TABLE import_ops (key TEXT PRIMARY KEY)',
+    'CREATE TABLE import_body (key TEXT PRIMARY KEY, body BLOB NOT NULL)',
   }) do db.exec(sql) end
 end}
 
@@ -1896,6 +1901,8 @@ local actions = {
 -- the committed call: it is logged, and the next change declares the tabs again.
 local ui_user = 'user'
 local plain = {store = false, tx = false}
+-- imported is true once SQL holds Messaging's data (import.lua). Before, every call is refused.
+local imported = {done = false, error = nil}
 
 -- The refresh applies new aliases and declares the tabs, in a timer after the call that asks for
 -- it: an agents change (hub.changed) or a render that sees an alias not yet applied. The schedule
@@ -1907,6 +1914,7 @@ local function schedule_refresh()
   refresh_schedule.pending = true
   app.after(refresh_delay, function()
     refresh_schedule.pending = false
+    if not imported.done then return end
     refresh_participants()
     migrate_aliases()
     declare_tabs(ui_user)
@@ -1945,6 +1953,9 @@ end
 
 local function handler(fn, declares, render)
   return function(ctx, args)
+    if not imported.done then
+      fail('unavailable', 'Messaging is importing its data' .. (imported.error and (': ' .. imported.error) or ''))
+    end
     if render then
       refresh_participants()
       render_aliases()
@@ -2031,7 +2042,37 @@ for _, command in ipairs({{id = 'new_thread', title = 'New Thread…', descripti
     {id = 'threads', title = 'Threads…', description = 'List all threads, with this session first', keywords = {'message', 'conversation'}, surface = 'panel', landing = true, route = '/panels/threads', user_only = 'navigation'}}) do app.command(command) end
 
 -- Spike 3 has one UI user. Each conversation has one tab.
+-- The import runs first, at start (each step its own transaction); calls wait in the plugin's queue
+-- until it ends. A failed import leaves every call refused with its error, and meta import_error
+-- holds the error; the plugin keeps running, and the next start resumes.
+local import = require('import')({
+  db = db, hub = hub, fail = fail, part = part, parts = parts, json = json, rows = rows,
+  encoded_size = encoded_size, utf8_cut = utf8_cut, later = later, thread_pair = thread_pair,
+  c = function(id) return canonical(id) end, c_thread = function(id) return canonical_thread_id(id) end,
+  use_aliases = function(map) aliases = map end,
+  refresh_participants = refresh_participants, participants = function() return participants end,
+  notice = app.notice,
+  -- The cutover gives the notices of the whole roster itself: the merges give none.
+  migrate_aliases = function()
+    local inside = notes.inside
+    notes.inside = true
+    migrate_aliases()
+    notes.inside, notes.marked, notes.list = inside, {}, {}
+  end,
+})
 app.start(function()
+  local ok, err = pcall(import.run)
+  if not ok then
+    imported.error = type(err) == 'table' and tostring(err.code) .. ': ' .. tostring(err.message) or tostring(err)
+    print('messaging: the import failed: ' .. imported.error)
+    pcall(db.transaction, function()
+      db.exec([[INSERT INTO meta (key, value) VALUES ('import_error', ?)
+        ON CONFLICT (key) DO UPDATE SET value = excluded.value]], imported.error)
+    end)
+    return
+  end
+  pcall(db.transaction, function() db.exec("DELETE FROM meta WHERE key = 'import_error'") end)
+  imported.done = true
   refresh_participants()
   migrate_aliases()
   declare_tabs(ui_user)

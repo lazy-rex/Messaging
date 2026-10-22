@@ -36,6 +36,29 @@ Each action and each view action is one SQL transaction (`app.db`). The schema i
 A send writes one message row and one delivery row for each recipient. No request depends on the
 size of a mailbox, a thread or a group. The hub admits one notice for each agent in a commit.
 
+## Import from the key-value release
+
+The first start on a hub with key-value records imports them into SQL (`import.lua`; the design is
+`docs/sql-storage.md` on the `sql-storage` branch). Until the import is done, every call fails with
+`unavailable`. A failed import keeps its error in the meta row `import_error` and in that
+`unavailable` message. The plugin keeps running, and the next start continues.
+
+- The fence record `sql-import` and the meta rows `import*` hold the state: `importing`, `verified`,
+  `done`. Each step is one transaction, so a crash continues where it stopped.
+- The import maps every name through the hub's aliases at its start, and keeps the roster of its
+  start. A source record or a saved operation that changes during the import starts it again.
+  After three changes in a row, the start fails.
+- Each message keeps its key-value revision as `seq`, so old cursors stay valid. The clock
+  continues above the fence. Saved operations replay with their old keys.
+- A legacy `team` message without recipients and without a delivery snapshot goes to the roster at
+  the import, without the sender. The key-value release used the roster at each read, so this
+  audience differs only when the roster changed after the import.
+- A mailbox entry without a delivery to its agent stops the import with `migration_conflict` and
+  the key. Nothing is truncated or dropped.
+- The cutover gives each agent a notice from SQL. A key-value release does not run after it: it
+  cannot see new messages, and its notices are refused. **Rollback after the cutover is not
+  supported.** Take a backup of hub.db and the SQL files before the release.
+
 ## Size limits
 
 What a Lua plugin sends is at most 64 KiB in one control message (LazyRex docs/rex-protocol.md,
