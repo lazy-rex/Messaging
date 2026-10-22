@@ -507,12 +507,15 @@ return function(env)
   end
 
   -- threads_task: each key-value chain maps through M to one SQL thread, ascends in seq, and the
-  -- union of the chains of a thread equals its SQL messages.
+  -- union of the chains of a thread equals its SQL messages from the first chained message on.
+  -- The first messages of the key-value store predate its thread index: no chain names them. A
+  -- message in no chain is imported only if it is older than every chained message (the global
+  -- prefix). With no chain at all, no message is older: every message must be in a chain.
   local function threads_task()
     -- cur: the chain in progress {key, a, b, v, seg (next segment), blocks (of one segment), block
     -- (next), tail (the record's own IDs are in blocks), last}.
     -- union: part(a) .. part(b) -> {n = distinct IDs, ids = set}. groups_after: the SQL page cursor.
-    local t = {after = nil, cur = nil, scanned = false, union = {}, groups_after = nil}
+    local t = {after = nil, cur = nil, scanned = false, union = {}, groups_after = nil, first = nil}
     -- One unit for each call: a chain record, one segment, one lookup batch, or one SQL page.
     function t.step()
       if not t.scanned and not t.cur then
@@ -557,6 +560,7 @@ return function(env)
             if m.thread_a ~= cur.a or m.thread_b ~= cur.b then conflict('A message is in another thread', cur.key .. ' ' .. id) end
             if cur.last and not later(m.seq, cur.last) then conflict('A thread is not in message order', cur.key) end
             cur.last = m.seq
+            if not t.first or later(t.first, m.seq) then t.first = m.seq end
             if not u.ids[id] then u.ids[id] = true; u.n = u.n + 1 end
           end
           cur.block = cur.block + 1
@@ -568,11 +572,12 @@ return function(env)
       -- Each chain ID is a message of its thread (above). So a thread whose distinct chain IDs are
       -- as many as its SQL messages has exactly those messages. Two chains that meet under M can
       -- share IDs: a sum of their lengths would hide a missing message. One page of threads for
-      -- each call.
+      -- each call. Only the messages from the first chained message on are counted: a message of
+      -- the prefix is in no chain.
       local g = t.groups_after or {a = '', b = ''}
       local page = env.rows([[SELECT thread_a, thread_b, count(*) AS n FROM messages
-        WHERE thread_a > ? OR (thread_a = ? AND thread_b > ?)
-        GROUP BY thread_a, thread_b ORDER BY thread_a, thread_b LIMIT 200]], g.a, g.a, g.b)
+        WHERE (thread_a > ? OR (thread_a = ? AND thread_b > ?)) AND seq >= CAST(? AS INTEGER)
+        GROUP BY thread_a, thread_b ORDER BY thread_a, thread_b LIMIT 200]], g.a, g.a, g.b, t.first or '0')
       for _, row in ipairs(page) do
         local k = part(row.thread_a) .. part(row.thread_b)
         if (t.union[k] and t.union[k].n or 0) ~= row.n then conflict('A thread has another set of messages', k) end
