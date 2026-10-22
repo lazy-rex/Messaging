@@ -1,7 +1,8 @@
 # Messaging storage on the Plugin SDK and hub.sql (proposed)
 
-Status: proposal, revision 3, 2026-10-22. Not implemented. It targets the Plugin SDK and hub.sql
-**draft 2** (LazyRex `docs/plugin-sdk.md` and `docs/sql.md`, commit 6ea4180), which the
+Status: proposal, revision 4, 2026-10-22 (revision 4 changes the migration, the operation lookup,
+the import tables and the import tests). Implemented on branch sdk-sql up to the import (fresh
+database only). It targets the Plugin SDK and hub.sql **draft 2** (LazyRex `docs/plugin-sdk.md` and `docs/sql.md`, commit 6ea4180), which the
 coordinator made the spec (2026-10-22: code first). Where this plan needs an SDK feature that
 draft 2 does not have, it says "needs G<n>" (see "Gaps in draft 2"). F2 (docs/f2-unread.md) is
 cancelled; this plan replaces it.
@@ -158,15 +159,18 @@ CREATE TABLE drafts (viewer TEXT NOT NULL, peer_kind TEXT NOT NULL, peer_a TEXT 
 CREATE TABLE operations (key TEXT PRIMARY KEY, owner TEXT NOT NULL, fingerprint TEXT NOT NULL,
   result TEXT NOT NULL);
 
--- Identity aliases that this database has applied (today: identity-migrated/<alias>).
+-- Identity aliases that this database has applied: every alias of M after the import, then the
+-- SQL alias merges (identity-migrated/ is provenance only, see "Migration").
 CREATE TABLE aliases_applied (alias TEXT PRIMARY KEY, identity TEXT NOT NULL);
 
 -- Gallery state (gallery/state, gallery/history, gallery/draft), as JSON values with a revision.
 CREATE TABLE gallery (key TEXT PRIMARY KEY, value TEXT NOT NULL, rev INTEGER NOT NULL);
 
 -- Import only (see "Migration"): the key and revision of each source record that the import
--- applied, and bodies that arrive in chunks. Dropped by a later cleanup migration.
+-- applied, the keys of the imported saved operations, and bodies that arrive in chunks. Dropped by
+-- a later cleanup migration.
 CREATE TABLE import_source (key TEXT PRIMARY KEY, rev TEXT NOT NULL, complete INTEGER NOT NULL);
+CREATE TABLE import_ops (key TEXT PRIMARY KEY);
 CREATE TABLE import_body (key TEXT PRIMARY KEY, body BLOB NOT NULL);
 ```
 
@@ -201,7 +205,8 @@ queried in the same transaction after the writes. An action that changes nothing
 Keys and fingerprints stay exactly as today (`send/`, `thread-create/`, `members/`,
 `thread-archive/`, `rename/`, `thread-move/`, `draft/`, `gallery-*`), and so does
 `normalized_fingerprint`. A handler first looks the key up (`operations` for the identity and its
-aliases; then the read-only key-value fallback, see "Old operation keys"). A hit replays the saved
+aliases; the import brings the saved operations from before the cutover, see "Saved
+operations"). A hit replays the saved
 result, or fails with today's conflict code on another fingerprint. A miss runs the action and
 inserts the `operations` row in the same transaction. So a lost reply after the commit replays, and
 a retry never sends twice and never sets an acked delivery to unread.
@@ -311,17 +316,55 @@ A transaction fails as a whole; the next action runs it again.
 
 ## Migration from the key-value store (one time)
 
+Revision 4 (2026-10-22) changes this section after the reviewer's design review of the
+implementation proposal:
+
+- The import does not run the key-value `migrate_aliases`. It normalizes every name itself, with
+  one recorded alias mapping M (below). An `identity-migrated/` record is provenance only: the
+  key-value migration rewrote mailboxes, thread chains, viewer families and current group members,
+  but not `message/` from and to, `message.recipients` or `delivery/` snapshots (reads
+  canonicalized them). So no key-value record is proof that its values are canonical.
+- The saved operations are imported with `hub.store.ops_scan` (hub.sql, `docs/sql.md`), with their
+  own verification. The permanent read-only `hub.store.op` fallback goes away.
+- The cutover commits the SQL alias merges, `done` and the notices together, and its notices are
+  never empty.
+
+### The alias mapping M
+
+- M is the hub's alias set when the import starts (or resets): `{alias = identity}` from
+  `refresh_participants`. The start that writes the fence also writes M into SQL `meta`
+  (`import_aliases`), in the transaction that sets `{state = importing, f0}`. A resumed import
+  reads M from `meta`, never from the hub.
+- `c(x)` is `M[x] or x`. `c_thread(p)` maps an observed peer `d-<hex>` through `c` on both of its
+  agents (today's `canonical_thread_id`).
+- Every name that the import writes goes through `c` or `c_thread`: message sender and recipient,
+  the thread columns (computed from `c(from)`, `c(to)`), every delivery agent, every mailbox owner,
+  group members and past members, every viewer and peer of the viewer families, both sides of a
+  home. Two source records that meet under one canonical key merge with the winner rules of the
+  SQL alias merge ("Identity aliases"), as `INSERT ... ON CONFLICT DO UPDATE`, so the result does
+  not depend on the import order:
+  - deliveries: one row for each (agent, message); unread wins (`acked = min`);
+  - group members: the first position; `current = max`;
+  - titles: the newest `set_rev`;
+  - drafts: a non-empty draft wins over an empty one, then the newest revision; two non-empty
+    drafts with different text stop the import with `migration_conflict` and both keys;
+  - homes: the newest move (`moved`), else the oldest `set_rev`;
+  - opened and archived: the union.
+- After the import, `aliases_applied` has a row for every alias in M (the import applied them).
+  An alias that the hub adds after M has no row: the SQL alias merge applies it, in the cutover
+  transaction or later.
+
 ### States at start
 
 The plugin reads the SQL state **first**. If SQL says `done`, it does not read the key-value state
-at all (only the read-only operation fallback stays). Else the state comes from the SQL `meta` row
-`import` and the key-value fence record `sql-import`:
+at all. Else the state comes from the SQL `meta` row `import` and the key-value fence record
+`sql-import`:
 
 | State | SQL `import` | Fence | What the plugin does at start |
 | --- | --- | --- | --- |
-| fresh | absent | absent | `refresh_participants`; today's key-value `migrate_aliases` (unchanged code), so the source is canonical; write the fence (`if_rev = 0`), f0 = its revision; one transaction: `{state = importing, f0, aliases = A0}`; import. |
-| orphan fence | absent | `importing` | A crash after the fence write and before the SQL row. Like fresh, but the fence write is a rewrite with `if_rev` = its current revision; its new revision is f0, and A0 is the alias set read now. Today's `migrate_aliases` may run first (no SQL row exists yet, so nothing depends on an older source). |
-| importing | `importing` | `importing` | Source check (below). Unchanged: continue from the progress. Changed: reset. No key-value `migrate_aliases` (it would change the source). |
+| fresh | absent | absent | Write the fence (`if_rev = 0`), f0 = its revision; one transaction: `{state = importing, f0, M}`; import. |
+| orphan fence | absent | `importing` | A crash after the fence write and before the SQL row. Like fresh, but the fence write is a rewrite with `if_rev` = its current revision; its new revision is f0. |
+| importing | `importing` | `importing` | Source check (below). Unchanged: continue from the progress. Changed: reset. |
 | verified | `verified` | `importing` | Source check again; then the cutover. |
 | fence written | `verified` | `cutover` | A crash between the two cutover commits. f1 = the fence record's own revision (read it). Source check against f1; then the SQL cutover transaction. |
 | done | `done` | any | SQL only. A stale key-value record or alias state cannot block a start. |
@@ -329,17 +372,15 @@ at all (only the read-only operation fallback stays). Else the state comes from 
 Any other combination (for example SQL `importing` with no fence) stops the start with
 `migration_conflict`: it means that someone changed one store by hand.
 
-- A0 is the alias set at the fence. The import canonicalizes with A0 only. An alias that appears
-  during the import is not applied to the source: its records import under the old name, and the
-  SQL alias merge applies it after `done` (it has no `aliases_applied` row).
-- A key that is not canonical under A0, or two source records with one canonical key, stops the
-  import with `migration_conflict` and the keys.
+- Before `done`, every action and view action fails with `unavailable` ("Messaging is importing
+  its data"), and the plugin declares no tabs. The import runs in steps (`app.after`), so the
+  plugin answers calls between steps.
 - Reset (the source changed): first the plugin rewrites the fence with `if_rev` = its current
   revision (never `if_rev = 0` against an existing record); its new revision is the new f0. Then one
-  transaction deletes every imported row and sets `{state = importing, f0 = new f0, progress =
-  start}`. A crash between the two leaves SQL with the old f0 and the old rows; the next start finds
-  the same change and resets again. The fence is not a source record, so its rewrite alone never
-  counts as a change.
+  transaction deletes every imported row, writes the new M, and sets `{state = importing, f0 = new
+  f0, progress = start}`. A crash between the two leaves SQL with the old f0 and the old rows; the
+  next start finds the same change and resets again. The fence is not a source record, so its
+  rewrite alone never counts as a change.
 
 ### The source fence
 
@@ -349,62 +390,88 @@ The key-value store gives each written record a revision from one global counter
 - **Fence**: the key-value record `sql-import`. Every key-value write after the fence has a revision
   above f0.
 - Messaging code from this release onward never writes the messaging key-value families: before
-  `done` it does not serve actions (the import runs first), and after `done` it uses SQL only. An
-  older release does not know the fence; a rollback to it during the import is what the source
-  check detects.
+  `done` it does not serve actions, and after `done` it uses SQL only. An older release does not
+  know the fence; a rollback to it during the import is what the source check detects.
 - **Source records**: each imported key-value record adds `import_source (key, rev, complete)` in
   the same transaction as its rows.
 - **Resume**: before it continues, the import checks that the source did not change: every
   `import_source` row still has its revision, and no family record has a revision above f0. A change
   (an old release wrote, or a record was deleted) is a reset. A deleted record that the import has
-  not reached yet is found by the verification. Every insert is a plain insert, so a duplicate is an
-  error, never a silent "equal".
-- **Verification** (before the cutover) is a full scan of the families: the set of keys and
-  revisions equals `import_source`, and every revision is at or below f0. Then the content checks
-  below.
+  not reached yet is found by the verification. Every insert of a source row is a plain insert, so
+  a duplicate is an error, never a silent "equal".
+- Saved operations have no revision (a saved reply does not advance `nextRev`). They have their own
+  rules ("Saved operations").
 
 ### Import steps
 
-The import runs in `{tx = false}` code (G1, G4). Each step is one transaction: its rows, its
-`import_source` rows, and the progress `{family, after}` in `meta`. A crash continues from the
-progress, after the resume check.
+Each step is one transaction: its rows, its `import_source` rows, and the progress `{family,
+after}` in `meta`. A crash continues from the progress, after the resume check.
 
-- `message/` -> `messages`, `seq` = the record revision, sender and recipient canonical, the thread
-  columns from today's `thread_key(from, to)`.
-  - **Large records**: a record that is larger than one request is imported in chunks: the body goes
-    into `import_body` in parts (UTF-8-safe cuts, one part per transaction); each step checks the
-    stored length first (`length(body) = ?`, `expect_rows = 1`) and moves the progress to `{key,
+- `message/` -> `messages`, `seq` = the record revision, sender and recipient through `c`, the
+  thread columns from `c(from)` and `c(to)`.
+  - **Large records**: a record whose SQL insert does not fit one request is imported in chunks: the
+    body goes into `import_body` in parts (UTF-8-safe cuts by encoded size, one part per
+    transaction); each step checks the stored length first and moves the progress to `{key,
     offset}`; the last step moves the row into `messages` and sets `complete = 1`. A resumed import
-    continues at `offset`. A record that the hub cannot return at all (`record_too_large` today)
-    stops the import with `migration_conflict` and the key; the source stays as it is, and nothing
-    is truncated or dropped.
-- The audience -> `deliveries` (`acked = 1` at first): the message's `recipients`, else
-  `delivery/<id>`, else today's fallback (the current members of the group, or the roster for
-  `team`, without the sender). The fallback is evaluated once, at the import; today it is evaluated
-  at each read, and a membership change snapshots it first. So it differs only for a legacy `team`
-  message whose roster changes after the import. README states it.
-- `mailbox/<agent>` -> `acked = 0` for each ID. An ID without a message or without a delivery row
-  for the agent stops the import with `migration_conflict` (today it is `internal` at read time).
+    continues at `offset`. A record that the hub cannot return at all (`record_too_large`) stops the
+    import with `migration_conflict` and the key; the source stays as it is, and nothing is
+    truncated or dropped.
+- The audience -> `deliveries` (`acked = 1` at first), each agent through `c`, without duplicates:
+  the message's `recipients`, else `delivery/<id>`, else today's fallback (the current members of
+  the group, or the roster for `team`, without the sender). The fallback is evaluated once, at the
+  import; today it is evaluated at each read, and a membership change snapshots it first. So it
+  differs only for a legacy `team` message whose roster changes after the import. README states it.
+- `mailbox/<agent>` -> `acked = 0` on the delivery of `(c(agent), id)`. An ID without a message, or
+  without a delivery for `c(agent)`, stops the import with `migration_conflict` (today it is
+  `internal` at read time). Two mailboxes that meet under `c` (an alias that the key-value store did
+  not migrate) give the union.
 - `groups` -> `groups`, `group_members` (members in order, then `past_members` not in members,
-  `current = 0`).
+  `current = 0`), every member through `c`.
 - `thread-meta/` -> `thread_homes`; `thread-title/`, `thread-open/`, `thread-archive/` (one row per
-  ID), `draft/` -> their tables. `set_rev` = the stored `set_rev`, else the record revision. A draft
-  record with empty text is a row with empty text and its revision; a missing draft is no row (rev
-  `0`), as today.
-- `identity-migrated/` -> `aliases_applied`. `gallery/*` -> `gallery`.
+  ID), `draft/` -> their tables, keys through `c` and `c_thread`, with the winner rules above.
+  `set_rev` = the stored `set_rev`, else the record revision. A draft record with empty text is a
+  row with empty text and its revision; a missing draft is no row (rev `0`), as today.
+- `gallery/*` -> `gallery`.
+- `identity-migrated/`: provenance only; imported as source records (for the source check), not as
+  `aliases_applied`. `aliases_applied` comes from M.
 - `thread/`, `thread-seg/`: not imported (derived); used in the verification.
 - `thread-page/`: not imported. No code reads it today (only the alias migration lists it).
 
+### Saved operations
+
+- `hub.store.ops_scan` lists the plugin's saved operations in key order, `{key, fingerprint,
+  result}`, a page at a time. Each page is one transaction: one `operations` row for each entry (the
+  exact key, fingerprint and result), an `import_ops` row `(key)`, and the progress (the page's
+  `next`).
+- The key, fingerprint and result are kept exactly. `owner` is auxiliary (a lookup is by exact key):
+  the agent part of the key for the families that have one (`send/`, `thread-create/`,
+  `thread-move/`, `rename/`, `thread-archive/`, `draft/`, `members/`, `create-restore/`), and `''`
+  for `gallery-send/`, `gallery-draft/`, `identity-migrate/` and any other family. A lookup for an
+  identity also tries the keys of its aliases (today's `prior_operation`), so a retry from before the
+  cutover under an alias name replays.
+- A saved result whose row does not fit one SQL request stops the import with `migration_conflict`
+  and the key (non-destructive: nothing is cut).
+- The source check of operations is part of the verification: a full `ops_scan` again; the key set
+  must equal `import_ops`, and each fingerprint and result must equal the stored row (results are
+  compared as decoded values). A difference is a reset. An operation added by an old release during
+  the import, also one whose key sorts before the saved cursor, is found here.
+
 ### Verification (before the cutover)
 
-After the source check:
+After the source check, in this order:
 
-- each thread chain (tail and segments, in order) equals `SELECT id ... WHERE thread = ... ORDER BY
-  seq`;
-- for each message, the delivery rows equal its audience (recipients, delivery snapshot, or
-  fallback);
-- for each agent, the unread deliveries equal its mailbox, and every other delivery is acked. So a
-  message that was acked stays acked.
+1. Families: a full scan; the set of keys and revisions equals `import_source`, and every revision
+   is at or below f0.
+2. Saved operations: as above.
+3. Threads: the key-value chains are kept under the names that were current when each message was
+   appended. For each chain (tail and segments, in order), its thread maps through `c` to one SQL
+   thread. Each chain's IDs must be in increasing `seq` order. The union of the chains of one SQL
+   thread must equal the IDs of that thread in SQL, as a set (two chains meet under `c` for an alias
+   that the key-value store did not migrate).
+4. Deliveries: for each message, the delivery agents equal `c` of its audience (recipients,
+   delivery snapshot, or fallback), without duplicates.
+5. Unread: for each canonical agent, the unread deliveries equal the union of the mailboxes that map
+   to it through `c`, and every other delivery is acked. So a message that was acked stays acked.
 
 A mismatch stops the start with `migration_conflict` and the key; nothing is cut over. Success sets
 SQL `import = verified`.
@@ -418,17 +485,19 @@ Two commits in two stores, in this order. A crash between them is the state "fen
    (read `next_cursor` = a mailbox or message revision, history `before`/`next_before` = message
    revisions, `draft_revision`, `set_rev`) is a key-value revision that the global counter gave out
    before f1. So every one is below f1.
-2. **SQL**, one transaction (G1): `clock.n = f1`; `import = done`; a notice for every agent with an
-   unread delivery (queried). This is Messaging's first SQL commit with notices, so the hub moves
-   Messaging's notices to SQL here (`notices_moved`, draft 2 section 7).
+2. **SQL**, one transaction: the SQL alias merge for every alias that the hub has now and
+   `aliases_applied` does not; `clock.n = f1`; `import = done`; and the notices. An alias conflict
+   (two drafts) rolls the whole transaction back: the state stays `verified`, and the next start
+   tries again.
+   - The notices: one for each agent of the roster. An identity or a plain agent gets `pending =
+     true` when it has an unread delivery, else `false`. An alias name (a legacy name of an
+     identity) gets `pending = false`: its mail is the identity's now, so a stale legacy notice is
+     cleared. The hub admits any roster ID (hub `admitSQLNotices`), one entry for each.
+   - This is Messaging's first SQL commit with notices, so the hub moves Messaging's notices to SQL
+     here (`notices_moved`, `docs/sql.md` section 7). The list is empty only when the roster is
+     empty; then no agent can have a notice, and the next commit with notices moves them.
 
 After step 2 the plugin reads and writes SQL only. The fence record stays.
-
-### Old operation keys
-
-`hub.store.op` cannot list its records, so they are not imported. A lookup that misses in
-`operations` falls back to `hub.store.op` (read only, G4), for the identity and its aliases (today's
-`prior_operation`), so a retry from before the cutover replays its first result.
 
 ### Rollback and backup
 
@@ -476,6 +545,16 @@ After step 2 the plugin reads and writes SQL only. The fence record stays.
     f1; a source change during the import; a chunked large body with a crash between chunks; a
     `record_too_large` source; a verification mismatch; acked messages stay acked; a restart in
     `done` with a stale key-value alias state;
+  - import names (revision 4): an alias that the key-value store already migrated (its mailbox and
+    thread under the identity) with messages, recipients and a delivery snapshot that still name
+    the alias; an alias that it did not migrate; mixed names in one group and one thread; two
+    mailboxes that meet under M; an alias that appears after the fence (merged at the cutover); a
+    draft conflict at the cutover leaves `verified`;
+  - saved operations: a replay before and after the cutover, under the identity and under an alias
+    name; a conflicting key; a Gallery replay; an operation added during the import with a key
+    before the saved cursor (a reset); a result too large for one request (a clear refusal);
+  - cutover notices: a store where every message is acked (the notices still move); a stale notice
+    of an alias name is cleared;
   - `since`, `before` and `draft_revision` values from before the cutover; integers above 2^53;
     two draft saves from one base with no send between them; a repeated and an empty ack write
     nothing.
@@ -491,8 +570,7 @@ pair builds it) and G1 to G4.
 2. The schema, send, read, ack, history, view.seen on SQL, with the tests (fresh database only).
 3. Threads, groups, members, homes, titles, drafts, gallery.
 4. Identity aliases on SQL.
-5. The import: states, fence, source records, chunks, verification, cutover; the operation-key
-   fallback.
+5. The import: states, fence, M, source records, chunks, saved operations, verification, cutover.
 6. Retire the key-value code paths (chains, mailboxes, M1 scans) and their tests, after the reviewer
    accepts the coverage map.
 
