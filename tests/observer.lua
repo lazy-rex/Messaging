@@ -25,6 +25,11 @@ local function panel()
   user:command('threads')
   return user:view('/panels/threads', nil, H.args.tests_session)
 end
+-- section opens a collapsed panel list (Show) and returns its first page.
+local function section(id)
+  local op = panel():action(id, 'show', {})
+  return user:view(op.result.form)
+end
 
 test('agent-only threads appear as observed, with no tab and no unread', function()
   group = alice:call('messaging.thread_create', {key = 'observer-group', title = 'Agent discussion', members = {'bob'}})
@@ -34,7 +39,8 @@ test('agent-only threads appear as observed, with no tab and no unread', functio
   expect(tab('thread/' .. group.id), 'an observed group is not opened automatically').to_be(nil)
   expect(tab('thread/' .. direct_id), 'an observed direct needs an explicit open').to_be(nil)
   local tree = panel():render()
-  local observed = H.node(tree, 'observed_threads').items
+  expect(H.node(tree, 'observed_threads').text).to_match('^Agent%-only threads %(%d+%)$')
+  local observed = H.node(section('observed_threads'):render(), 'observed_threads').items
   expect(find(observed, group.id).detail).to_be('Send a message to join')
   expect(find(observed, direct_id).detail).to_be('Read-only direct thread')
   expect(find(H.node(tree, 'threads').items, group.id)).to_be(nil)
@@ -42,7 +48,7 @@ end)
 
 local direct_view
 test('an observed direct opens read-only, without status or token, and refuses drafts and sends', function()
-  local op = panel():action('observed_threads', 'open', {item_id = direct_id})
+  local op = section('observed_threads'):action('observed_threads', 'open', {item_id = direct_id})
   expect(op.result).to_equal({navigate = 'thread/' .. direct_id})
   local t = tab('thread/' .. direct_id)
   expect(t.status).to_be(nil)
@@ -104,8 +110,7 @@ test('the first message joins the group atomically and backfills nothing', funct
   expect(user_mail(), 'joining does not backfill unread history').to_equal(user_box)
   expect(#sql([[SELECT 1 AS x FROM deliveries d JOIN messages m ON m.seq = d.seq WHERE m.id = ?]], {old.id}),
     'old history keeps its audience').to_be(1)
-  local tree2 = panel():render()
-  expect(find(H.node(tree2, 'observed_threads').items, group.id)).to_be(nil)
+  expect(find(H.node(section('observed_threads'):render(), 'observed_threads').items, group.id)).to_be(nil)
   expect(H.node(v:render(), 'observer_notice')).to_be(nil)
 end)
 

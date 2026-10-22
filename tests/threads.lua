@@ -25,6 +25,11 @@ local function panel()
   user:command('threads')
   return user:view('/panels/threads')
 end
+-- archived_page opens the Archived section of the panel (Show) and returns its first page.
+local function archived_page()
+  local op = panel():action('archived_threads', 'show', {})
+  return user:view(op.result.form)
+end
 
 local alice, bob, charlie = agent('alice'), agent('bob'), agent('charlie')
 
@@ -85,7 +90,7 @@ test('New Thread declares an empty direct thread; archive hides it; restore brin
   -- A navigation does not undo the archive: view.open declares nothing.
   pcall(function() H.hub('hub.ui.navigate', {plugin = 'messaging', tab = 'thread/alice'}) end)
   expect(has_tab('thread/alice'), 'opening does not undo archive').to_be(false)
-  local p = panel()
+  local p = archived_page()
   expect(find(H.node(p:render(), 'archived_threads').items, 'alice')).to_be_truthy()
   op = p:action('archived_threads', 'restore', {item_id = 'alice'})
   expect(op.result).to_equal({navigate = 'thread/alice'})
@@ -179,8 +184,7 @@ test('archive from the menu keeps other archived threads, the draft and unread d
   expect(draft(), 'archive keeps the draft').to_equal(draft_before)
   expect(#sql([[SELECT 1 AS x FROM deliveries d JOIN messages m ON m.seq = d.seq
     WHERE d.agent = 'user' AND d.acked = 0 AND m.id = ?]], {unread.id}), 'archive keeps unread delivery').to_be(1)
-  local p = panel()
-  expect(find(H.node(p:render(), 'archived_threads').items, created.id)).to_be_truthy()
+  expect(find(H.node(archived_page():render(), 'archived_threads').items, created.id)).to_be_truthy()
   expect(find(bob:call('messaging.thread_list', {}).threads, created.id).archived, 'archive is per participant').to_be_falsy()
   local later = alice:call('messaging.send', {to = created.id, key = 'later', body = 'Another note'})
   expect(has_tab('thread/' .. created.id), 'new mail does not undo archive').to_be(false)
@@ -188,7 +192,7 @@ test('archive from the menu keeps other archived threads, the draft and unread d
 end)
 
 test('restore from the panel; seeing the thread clears its status', function()
-  local p = user:view('/panels/threads')
+  local p = archived_page()
   p:render()
   local op = p:action('archived_threads', 'restore', {item_id = created.id})
   expect(op.result).to_equal({navigate = 'thread/' .. created.id})

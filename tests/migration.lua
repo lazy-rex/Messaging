@@ -116,9 +116,10 @@ test('the user sees the migrated thread: archive, history, draft; the old name s
   -- The plugin no longer declares thread/alice, so the hub closed its view.
   expect(tab('thread/alice')).to_be(nil)
   user:command('threads')
-  local p = user:view('/panels/threads')
+  local op = user:view('/panels/threads'):action('archived_threads', 'show', {})
+  local p = user:view(op.result.form)
   expect(has_id(H.node(p:render(), 'archived_threads').items, alice_id)).to_be(true)
-  local op = p:action('archived_threads', 'restore', {item_id = alice_id})
+  op = p:action('archived_threads', 'restore', {item_id = alice_id})
   expect(op.result).to_equal({navigate = 'thread/' .. alice_id})
   local tree = user:view('thread/' .. alice_id):render()
   expect(#H.node(tree, 'history').messages > 0, 'the identity thread shows the legacy history').to_be(true)

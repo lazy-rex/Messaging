@@ -1206,7 +1206,18 @@ local function set_draft(user, peer, text)
   return rev
 end
 
-local function render_home(user, context)
+-- The Threads panel and its section pages stay under one view reply (reply_budget) at any number of
+-- threads. On the live hub (2026-10-22) 273 threads, with a New-thread form inside the panel, gave
+-- a 134 KB render, which the hub refused (too_large). The panel shows the user's own threads by
+-- name. Agent-only and archived threads are a count that opens a section page
+-- (/forms/threads/<list>/<from>). A list over list_budget bytes ends with a More item that opens
+-- the next page. A label is cut to label_bytes, so one item always fits.
+local list_budget = 36000
+local label_bytes = 200
+local sections = {threads = 'Conversations', observed_threads = 'Agent-only threads', archived_threads = 'Archived'}
+
+-- home_lists returns the items of each panel list, the threads of the context's session first.
+local function home_lists(user, context)
   local placement = hub('hub.ui.describe', {plugin = 'messaging'})
   local redirects = placement.home_redirects or {}
   local current, other = {}, {}
@@ -1217,35 +1228,59 @@ local function render_home(user, context)
     local target = context and session == context.session_id and current or other
     target[#target + 1] = peer
   end
-  local ordered = {}
+  local lists = {threads = {}, observed_threads = {}, archived_threads = {}}
   for _, list in ipairs({current, other}) do
-    for _, peer in ipairs(list) do ordered[#ordered + 1] = peer end
-  end
-  local items, archived_items, observed_items = {}, {}, {}
-  for _, a in ipairs(ordered) do
-    local n = a.observer and 0 or (s.counts[a.id] or 0)
-    local archived = s.archived[a.id]
-    local item = {id = a.id, label = thread_title(user, a, s), detail = n > 0 and (n .. ' unread') or 'No unread messages',
-      action = archived and {name = 'restore', label = 'Restore', enabled = true, tool = 'messaging.thread_archive'}
-        or {name = 'open', label = 'Open', enabled = true, user_only = 'navigation'}}
-    if a.observer then item.detail = a.readonly and 'Read-only direct thread' or 'Send a message to join' end
-    local target = archived and archived_items or (a.observer and observed_items or items)
-    target[#target + 1] = item
-  end
-  -- New thread: an optional title and a checkbox per participant.
-  local fields = {{id = 'title', label = 'Title (optional)', kind = 'text', value = '', required = false}}
-  for _, a in ipairs(participants) do
-    if a.id ~= user and not a.alias_of then
-      fields[#fields + 1] = {id = 'member_' .. a.id, label = display_name(a), kind = 'boolean', value = false, required = false}
+    for _, a in ipairs(list) do
+      local n = a.observer and 0 or (s.counts[a.id] or 0)
+      local archived = s.archived[a.id]
+      local label = thread_title(user, a, s)
+      if #label > label_bytes then label = utf8_cut(label, label_bytes - 3) .. '…' end
+      -- Only an unread count is detail text. An observed thread says how the user can join it.
+      local item = {id = a.id, label = label, detail = n > 0 and (n .. ' unread') or nil,
+        action = archived and {name = 'restore', label = 'Restore', enabled = true, tool = 'messaging.thread_archive'}
+          or {name = 'open', label = 'Open', enabled = true, user_only = 'navigation'}}
+      if a.observer then item.detail = a.readonly and 'Read-only direct thread' or 'Send a message to join' end
+      local target = archived and lists.archived_threads or (a.observer and lists.observed_threads or lists.threads)
+      target[#target + 1] = item
     end
   end
-  return {title = 'Messages', nodes = {
-    {id = 'threads', type = 'list', label = 'Conversations', items = items},
-    {id = 'observed_threads', type = 'list', label = 'Agent-only threads', items = observed_items},
-    {id = 'archived_threads', type = 'list', label = 'Archived', items = archived_items},
-    {id = 'new_thread', type = 'form', label = 'New thread', fields = fields,
-      submit_action = {name = 'submit', label = 'Create thread', enabled = true, tool = 'messaging.thread_create'}},
-  }}
+  return lists
+end
+
+-- list_page returns the items from index from on that fit in list_budget bytes, then a More item
+-- (ID more:<next index>) when items remain. The first item always fits.
+local function list_page(items, from)
+  local function more(next)
+    return {id = 'more:' .. next, label = 'More…', detail = (#items - next + 1) .. ' more',
+      action = {name = 'more', label = 'Show more', enabled = true, user_only = 'navigation'}}
+  end
+  local reserve = encoded_size(more(#items)) + 16
+  local out, size = {}, 0
+  for i = from, #items do
+    local cost = encoded_size(items[i]) + 1
+    if #out > 0 and size + cost + reserve > list_budget then
+      out[#out + 1] = more(i)
+      return out
+    end
+    out[#out + 1] = items[i]
+    size = size + cost
+  end
+  return out
+end
+
+local function render_home(user, context)
+  local lists = home_lists(user, context)
+  local nodes = {
+    {id = 'threads', type = 'list', label = sections.threads, items = list_page(lists.threads, 1)},
+    {id = 'new_thread', type = 'widget', text = '', action = {name = 'new', label = 'New thread…', enabled = true, user_only = 'navigation'}},
+  }
+  for _, id in ipairs({'observed_threads', 'archived_threads'}) do
+    if #lists[id] > 0 then
+      nodes[#nodes + 1] = {id = id, type = 'widget', text = sections[id] .. ' (' .. #lists[id] .. ')',
+        action = {name = 'show', label = 'Show', enabled = true, user_only = 'navigation'}}
+    end
+  end
+  return {title = 'Messages', nodes = nodes}
 end
 -- Rex limits one control message to 64 KiB (rex-protocol.md), for requests and replies. A view
 -- tree and a history page therefore carry a bounded part of a thread. The transcript pane fetches
@@ -1566,6 +1601,15 @@ local function move_thread(user, peer, intent, operation_key, source_session)
   save_operation(op_key, user, fingerprint, result)
   return result
 end
+-- render_section returns one page of a panel list: /forms/threads/<list>/<from>.
+local function render_section(args)
+  local id, from = args.route:match('^/forms/threads/([%w_]+)/(%d+)$')
+  if not sections[id] then fail('invalid_input', 'Unknown thread list') end
+  local items = home_lists(args.user, args.context)[id]
+  local page = list_page(items, math.max(1, tonumber(from)))
+  return {title = sections[id], nodes = {{id = id, type = 'list', label = sections[id], items = page}, cancel_node('Close')}}
+end
+
 local function render_form(args)
   local context = form_context(args)
   if args.route == '/forms/thread-menu' then
@@ -1629,6 +1673,8 @@ local function render_form(args)
 end
 
 local function form_view(args)
+  -- A section page needs no source session (the session only orders the list) and waits for no input.
+  if args.route:sub(1, 15) == '/forms/threads/' then return render_section(args) end
   local tree = render_form(args)
   tree.status = {state = 'blocked', kind = 'question', msg = 'Waiting for input'}
   return tree
@@ -1792,6 +1838,17 @@ local function view_action(args)
     remember_thread_open(args.user, target.id)
     return {navigate = 'thread/' .. target.id}
   end
+  -- More and Show open a page of the list; New thread opens the New thread form.
+  if sections[args.node_id] and (args.action == 'more' or args.action == 'show') then
+    local from = 1
+    if args.action == 'more' then
+      local item = type(args.input) == 'table' and args.input.item_id
+      from = type(item) == 'string' and tonumber(item:match('^more:(%d+)$'))
+      if not from then fail('invalid_input', 'Unknown More item') end
+    end
+    return {form = '/forms/threads/' .. args.node_id .. '/' .. from}
+  end
+  if args.node_id == 'new_thread' and args.action == 'new' then return {form = '/forms/new-thread'} end
   if args.node_id == 'archived_threads' and args.action == 'restore' then
     local peer = type(args.input) == 'table' and args.input.item_id
     thread_archive(args.user, {thread = peer, archived = false, key = args.operation_key})

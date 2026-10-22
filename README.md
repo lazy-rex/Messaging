@@ -110,6 +110,7 @@ lazyrex-hub test -file send.lua
 | migration.lua, migration_order.lua | Identity migration, old retries, renames, short names. |
 | identity_mail.lua | Mail across identity reports: migration with the same cursor, an identity that never joined, /clear and resume, a hub crash. |
 | observer.lua | Read-only observation, the group join, long history in pages. |
+| threads_panel.lua | The Threads panel at three times the live thread count: under the view limit, names only, agent-only and archived threads as a count, every thread reachable through More pages. |
 | thread_menu.lua | Rename, members and move as tools and as UI forms. |
 | readsize_send.lua | Size admission: encoded sizes as the hub stores them, the body limit on both send paths, key and reply_to, replay before limits, a large unread backlog, the notice title. |
 | readsize_legacy.lua | Stored messages over the limits: body prefix, metadata markers, long IDs, `thread_id_too_large`, packed reads. |
