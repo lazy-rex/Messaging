@@ -1771,9 +1771,6 @@ local function view_action(args)
     remember_thread_open(args.user, peer)
     return {navigate = 'thread/' .. peer}
   end
-  if args.node_id == 'new_thread' and args.action == 'submit' then
-    return create_thread(args.user, args.input, args.operation_key, args.context)
-  end
   fail('invalid_input', 'Unknown action ' .. tostring(args.action) .. ' on ' .. tostring(args.node_id))
 end
 

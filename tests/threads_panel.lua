@@ -103,6 +103,9 @@ test('a thread on a later page opens; New thread opens its form', function()
   expect(op.result).to_equal({navigate = 'thread/' .. last})
   op = panel():action('new_thread', 'new', {})
   expect(op.result).to_equal({form = '/forms/new-thread'})
+  -- The panel has no form: a submit to it is an unknown action.
+  op = panel():action('new_thread', 'submit', {values = {member_alice = true}})
+  expect(op.status).to_be('failed')
 end)
 
 test('a thread whose ID alone is over a page shows as a row without an action', function()
