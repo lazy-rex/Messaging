@@ -91,6 +91,16 @@ test('move as a tool sets the thread home; the UI form does the same', function(
   local op = form(g.id, 'move'):action('move_thread', 'submit', {values = {session_id = s2, session_name = ''}})
   expect(op.status).to_be('succeeded')
   expect(store(home).value.home_session).to_be(s2)
+  -- The new home moves the open thread view: the hub retires it and opens a view in s2, after
+  -- the action replied. Wait for that, so that the next test does not act on the retiring view
+  -- (reviewer's full run, 2026-10-22: 'the source view is closed').
+  wait('one attached view of the moved thread, in s2', function()
+    local found, moved = 0, false
+    for _, v in ipairs(H.views()) do
+      if v.tab == 'thread/' .. g.id then found = found + 1; moved = v.session_id == s2 and v.attached end
+    end
+    return found == 1 and moved
+  end)
 end)
 
 -- Ported from the hub's one-tab-migration-lab.mjs (phase 3, items 4 and 5 of the coverage map):
