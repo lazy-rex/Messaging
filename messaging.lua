@@ -128,21 +128,15 @@ db.migrate {function()
   }) do db.exec(sql) end
 end}
 
--- rows returns every row of a query. One hub.sql reply holds about 1 MB of rows (more = true for
--- a larger result): rows then reads the next parts with OFFSET. In a transaction the parts come
+-- rows returns every row of a query. One hub.sql reply holds about 1 MB of rows; db.each reads
+-- the next parts with OFFSET (a query with its own LIMIT too). In a transaction the parts come
 -- from one snapshot. In a render (no transaction) they can come from two commits; the next change
--- renders again. A query with its own LIMIT reads its pages itself (db.query): here a partial
--- result fails.
+-- renders again.
 local function rows(sql, ...)
-  local out, more = db.query(sql, ...)
-  if not more then return out end
-  if sql:find('LIMIT', 1, true) then fail('internal', 'A limited query result is over one reply') end
-  repeat
-    local page
-    page, more = db.query(sql .. ' LIMIT -1 OFFSET ' .. #out, ...)
-    if #page == 0 and more then fail('internal', 'One row is over one reply') end
-    for _, r in ipairs(page) do out[#out + 1] = r end
-  until not more
+  local out, n = {}, select('#', ...)
+  local args = {...}
+  args[n + 1] = function(r) out[#out + 1] = r end
+  db.each(sql, unpack(args, 1, n + 1))
   return out
 end
 local function json(list) return rex.json.encode(list) end
@@ -722,15 +716,15 @@ local function read(agent, args)
   local high = db.first('SELECT CAST(coalesce(max(seq), 0) AS TEXT) AS n FROM deliveries WHERE agent = ?', agent).n
   local query = 'SELECT ' .. message_columns(reply_budget + 1) .. [[ FROM deliveries d JOIN messages m ON m.seq = d.seq
     WHERE d.agent = ? AND d.acked = 0 AND d.seq > CAST(? AS INTEGER)]] .. filter .. ' ORDER BY d.seq LIMIT ' .. read_limit
-  local selected, more
-  if filter ~= '' then selected, more = db.query(query, agent, since, ta, tb) else selected, more = db.query(query, agent, since) end
+  local selected
+  if filter ~= '' then selected = rows(query, agent, since, ta, tb) else selected = rows(query, agent, since) end
   if #selected == 0 then return {messages = {}, next_cursor = high} end
   local messages = {}
   for i, r in ipairs(selected) do messages[i] = page_item(r) end
   -- A page that stops early continues after its last message: next_cursor is that cursor.
   local page = {next_cursor = cursor_max, more = true}
   local n = fit_page(page, messages)
-  if n == #messages and not more and #selected < read_limit then
+  if n == #messages and #selected < read_limit then
     page.more, page.next_cursor = nil, high
   else
     page.next_cursor = page.messages[n].cursor
@@ -755,16 +749,14 @@ local function history(agent, args)
   local ta, tb = thread_pair(agent, peer)
   local query = 'SELECT ' .. message_columns(reply_budget + 1) .. ' FROM messages m WHERE m.thread_a = ? AND m.thread_b = ?'
     .. (before and ' AND m.seq < CAST(? AS INTEGER)' or '') .. ' ORDER BY m.seq DESC LIMIT ' .. (limit + 1)
-  -- A partial result (more) has the newest rows: older messages exist after them.
-  local found, more
-  if before then found, more = db.query(query, ta, tb, before) else found, more = db.query(query, ta, tb) end
-  if more and #found == 0 then fail('internal', 'One message is over one reply') end
+  local found
+  if before then found = rows(query, ta, tb, before) else found = rows(query, ta, tb) end
   local messages = {}
   for i = 1, math.min(limit, #found) do messages[i] = page_item(found[i]) end
   -- The page also stops at reply_budget. next_before then names its oldest message.
   local result = {thread = peer, next_before = cursor_max}
   local n = fit_page(result, messages)
-  result.next_before = (n < #messages or #found > limit or more) and result.messages[n].cursor or nil
+  result.next_before = (n < #messages or #found > limit) and result.messages[n].cursor or nil
   return checked(result)
 end
 
@@ -1262,13 +1254,9 @@ local function history_page(user, peer, before, budget)
   local op = cursor and '<' or '<='
   cursor = cursor or '9223372036854775807'
   while true do
-    -- A partial chunk is fine: the next query starts after its oldest row.
-    local chunk, more = db.query(query(op), ta, tb, cursor)
+    local chunk = rows(query(op), ta, tb, cursor)
     op = '<'
-    if #chunk == 0 then
-      if more then fail('internal', 'One message is over one reply') end
-      break
-    end
+    if #chunk == 0 then break end
     for _, r in ipairs(chunk) do
       -- author is display text. own (optional) marks the user's own messages for styling.
       local item = {id = r.id, author = names[r.sender] or r.sender, own = r.sender == user, text = r.body, at = r.at, fyi = r.reply_expected == 0}

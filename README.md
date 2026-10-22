@@ -12,7 +12,7 @@ Check this repository out next to LazyRex, and add the plugin to the hub config:
 
 The plugin loads its other files from its own directory, so keep them together.
 
-Messaging runs on the LazyRex Plugin SDK v0. Its `lazyrex.json` has `"sdk": "0"`, so the hub starts it through the SDK launcher (`sdk/lua/boot.lua`). A hub without the launcher cannot start it. Messaging keeps its data in the plugin's SQL database (`hub.sql`), so it also needs a hub with `hub.sql`.
+Messaging runs on the LazyRex Plugin SDK v0. Its `lazyrex.json` has `"sdk": "0"`, so the hub starts it through the SDK launcher (`sdk/lua/boot.lua`). A hub without the launcher cannot start it. Messaging keeps its data in the plugin's SQL database (`hub.sql`), so it also needs a hub with `hub.sql`. It reads a result of any size with `db.each`, so it needs SDK commit 1357b43 or later.
 
 Plugin args (hub config `plugins[].args`):
 
