@@ -119,7 +119,23 @@ db.migrate {function()
   }) do db.exec(sql) end
 end}
 
-local function rows(sql, ...) return (db.query(sql, ...)) end
+-- rows returns every row of a query. One hub.sql reply holds about 1 MB of rows (more = true for
+-- a larger result): rows then reads the next parts with OFFSET. In a transaction the parts come
+-- from one snapshot. In a render (no transaction) they can come from two commits; the next change
+-- renders again. A query with its own LIMIT reads its pages itself (db.query): here a partial
+-- result fails.
+local function rows(sql, ...)
+  local out, more = db.query(sql, ...)
+  if not more then return out end
+  if sql:find('LIMIT', 1, true) then fail('internal', 'A limited query result is over one reply') end
+  repeat
+    local page
+    page, more = db.query(sql .. ' LIMIT -1 OFFSET ' .. #out, ...)
+    if #page == 0 and more then fail('internal', 'One row is over one reply') end
+    for _, r in ipairs(page) do out[#out + 1] = r end
+  until not more
+  return out
+end
 local function json(list) return rex.json.encode(list) end
 
 -- bump gives out the next revision. Every write that gives out a revision (a message seq, a draft
@@ -167,22 +183,52 @@ local function save_operation(key, owner, fingerprint, result)
 end
 
 -- Identity aliases. The hub owns them; the plugin moves its rows to the identity once for each
--- alias, in one transaction, in sorted order. A merge never updates a key column in place (a
--- collision would fail it): it writes the target row with a winner rule, then deletes the sources.
--- A message unread under either name stays unread.
-local function merge_rows(list, target_of, keep)
+-- alias, in one transaction, in sorted order. A message unread under either name stays unread.
+-- Viewer rows and homes: Lua reads only their keys and the columns of the winner rule; the values
+-- (a draft can be 16 KB) stay in SQL. settle gives the target row the winner's values and deletes
+-- the other rows of the group. A key column changes in place only when no row has the target key.
+local function settle(t, target, group, winner)
+  local where = t.k1 .. ' = ? AND ' .. t.k2 .. ' = ?'
+  local function is_target(r) return r.k1 == target[1] and r.k2 == target[2] end
+  local has_target = false
+  for _, r in ipairs(group) do
+    if is_target(r) then has_target = true
+    elseif r ~= winner then db.exec('DELETE FROM ' .. t.name .. ' WHERE ' .. where, r.k1, r.k2) end
+  end
+  if is_target(winner) then return end
+  if not has_target then
+    db.exec('UPDATE ' .. t.name .. ' SET ' .. t.k1 .. ' = ?, ' .. t.k2 .. ' = ? WHERE ' .. where, target[1], target[2], winner.k1, winner.k2)
+    return
+  end
+  if t.values then
+    db.exec('UPDATE ' .. t.name .. ' SET (' .. t.values .. ') = (SELECT ' .. t.values .. ' FROM ' .. t.name .. ' WHERE ' .. where .. ') WHERE ' .. where,
+      winner.k1, winner.k2, target[1], target[2])
+  end
+  db.exec('DELETE FROM ' .. t.name .. ' WHERE ' .. where, winner.k1, winner.k2)
+end
+
+-- merge groups the rows of table t by target key and settles each group that changes. pick returns
+-- the winner of a group.
+local function merge(t, list, target_of, pick)
   local groups, order = {}, {}
   for _, r in ipairs(list) do
-    local t = target_of(r)
-    local k = part(t[1]) .. part(t[2])
-    if not groups[k] then groups[k] = {target = t, rows = {}, changed = false}; order[#order + 1] = k end
+    local target = target_of(r)
+    local k = part(target[1]) .. part(target[2])
+    if not groups[k] then groups[k] = {target = target, rows = {}, changed = false}; order[#order + 1] = k end
     table.insert(groups[k].rows, r)
-    if t[1] ~= r.k1 or t[2] ~= r.k2 then groups[k].changed = true end
+    if target[1] ~= r.k1 or target[2] ~= r.k2 then groups[k].changed = true end
   end
   for _, k in ipairs(order) do
     local g = groups[k]
-    if g.changed then keep(g.target, g.rows) end
+    if g.changed then settle(t, g.target, g.rows, pick(g.target, g.rows)) end
   end
+end
+
+-- newest returns the row with the latest revision in column c (decimal text).
+local function newest(list, c)
+  local w = list[1]
+  for _, r in ipairs(list) do if later(r[c], w[c]) then w = r end end
+  return w
 end
 
 local function merge_alias(x, y)
@@ -199,57 +245,47 @@ local function merge_alias(x, y)
     ON CONFLICT (gid, agent) DO UPDATE SET pos = min(pos, excluded.pos), current = max(current, excluded.current)]], y, x)
   db.exec('DELETE FROM group_members WHERE agent = ?', x)
   -- Viewer rows: (viewer, peer). An observed peer d-<hex> names agents too.
-  local function viewer_rows(name, columns)
+  local function viewer_merge(name, values, columns, pick)
     local list = rows('SELECT viewer AS k1, peer AS k2' .. columns .. ' FROM ' .. name
-      .. " WHERE viewer IN (?, ?) OR peer IN (?, ?) OR peer LIKE 'd-%'", x, y, x, y)
-    return list, function(r) return {canonical(r.k1), canonical_thread_id(r.k2)} end
+      .. " WHERE viewer IN (?, ?) OR peer IN (?, ?) OR peer LIKE 'd-%' ORDER BY viewer, peer", x, y, x, y)
+    merge({name = name, k1 = 'viewer', k2 = 'peer', values = values}, list,
+      function(r) return {canonical(r.k1), canonical_thread_id(r.k2)} end, pick)
   end
-  local function replace(name, target, list, columns, values)
-    for _, r in ipairs(list) do db.exec('DELETE FROM ' .. name .. ' WHERE viewer = ? AND peer = ?', r.k1, r.k2) end
-    db.exec('INSERT INTO ' .. name .. ' (viewer, peer' .. columns .. ') VALUES (?, ?' .. string.rep(', ?', #values) .. ')',
-      target[1], target[2], unpack(values))
-  end
-  local list, target_of = viewer_rows('thread_titles', ', title, CAST(set_rev AS TEXT) AS set_rev')
-  merge_rows(list, target_of, function(target, contributors)
-    local newest = contributors[1] -- the latest explicit rename wins
-    for _, r in ipairs(contributors) do if later(r.set_rev, newest.set_rev) then newest = r end end
-    replace('thread_titles', target, contributors, ', title, set_rev', {newest.title, db.int(newest.set_rev)})
-  end)
-  for _, name in ipairs({'thread_opened', 'thread_archived'}) do
-    list, target_of = viewer_rows(name, '')
-    merge_rows(list, target_of, function(target, contributors) replace(name, target, contributors, '', {}) end)
-  end
-  list, target_of = viewer_rows('drafts', ', text, CAST(rev AS TEXT) AS rev')
-  merge_rows(list, target_of, function(target, contributors)
-    local winner = contributors[1]
-    for _, r in ipairs(contributors) do
-      if r.text ~= '' and winner.text ~= '' and r.text ~= winner.text then
-        fail('migration_conflict', 'Two drafts have different text for ' .. target[1] .. ' and ' .. target[2])
-      end
-      if (r.text ~= '' and winner.text == '') or (r.text == winner.text and later(r.rev, winner.rev)) then winner = r end
+  -- The latest explicit rename wins.
+  viewer_merge('thread_titles', 'title, set_rev', ', CAST(set_rev AS TEXT) AS set_rev', function(_, g) return newest(g, 'set_rev') end)
+  viewer_merge('thread_opened', nil, '', function(_, g) return g[1] end)
+  viewer_merge('thread_archived', nil, '', function(_, g) return g[1] end)
+  -- Drafts: a non-empty draft wins over an empty one, then the latest revision. Two non-empty
+  -- drafts with different text are a conflict: SQL compares the texts.
+  viewer_merge('drafts', 'text, rev', ", CAST(rev AS TEXT) AS rev, text <> '' AS full", function(target, g)
+    local full = {}
+    for _, r in ipairs(g) do if r.full == 1 then full[#full + 1] = r end end
+    if #full > 1 then
+      local keys = {}
+      for _, r in ipairs(full) do keys[#keys + 1] = {r.k1, r.k2} end
+      local n = db.first([[SELECT count(DISTINCT d.text) AS n FROM drafts d JOIN json_each(?) k
+        ON d.viewer = json_extract(k.value, '$[0]') AND d.peer = json_extract(k.value, '$[1]')]], json(keys)).n
+      if n > 1 then fail('migration_conflict', 'Two drafts have different text for ' .. target[1] .. ' and ' .. target[2]) end
     end
-    replace('drafts', target, contributors, ', text, rev', {winner.text, db.int(winner.rev)})
+    return newest(#full > 0 and full or g, 'rev')
   end)
   -- Homes: a move (moved = 1) is an explicit choice, and the newest move wins. Without a move, the
   -- first home wins. set_rev moves with the value.
-  list = rows([[SELECT thread_a AS k1, thread_b AS k2, home_session, moved, CAST(set_rev AS TEXT) AS set_rev FROM thread_homes
-    WHERE thread_a IN (?, ?) OR thread_b IN (?, ?) OR thread_a LIKE 'd-%']], x, y, x, y)
-  merge_rows(list, function(r)
+  local list = rows([[SELECT thread_a AS k1, thread_b AS k2, moved, CAST(set_rev AS TEXT) AS set_rev FROM thread_homes
+    WHERE thread_a IN (?, ?) OR thread_b IN (?, ?) OR thread_a LIKE 'd-%' ORDER BY thread_a, thread_b]], x, y, x, y)
+  merge({name = 'thread_homes', k1 = 'thread_a', k2 = 'thread_b', values = 'home_session, moved, set_rev'}, list, function(r)
     if r.k1:sub(1, 2) == 'd-' then return {canonical_thread_id(r.k1), r.k2} end
     if r.k1 == '' then return {r.k1, r.k2} end
     local a, b = canonical(r.k1), canonical(r.k2)
     if b < a then return {b, a} end
     return {a, b}
-  end, function(target, contributors)
+  end, function(_, g)
     local moved, first
-    for _, r in ipairs(contributors) do
+    for _, r in ipairs(g) do
       if r.moved == 1 and (not moved or later(r.set_rev, moved.set_rev)) then moved = r end
       if not first or later(first.set_rev, r.set_rev) then first = r end
     end
-    local w = moved or first
-    for _, r in ipairs(contributors) do db.exec('DELETE FROM thread_homes WHERE thread_a = ? AND thread_b = ?', r.k1, r.k2) end
-    db.exec('INSERT INTO thread_homes (thread_a, thread_b, home_session, moved, set_rev) VALUES (?, ?, ?, ?, ?)',
-      target[1], target[2], w.home_session, w.moved, db.int(w.set_rev))
+    return moved or first
   end)
   db.exec('INSERT INTO aliases_applied (alias, identity) VALUES (?, ?)', x, y)
   notify(x)
@@ -710,13 +746,16 @@ local function history(agent, args)
   local ta, tb = thread_pair(agent, peer)
   local query = 'SELECT ' .. message_columns(reply_budget + 1) .. ' FROM messages m WHERE m.thread_a = ? AND m.thread_b = ?'
     .. (before and ' AND m.seq < CAST(? AS INTEGER)' or '') .. ' ORDER BY m.seq DESC LIMIT ' .. (limit + 1)
-  local found = before and rows(query, ta, tb, before) or rows(query, ta, tb)
+  -- A partial result (more) has the newest rows: older messages exist after them.
+  local found, more
+  if before then found, more = db.query(query, ta, tb, before) else found, more = db.query(query, ta, tb) end
+  if more and #found == 0 then fail('internal', 'One message is over one reply') end
   local messages = {}
   for i = 1, math.min(limit, #found) do messages[i] = page_item(found[i]) end
   -- The page also stops at reply_budget. next_before then names its oldest message.
   local result = {thread = peer, next_before = cursor_max}
   local n = fit_page(result, messages)
-  result.next_before = (n < #messages or #found > limit) and result.messages[n].cursor or nil
+  result.next_before = (n < #messages or #found > limit or more) and result.messages[n].cursor or nil
   return checked(result)
 end
 
@@ -1209,8 +1248,12 @@ local function history_page(user, peer, before, budget)
   -- Bounded chunks, newest first. A cursor above every seq starts at the newest message.
   cursor = cursor or '9223372036854775807'
   while true do
-    local chunk = rows(query, ta, tb, cursor)
-    if #chunk == 0 then break end
+    -- A partial chunk is fine: the next query starts after its oldest row.
+    local chunk, more = db.query(query, ta, tb, cursor)
+    if #chunk == 0 then
+      if more then fail('internal', 'One message is over one reply') end
+      break
+    end
     for _, r in ipairs(chunk) do
       local body = r.body
       local author = names[r.sender] or r.sender

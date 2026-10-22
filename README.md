@@ -87,6 +87,7 @@ lazyrex-hub test -file send.lua
 | growth.lua | A thread of 2000 messages: every send commits, history to the oldest message, the view renders. |
 | tab_reads.lua | The SQL statements of a send and its tab declaration do not grow with the number of peers (needs hub.test.calls). |
 | tabs_commit.lua | The tabs come from committed state: a failed send, move or archive leaves the tabs as they were. |
+| sql_paging.lua | Results over one hub.sql reply: the group list, the alias migration of large drafts (values stay in SQL), history after a partial result. |
 | gallery.lua | The Gallery view with the plugin arg gallery = true (lazyrex.json test.files): render, actions, draft and send. |
 | tab_coalesce.lua | A burst of `hub.changed agents` gives one or two tab declarations, and the declaration still has the threads (needs hub.test.calls). |
 
