@@ -2441,11 +2441,31 @@ end, ['view.history'] = function(args)
   local messages, has_more = history_page(args.user, thread_peer(args.route, args.user), args.before, page_budget)
   return {messages = messages, has_more = has_more}
 end, ['view.rename'] = view_rename, ['view.render'] = view_render, ['view.action'] = view_action,
-  ['view.draft.save'] = view_draft_save, ['view.send'] = view_send, ['view.seen'] = view_seen,
-  ['hub.changed'] = function(args)
-    if args.what == 'agents' then declare_tabs('user') end
-    return {}
-  end}
+  ['view.draft.save'] = view_draft_save, ['view.send'] = view_send, ['view.seen'] = view_seen}
+
+-- hub.changed: the hub sends one for each change of agents, workers and plugins, and does not
+-- coalesce them. Only agents changes the tabs. A declaration for each one queued the plugin: on
+-- the live hub after release 2 (2026-10-22), bursts of about 30 per 10 s met declarations of about
+-- 1 s each, and the 16-request queue filled. So the handler only schedules one declaration
+-- (rex.after) and replies at once; a burst gets one or two declarations. The schedule state is a
+-- table field, not a captured local (pcall rule, see chain_reader).
+local tabs_schedule = {pending = false}
+local tabs_delay = 0.25
+view_handlers['hub.changed'] = function(args)
+  if args.what ~= 'agents' or tabs_schedule.pending then return {} end
+  tabs_schedule.pending = true
+  rex.after(tabs_delay, function()
+    tabs_schedule.pending = false
+    local ok, err = pcall(function()
+      refresh_participants()
+      migrate_aliases()
+      declare_tabs('user')
+    end)
+    -- The next action or agents change declares the tabs again.
+    if not ok then rex.log('messaging: tab declaration after hub.changed failed: ' .. tostring(type(err) == 'table' and err.message or err)) end
+  end)
+  return {}
+end
 local view_args = {type = 'object', properties = {route = {type = 'string'}, user = {type = 'string'}}, required = {'route', 'user'}}
 for name in pairs(view_handlers) do
   actions[#actions + 1] = {name = name, kind = 'client', title = name,
@@ -2479,6 +2499,11 @@ rex.on('client_perform_requested', function(ctx, ev)
       end
       ev = {action = forwarded.action, args = forwarded.args,
         requester = {principal = {kind = 'peer', pid = forwarded.requester_pid}}}
+    end
+    -- hub.changed only schedules work, so it does not pay for the reads below.
+    if ev.action == 'hub.changed' then
+      if not ev.requester or ev.requester.client_id ~= hub_id then fail('refused', 'Only the hub calls view actions') end
+      return view_handlers['hub.changed'](ev.args or {})
     end
     refresh_participants()
     migrate_aliases()
