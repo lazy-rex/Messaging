@@ -2046,8 +2046,9 @@ for _, command in ipairs({{id = 'new_thread', title = 'New Thread…', descripti
 
 -- Spike 3 has one UI user. Each conversation has one tab.
 -- The import runs in steps: each step is one transaction or one page of a check (import.lua).
--- The start runs at most start_steps of them at once, so a done or small import ends before the
--- first call (calls wait in the plugin's queue for that bounded time). A larger import continues in
+-- The start runs steps for at most start_seconds (os.clock: wall time since start in gopher-lua),
+-- so a done or small import ends before the first call (calls wait in the plugin's queue for that
+-- bounded time). A larger import continues in
 -- timer steps; between them the plugin answers calls, and each fails with unavailable until the
 -- import is done. A failed import stops; every call then fails with its error, meta import_error
 -- holds the error, the plugin keeps running, and the next start continues.
@@ -2067,13 +2068,13 @@ local import = require('import')({
   end,
 })
 local import_timer = {}
-local start_steps = 100
-function import_timer.tick(steps)
+local start_seconds = 0.5
+function import_timer.tick(seconds)
   local ok, more
-  for _ = 1, steps or 1 do
+  local stop = os.clock() + (seconds or 0)
+  repeat
     ok, more = pcall(import.step)
-    if not ok or not more then break end
-  end
+  until not ok or not more or os.clock() >= stop
   if not ok then
     imported.error = type(more) == 'table' and tostring(more.code) .. ': ' .. tostring(more.message) or tostring(more)
     print('messaging: the import failed: ' .. imported.error)
@@ -2090,4 +2091,4 @@ function import_timer.tick(steps)
   migrate_aliases()
   declare_tabs(ui_user)
 end
-app.start(function() import_timer.tick(start_steps) end, {tx = false})
+app.start(function() import_timer.tick(start_seconds) end, {tx = false})
