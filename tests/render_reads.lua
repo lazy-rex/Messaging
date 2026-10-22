@@ -34,3 +34,18 @@ test('a render with an alias not yet applied reads, and the refresh applies the 
   local row = wait('the refresh to apply the alias', function() return applied('alice') end)
   expect(row.identity).to_be(alice_id)
 end)
+
+test('a render right after an identity report shows the rows under the old name, then the migrated thread', function()
+  local bob, bob_id = agent('bob'), 'claude:conversation-render-bob'
+  bob:call('messaging.send', {to = 'user', body = 'visible before the identity', key = 'pending-alias'})
+  local v = user:open('thread/bob')
+  expect(#H.node(v:render(), 'history').messages).to_be(1)
+  bob:report({kind = 'claude', conversation_id = 'conversation-render-bob'})
+  -- The hub resolves bob to the identity at once; the rows move only in the refresh.
+  local tree = v:render()
+  expect(#H.node(tree, 'history').messages, 'the render keeps the history under the old name').to_be(1)
+  wait('the refresh to apply the alias', function() return applied('bob') end)
+  wait('the old tab to close', function() return tab('thread/bob') == nil end)
+  local moved = user:view('thread/' .. bob_id):render()
+  expect(H.node(moved, 'history').messages[1].text).to_be('visible before the identity')
+end)

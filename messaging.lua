@@ -62,14 +62,19 @@ local function canonical_thread_id(id)
   return pair and observed_direct_id(pair[1], pair[2]) or canonical(id)
 end
 
+-- pending: in a render, the aliases that the rows do not show yet (render_aliases). A render
+-- treats them as plain agents. Each call starts with none.
+local pending = {names = {}}
 local function refresh_participants()
-  aliases, participants = {}, hub('hub.agents', {all = true}).agents or {}
+  aliases, participants, pending.names = {}, hub('hub.agents', {all = true}).agents or {}, {}
   for _, a in ipairs(participants) do
     if a.alias_of then aliases[a.id] = a.alias_of end
   end
 end
 
 local function resolve_recipient(id)
+  -- The hub resolves a pending alias to its identity already; the rows still use the alias.
+  if pending.names[id] then return id end
   if id == 'team' or (type(id) == 'string' and id:sub(1, 2) == 'g-') then return id end
   local ok, result = pcall(hub, 'hub.agents.resolve', {to = id})
   if ok then return result.id end
@@ -1908,9 +1913,10 @@ local function schedule_refresh()
   end, {tx = false})
 end
 
--- A render reads only (the SDK refuses a write in a render). It uses only the aliases that the
--- rows already show; an alias not yet applied waits for the refresh, which merges the rows and
--- declares the tabs again.
+-- A render reads only (the SDK refuses a write in a render). It shows the rows as they are: an
+-- alias that the rows do not show yet is a plain agent in this render (the roster entry without
+-- alias_of, and no alias). The render schedules the refresh, which merges the rows and declares
+-- the tabs again.
 local function render_aliases()
   local names = {}
   for id in pairs(aliases) do names[#names + 1] = id end
@@ -1920,8 +1926,21 @@ local function render_aliases()
     applied[r.alias] = true
   end
   for _, id in ipairs(names) do
-    if not applied[id] then aliases[id] = nil; schedule_refresh() end
+    if not applied[id] then aliases[id] = nil; pending.names[id] = true end
   end
+  if next(pending.names) == nil then return end
+  local list = {}
+  for i, a in ipairs(participants) do
+    if pending.names[a.id] then
+      local copy = {}
+      for k, v in pairs(a) do copy[k] = v end
+      copy.alias_of = nil
+      a = copy
+    end
+    list[i] = a
+  end
+  participants = list
+  schedule_refresh()
 end
 
 local function handler(fn, declares, render)
