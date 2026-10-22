@@ -1891,10 +1891,47 @@ local actions = {
 -- the committed call: it is logged, and the next change declares the tabs again.
 local ui_user = 'user'
 local plain = {store = false, tx = false}
+
+-- The refresh applies new aliases and declares the tabs, in a timer after the call that asks for
+-- it: an agents change (hub.changed) or a render that sees an alias not yet applied. The schedule
+-- state is a table field, not a captured local (the pcall rule, LazyRex docs/rex-protocol.md).
+local refresh_schedule = {pending = false}
+local refresh_delay = 0.25
+local function schedule_refresh()
+  if refresh_schedule.pending then return end
+  refresh_schedule.pending = true
+  app.after(refresh_delay, function()
+    refresh_schedule.pending = false
+    refresh_participants()
+    migrate_aliases()
+    declare_tabs(ui_user)
+  end, {tx = false})
+end
+
+-- A render reads only (the SDK refuses a write in a render). It uses only the aliases that the
+-- rows already show; an alias not yet applied waits for the refresh, which merges the rows and
+-- declares the tabs again.
+local function render_aliases()
+  local names = {}
+  for id in pairs(aliases) do names[#names + 1] = id end
+  if #names == 0 then return end
+  local applied = {}
+  for _, r in ipairs(rows('SELECT alias FROM aliases_applied WHERE alias IN (SELECT value FROM json_each(?))', json(names))) do
+    applied[r.alias] = true
+  end
+  for _, id in ipairs(names) do
+    if not applied[id] then aliases[id] = nil; schedule_refresh() end
+  end
+end
+
 local function handler(fn, declares, render)
   return function(ctx, args)
-    -- A render reads only: it runs in the SDK's render frame, without a transaction.
-    local result = (render and function(f) return f() end or db.transaction)(function()
+    if render then
+      refresh_participants()
+      render_aliases()
+      return fn(ctx, args)
+    end
+    local result = db.transaction(function()
       notes.marked, notes.list, notes.inside = {}, {}, true
       local ok, out = pcall(function()
         refresh_participants()
@@ -1967,17 +2004,8 @@ end
 -- replies at once; a burst gets one or two declarations. The schedule state is a table field, not
 -- a captured local (the pcall rule, LazyRex docs/rex-protocol.md). The SDK logs a failed declaration; the next
 -- action or agents change declares the tabs again.
-local tabs_schedule = {pending = false}
-local tabs_delay = 0.25
 app.on('hub.changed', function(args)
-  if args.what ~= 'agents' or tabs_schedule.pending then return end
-  tabs_schedule.pending = true
-  app.after(tabs_delay, function()
-    tabs_schedule.pending = false
-    refresh_participants()
-    migrate_aliases()
-    declare_tabs(ui_user)
-  end, {tx = false})
+  if args.what == 'agents' then schedule_refresh() end
 end, {tx = false})
 
 for _, command in ipairs({{id = 'new_thread', title = 'New Thread…', description = 'Start a conversation with agents', keywords = {'message', 'conversation'}, route = '/forms/new-thread', action = 'messaging.thread_create'},
