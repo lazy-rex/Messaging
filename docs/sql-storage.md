@@ -1,77 +1,19 @@
-# Messaging storage on hub.sql (proposed)
+# Messaging storage on the Plugin SDK and hub.sql (proposed)
 
-Status: proposal, revision 2, 2026-10-21. Not implemented. It depends on the `hub.sql` contract,
-which the hub lead writes now. Where this plan needs a `hub.sql` feature, it says "needs H<n>" (see
-"What Messaging needs from hub.sql"). H1-H10 are dependencies, not capabilities that exist. F2
-(docs/f2-unread.md) is cancelled; this plan replaces it.
+Status: proposal, revision 3, 2026-10-22. Not implemented. It targets the Plugin SDK and hub.sql
+**draft 2** (LazyRex `docs/plugin-sdk.md` and `docs/sql.md`, commit 6ea4180), which the
+coordinator made the spec (2026-10-22: code first). Where this plan needs an SDK feature that
+draft 2 does not have, it says "needs G<n>" (see "Gaps in draft 2"). F2 (docs/f2-unread.md) is
+cancelled; this plan replaces it.
 
-Revision 0 (d82d47d): the reviewer's early review asked for eight changes. Revision 1 has: a source
-fence and source-revision records for the import; chunked import of large bodies; a notice version
-for every unread change; rows and the final cursor from one statement; the `team` audience; a
-set-based alias migration (thread and peer keys become columns); a proof that the clock is above
-every issued value; rollback after the cutover is not supported.
+History: revision 0 (d82d47d), 1 (4b7c6c2) and 2 (19838cb) planned against a lower-level hub.sql
+(batches, guards, a plugin outbox). The reviewer's points on them stay in force where they still
+apply; revision 3 keeps their substance and drops the machinery that draft 2 moves into the hub.
+The two points open after revision 2 are closed here: the orphan fence ("States at start") and
+the read selection ("Read").
 
-Revision 1 (4b7c6c2): the reviewer asked for six lifecycle changes. Revision 2 has: start-up
-states read before any key-value access, a guarded fence reset and a two-commit cutover; a clock
-bump for every revision, with an exhaustion error; an outbox timer and terminal-refusal rule; a
-two-step read for oversized rows; staged alias merges; an ack that changes nothing writes nothing.
-Revision 2 is targeted; the next full revision follows the hub contract.
-
-Open for revision 3 (reviewer, on 19838cb):
-
-- The first-fence crash: the key-value fence `{state = 'importing'}` exists, but the SQL `import`
-  row was never committed (an orphan fence). Recover it explicitly, with a defined alias set, and
-  test it. The SQL `done` state takes precedence over any key-value state.
-- The selection query of an oversized read: 1 KiB prefixes do not make `LIMIT` rows fit one reply.
-  Keep byte-aware sizing and reduction for it too. Only `body` and `id` are immutable: the SQL
-  alias migration changes `sender`, `recipient` and the thread columns, so the fill must handle
-  that change (or fence it) and not assume the same bytes.
-
-Hub contract draft 1 (LazyRex docs/sql.md, db1e004, and fa8e1f7), for revision 3. Revision 3
-waits for draft 2, which comes with a prototype:
-
-- Notices: the hub owns the outbox (`hub.sql.batch` `notices: [{agent, pending}]`, applied in
-  commit order). If draft 2 keeps it with a durable receipt, Messaging drops `notice_outbox`, the
-  timer and the notice versions. Until then, the plugin outbox above stays the plan.
-- Every guard stays inside the transaction (`expect_changes`; an assertion as a guarded no-op write
-  or `expect_rows` if the hub adds it). Serial hub calls do not make a read and a later batch
-  atomic (hub reviewers, 2026-10-21); Messaging does not rely on it.
-- The hub `key` is a bounded retry cache for a byte-identical batch. Messaging keeps its own
-  permanent `operations` table: a retried send has a new `at` and possibly a new canonical sender.
-- Rex Lua is Lua 5.1 (hub lead, observed on 0.0.1792158932-g88fd41): integers above 2^53 travel as
-  decimal text. Messaging reads revisions with `CAST(x AS TEXT)` and passes them as `{"int": "..."}`.
-- `hub.sql.query` returns whole rows up to `max_bytes` with `complete = false`, and `too_large`
-  `{row = 0, bytes}` for a first row that does not fit: the read uses both (byte-aware selection,
-  then the two-step fill).
-- Rows with NULL decode in Lua with holes: index rows by column number, never `ipairs`.
-- Ordering of `hub.sql.*` with `hub.store.*` (the import reads key-value and writes SQL) is not in
-  draft 1; the import does not depend on it beyond the fence and the source check.
-- A notice's `pending` must come from the transaction, not from a read before it (reviewer): an ack
-  that computed "no unread" before a send committed would clear the send's wake-up. Two ways:
-  (a) the hub takes the value from a query statement of the batch (proposed: `{agent, pending_from
-  = <statement index>}`, the first cell of that query); (b) Messaging adds a guarded no-op write
-  that proves the precomputed value: `UPDATE clock SET n = n WHERE (EXISTS (SELECT 1 FROM
-  deliveries WHERE agent = ? AND acked = 0)) = ?`, `expect_changes = 1`. (a) is cleaner; (b) works
-  on draft 1 but marks views that depend on `clock`. Plan: (a) if draft 2 has it, else (b).
-- Messaging removes its outbox and timer only after the hub outbox has its full lifecycle: retry of
-  a transient hub.db failure without another call, a durable apply receipt, commit-order replay,
-  order with `hub.store.batch` notices, and a defined rule for unknown, absent and superseded
-  agents (reviewer).
-- After the transport key expires, a retry is not replay-safe on the hub side; Messaging's own
-  `operations` table is what makes its actions safe to retry.
-- `complete = false` with fewer rows than `LIMIT` is a partial page: the read continues from the
-  last returned row, never from `high`.
-- User decision (2026-10-21): the plugin-facing interface is small (exec, query, a transaction
-  helper), through a Lua helper that the hub ships (for example `lazyrex.sql`: rows keyed by column
-  name, NULL as nil, retry keys generated). Messaging's storage layer (commit 1) uses that helper,
-  and the advanced options (`expect_changes`, `notices`, `pending_from`, `{"int"}` tags) where this
-  plan needs them. Open for draft 2: how a plugin loads the helper (today a plugin loads files only
-  from its own directory).
-- Release gates for the Messaging cutover: a stopped (or coordinated) backup of hub.db and the SQL
-  file that keeps the import states, and the hub's replacement linearization proof.
-
-Decision (user, 2026-10-21): each plugin gets its own SQLite database, run by the hub, through hub
-actions. Messaging keeps its current semantics exactly:
+Decision (user, 2026-10-21): each plugin gets its own SQLite database, run by the hub, through the
+Plugin SDK. Messaging keeps its current semantics exactly:
 
 - An agent acknowledges each message on its own (per-ID ack). There is no read watermark.
 - The audience of a message is fixed when it is sent. A later membership change does not change it.
@@ -84,17 +26,63 @@ guarded by its revision. So a send rewrites the whole mailbox of each recipient 
 `groups` record (the live 64628-byte failure, 2026-10-21); a thread needs a chain of segments (F1);
 an unread count reads every unread message (the get storm). In SQL, each of these is a row. The SQL
 text and the parameters of a send do not depend on mailbox, group or thread size. (The row work
-does: a 100-member send writes 100 delivery rows and 100 outbox rows. See "Sizes and costs".)
+does: a 100-member send writes 100 delivery rows. See "Sizes and costs".)
+
+## What draft 2 gives Messaging
+
+From `docs/sql.md` draft 2 (proposed; the hub lead's lab tests prove each row before approval):
+
+- **One transaction per handler** (section 3). It begins at the handler's first SQL call, read or
+  write, and commits when the handler returns; an error rolls it back. "No other write to the
+  plugin's file happens between" a handler's reads and its writes. So Messaging needs no revision
+  guards, no retry loops on conflicts, and no `attempts` bound for storage. A rule that today needs
+  an `if_rev` is a plain read and write inside the handler.
+- **Notices** (section 7): `app.notice(agent, pending)` goes into the hub's outbox in the handler's
+  transaction. Messaging computes `pending` with a query in the same transaction, after its writes,
+  so it is exact. The hub applies notices in commit order, with receipts and timer retries, and
+  keeps a notice for an agent that is absent now. Messaging has no outbox, no timer and no notice
+  version. The first SQL commit with notices moves Messaging's notices to SQL for good
+  (`notices_moved`): that is the cutover commit.
+- **Retries** (section 8): Messaging opts out of the SDK result store (`{store = false}`) and keeps
+  its own permanent `operations` table: its agent keys must replay forever, and its fingerprints
+  are normalized for identity aliases.
+- **Values** (section 4): a NULL is `nil` in a row keyed by column name; an integer above 2^53 is a
+  string. `expect_rows` and `expect_changes` exist for assertions.
+- **Pages** (section 4): a query returns whole rows up to the reply limit and a `more` flag; a
+  first row over the limit is `too_large {row = 0, bytes}`.
+- **Views refresh from tables read** (section 10). Messaging's panels and thread views read
+  `messages` and `deliveries`, so a send re-renders each open Messaging view once (coalesced).
+
+## Gaps in draft 2
+
+Sent to the hub lead and the Tunnels pair on 2026-10-22 (`msg-sdk-d2-gaps`). None blocks the SDK's
+to-do target; each blocks part of the Messaging port.
+
+- **G1 Atomic steps outside a handler.** The start-up work (the alias merge, the import steps, the
+  cutover with its notices) runs outside an action handler, and `{tx = false}` runs each SQL call
+  alone. Each of those steps must commit several statements together. Proposed: an advanced
+  `app.db.transaction(fn)`, with the handler-transaction rules and notices.
+- **G2 Idle limit.** "No call for 5 s" rolls a handler transaction back. A Messaging handler makes
+  non-SQL hub calls (`hub.agents`, `hub.identify`, `hub.ui.tabs`), which took seconds on the live
+  hub under load. Either a non-SQL call counts as activity, or Messaging makes its non-SQL calls
+  before its first SQL call (possible for all but `hub.ui.tabs`, see G3).
+- **G3 After-commit work.** Messaging declares its tabs (`hub.ui.tabs`) from the committed state
+  after each write. Proposed: `app.after_commit(fn)`. Without it, Messaging declares tabs inside
+  the handler, from its own uncommitted writes; a later failure of the commit leaves stale tabs
+  until the next declaration.
+- **G4 Raw hub calls.** The import reads the key-value store (`hub.store.scan`, `get`, `op`) and
+  writes its fence (`hub.store.batch`). Either the SDK exposes `app.hub(action, args)`, or Messaging
+  keeps its own `client.perform` wrapper for these calls.
 
 ## Tables
 
 All IDs are TEXT, as today. Revisions and cursors are INTEGER in SQL and decimal strings in Lua and
 JSON (see "Exact integers").
 
-Thread and peer keys are columns, not today's length-prefixed strings, so an alias migration is a
-set-based UPDATE:
+Thread and peer keys are columns, not today's length-prefixed strings, so an alias merge is
+set-based:
 
-- A **thread** is `(thread_kind, thread_a, thread_b)`. `direct`: the canonical pair, `thread_a <
+- A **thread** is `(thread_kind, thread_a, thread_b)`. `direct`: the canonical pair, `thread_a <=
   thread_b` (a self thread has `thread_a = thread_b`). `group`: `thread_a = ''`, `thread_b` = the
   group ID (`team` or `g-...`).
 - A **peer** (what a viewer sees in its thread list) is `(peer_kind, peer_a, peer_b)`. `agent`:
@@ -104,7 +92,7 @@ set-based UPDATE:
 
 ```sql
 -- One counter for every revision that the plugin gives out: message cursors, draft revisions,
--- set_rev of titles and homes, notice versions. The cutover sets it (see "Migration").
+-- set_rev of titles and homes, gallery revisions. The cutover sets it (see "Migration").
 CREATE TABLE clock (one INTEGER PRIMARY KEY CHECK (one = 1), n INTEGER NOT NULL);
 
 -- Plugin state: import progress, the source fence, the cutover marker.
@@ -122,6 +110,8 @@ CREATE TABLE messages (
   at             TEXT NOT NULL
 );
 CREATE INDEX messages_thread ON messages (thread_kind, thread_a, thread_b, seq);
+CREATE INDEX messages_sender ON messages (sender);
+CREATE INDEX messages_recipient ON messages (recipient);
 
 -- The audience, fixed at send: one row per recipient. acked = 0 is unread.
 CREATE TABLE deliveries (
@@ -156,324 +146,261 @@ CREATE TABLE drafts (viewer TEXT NOT NULL, peer_kind TEXT NOT NULL, peer_a TEXT 
   peer_b TEXT NOT NULL, text TEXT NOT NULL, rev INTEGER NOT NULL,
   PRIMARY KEY (viewer, peer_kind, peer_a, peer_b)) WITHOUT ROWID;
 
--- Idempotent operations: today's hub.store.op records, in the same transaction as their effect.
--- owner is the agent part of the key, so an alias migration can find them (prior_operation).
+-- Idempotent operations: today's hub.store.op records. Written in the handler's transaction.
+-- owner is the agent part of the key, so an alias merge can find them (prior_operation).
 CREATE TABLE operations (key TEXT PRIMARY KEY, owner TEXT NOT NULL, fingerprint TEXT NOT NULL,
   result TEXT NOT NULL);
 
 -- Identity aliases that this database has applied (today: identity-migrated/<alias>).
 CREATE TABLE aliases_applied (alias TEXT PRIMARY KEY, identity TEXT NOT NULL);
 
--- Notice outbox (see "Notices"). version is the clock value of the last unread change.
-CREATE TABLE notice_outbox (agent TEXT PRIMARY KEY, version INTEGER NOT NULL);
-
 -- Gallery state (gallery/state, gallery/history, gallery/draft), as JSON values with a revision.
 CREATE TABLE gallery (key TEXT PRIMARY KEY, value TEXT NOT NULL, rev INTEGER NOT NULL);
 
 -- Import only (see "Migration"): the key and revision of each source record that the import
--- applied, and bodies that arrive in chunks. Dropped by a later cleanup commit.
+-- applied, and bodies that arrive in chunks. Dropped by a later cleanup migration.
 CREATE TABLE import_source (key TEXT PRIMARY KEY, rev TEXT NOT NULL, complete INTEGER NOT NULL);
 CREATE TABLE import_body (key TEXT PRIMARY KEY, body BLOB NOT NULL);
 ```
 
-Schema version: `PRAGMA user_version` (needs H7). Version 1 is this schema. The plugin applies each
-migration in one transaction that also sets the version. Foreign keys: on (needs H7).
+The schema is version 1 of `app.db.migrate`. Foreign keys are on (draft 2 fixes it).
 
 ## Exact integers
 
-Lua numbers lose precision above 2^53. The plugin never passes a revision as a Lua number:
+Lua 5.1 numbers are doubles (observed on Rex 0.0.1792158932-g88fd41, hub lead). The SDK gives an
+integer above 2^53 as a string and a smaller one as a number. Messaging never mixes them:
 
-- In SQL text, a revision parameter is `CAST(? AS INTEGER)` with a decimal string, and a revision
-  result is `CAST(x AS TEXT)`. (Or the typed encoding of H1, if the contract gives one.)
+- A revision result is `CAST(x AS TEXT)` in SQL, so Lua always has a decimal string.
+- A revision parameter is `CAST(? AS INTEGER)` with a decimal string (or the `{"int"}` tag).
 - In Lua, revisions are compared with `later()` (length, then bytes), as today.
-- The clock and seq are SQLite INTEGER (64-bit). A key-value revision above 2^63 - 1 stops the
-  import with `migration_conflict` (not observed; today's live revisions are about 10^5).
+- The clock and `seq` are SQLite INTEGER (64-bit). "Bump" is an `expect_changes = 1` update
+  `UPDATE clock SET n = n + 1 WHERE n < 9223372036854775807`; 0 changes is `clock_exhausted` (an
+  increment past 2^63 - 1 would make the value REAL). A key-value revision above 2^63 - 1 stops the
+  import with `migration_conflict` (not observed; live revisions are about 10^5).
 
-## Operations
+## Actions
 
-Each operation is one `hub.sql.batch` (one transaction). "Bump" is an assertion `SELECT 1 FROM
-clock WHERE n < 9223372036854775807` (expected 1 row, else the batch fails with `clock_exhausted`;
-an increment past 2^63 - 1 would make the value REAL), then `UPDATE clock SET n = n + 1`. A later
-statement of the same batch uses `(SELECT n FROM clock)` as "clock".
+Every action is an SDK handler with `{store = false}`: one transaction, its own operation rules.
+"Bump" (above) gives the next revision; a later statement uses `(SELECT n FROM clock)` as "clock".
+**Every write that gives out a revision bumps the clock**: a message `seq`, a draft `rev`, a title
+or home `set_rev`, a gallery `rev`. So two writes never share a revision.
 
-**Every batch that gives out a new revision bumps the clock** and uses the new value: a message
-`seq`, a draft `rev`, a title or home `set_rev`, a gallery `rev`, a notice version. So two writes
-never share a revision, and an `UPDATE ... WHERE rev = <base>` fails for the second of two saves
-from one base, even with no message between them. A guarded statement has
-an expected change count; a different count rolls the whole batch back with `conflict` and the
-statement index (needs H2). An **assertion** is a query with an expected row count (needs H2). On
-`conflict` the plugin reads again and retries, at most `attempts` times, as today.
+Each action that changes an agent's unread state ends with, for each such agent, `app.notice(agent,
+pending)` where `pending` is `EXISTS (SELECT 1 FROM deliveries WHERE agent = ? AND acked = 0)`,
+queried in the same transaction after the writes. An action that changes nothing sends no notice.
 
-**Every batch that changes unread state** (a delivery insert, an ack, a union) bumps the clock and
-writes `notice_outbox(agent, clock)` for each agent whose unread state it can change (see
-"Notices"). So two such batches never share a version.
+### Operation keys
+
+Keys and fingerprints stay exactly as today (`send/`, `thread-create/`, `members/`,
+`thread-archive/`, `rename/`, `thread-move/`, `draft/`, `gallery-*`), and so does
+`normalized_fingerprint`. A handler first looks the key up (`operations` for the identity and its
+aliases; then the read-only key-value fallback, see "Old operation keys"). A hit replays the saved
+result, or fails with today's conflict code on another fingerprint. A miss runs the action and
+inserts the `operations` row in the same transaction. So a lost reply after the commit replays, and
+a retry never sends twice and never sets an acked delivery to unread.
 
 ### Send (`messaging.send`, view send, member notice)
 
-1. Validation in Lua, as today: arguments, limits, the operation key (`operations`, then the
-   fallback), `resolve_recipient`, and the reply target. `reply_to` keeps today's whole rule: the
-   message exists, it is addressed to the agent (a delivery row for the agent), and it is from the
-   recipient or in the same group (`message.from == to`, or `to` is a group and `message.to ==
-   to`). A delivery row alone does not validate it.
-2. The batch: bump; insert the message (`seq` = clock); insert the deliveries; clear the reply
-   target (`UPDATE deliveries SET acked = 1 WHERE agent = sender AND seq = <reply_to seq>`, no
-   expected count: an acked or absent row is not an error, as today); insert the operation; write
-   the outbox for the recipients and, with reply_to, the sender.
+1. Validation in Lua, as today: arguments, limits, the operation key, `resolve_recipient`, and the
+   reply target. `reply_to` keeps today's whole rule: the message exists, it is addressed to the
+   agent (a delivery row for the agent), and it is from the recipient or in the same group
+   (`message.from == to`, or `to` is a group and `message.to == to`).
+2. In the same transaction: bump; insert the message (`seq` = clock); insert the deliveries; clear
+   the reply target (`UPDATE deliveries SET acked = 1 WHERE agent = sender AND seq = <reply_to
+   seq>`; an acked or absent row is not an error, as today); insert the operation; notices for the
+   recipients (pending is true) and, with `reply_to`, the sender (queried).
 3. The audience, by recipient kind:
    - **Direct**: one delivery for `to` (also when `to` is the sender: today's self mailbox).
-   - **Created group**: the message insert is `INSERT ... SELECT ... WHERE EXISTS (SELECT 1 FROM
-     group_members WHERE gid = ? AND agent = sender AND current = 1)`, expected 1 (a refused
-     sender changes nothing). The deliveries are `INSERT INTO deliveries SELECT agent, clock, 0 FROM
-     group_members WHERE gid = ? AND current = 1 AND agent <> sender`. The audience and the
-     membership check read the same transaction, so a membership change cannot fall between them.
+   - **Created group**: the sender must be a current member (a query; else `refused`, as today).
+     The deliveries are `INSERT INTO deliveries SELECT agent, clock, 0 FROM group_members WHERE gid
+     = ? AND current = 1 AND agent <> sender`.
    - **team**: the members are the live roster (`hub.agents`), as today; the hub owns it, so it is
-     not in this database. The plugin reads the roster in the same action (`refresh_participants`),
-     checks that the sender is in it, and passes the other members as one JSON array parameter:
-     `INSERT INTO deliveries SELECT value, clock, 0 FROM json_each(?)`. This is today's rule: today's
-     team send guards no record either. A roster change between the read and the commit gives the
-     audience that the read saw, as today.
-   - **User join** (view send to an observed group): the same batch inserts the user's
-     `group_members` row (`current = 1`, next `pos`) before the deliveries. No backfill.
-4. `messages.recipients` today is the audience list. It is now the delivery rows of the message.
+     not in this database. The plugin reads the roster in the same action (before the first SQL
+     call, G2), checks that the sender is in it, and passes the other members as one JSON array:
+     `INSERT INTO deliveries SELECT value, clock, 0 FROM json_each(?)`. This is today's rule: a
+     roster change between the read and the commit gives the audience that the read saw.
+   - **User join** (view send to an observed group): insert the user's `group_members` row
+     (`current = 1`, next `pos`) before the deliveries. No backfill.
+4. View send also clears the draft: the draft's `rev` must equal the request's `draft_revision`,
+   else `draft_conflict`; then `text = ''` and `rev` = clock.
 
 ### Read (`messaging.read`)
 
-One read action is **one SQL statement**, so its rows and its final cursor are one snapshot:
+The read handler's transaction is one snapshot (draft 2, section 3), so every query of one read sees
+the same state, and nothing (no send, no ack, no alias merge) changes it between them.
 
-```sql
-SELECT CAST(m.seq AS TEXT), m.id, m.sender, m.recipient, m.body, m.reply_to, m.reply_expected, m.at,
-       CAST(c.n AS TEXT) AS high
-FROM clock c LEFT JOIN (
-  SELECT m.* FROM deliveries d JOIN messages m ON m.seq = d.seq
-  WHERE d.agent = ? AND d.acked = 0 AND d.seq > CAST(? AS INTEGER) [AND thread = ?]
-  ORDER BY d.seq LIMIT ?) m
-ORDER BY m.seq;
-```
-
-- The plugin fits the rows into the 48 KiB agent reply, as today (`fit_page`, `shrink`).
-- `next_cursor`: if the statement returned fewer than `LIMIT` rows and they all fit the page, it is
-  `high` (the clock of the same snapshot). Else it is the cursor of the last item on the page.
-- Why it is safe: every message committed after the snapshot has `seq` > `high`. A separate clock
-  query could return a clock above a message that the rows query did not see; this plan has none.
-- This needs H4 to return one statement's result from one snapshot, inside one reply, or a typed
-  error. If the result does not fit, the plugin repeats with a smaller `LIMIT` (at least 1).
-- **Oversized rows.** The statement above fails before it returns any row if one row is larger
-  than a hub.sql reply. So the read has two steps:
-  1. **Selection** (one statement, the snapshot of the read): the same query, but with bounded
-     columns only: `seq`, `high`, and for each text column its byte length
-     (`length(CAST(x AS BLOB))`) and a prefix `substr(CAST(x AS BLOB), 1, 1024)`. This result is
-     small for every row, so it fits one reply for `LIMIT` rows.
-  2. **Fill**: for each selected row whose full size fits the agent page, the plugin reads its
-     columns by `seq` (messages are immutable, so a later statement returns the same bytes). For a
-     row that does not fit, it reads only the bytes that the page needs (`substr` on the BLOB cast,
-     so offsets are bytes, not characters; the cut is made UTF-8-safe in Lua with `utf8_cut`).
-  - The page and its continuation come from the selection: `next_cursor` is `high` of the
-    selection, or the last item's `seq`. A concurrent ack between the steps does not remove a
-    selected message from this page (the fill reads `messages`, not `deliveries`); the next read
-    does not return it again. A selected message is never dropped or skipped.
-  - Today's markers stay: a body too large gives a prefix with `truncated` and `body_bytes`;
-    metadata too large gives `metadata_too_large` and `bytes`; an ID too large gives `id_prefix`
-    and `id_bytes` (`shrink`, unchanged). The byte lengths come from the selection.
-- A concurrent ack removes rows from later reads, as today. An alias migration changes `agent`
-  but not `seq`, so a cursor stays valid.
+- **Selection**: `SELECT CAST(m.seq AS TEXT) AS seq, length(CAST(m.id AS BLOB)) AS id_bytes,
+  length(CAST(m.body AS BLOB)) AS body_bytes, length(...) of the other text columns, (SELECT
+  CAST(n AS TEXT) FROM clock) AS high FROM deliveries d JOIN messages m ... WHERE d.agent = ? AND
+  d.acked = 0 AND d.seq > CAST(? AS INTEGER) [AND thread = ?] ORDER BY d.seq LIMIT ?`. Each row is
+  a few numbers, so the selection is small; the SDK still sizes it by bytes and returns `more` when
+  the rows do not all fit. `LIMIT` is the number of messages that one agent page can hold at most
+  (a page is 48 KiB and an item is at least the smallest marker).
+- **Fill**: for the selected rows, in order, the plugin reads the columns of each message by `seq`
+  in the same transaction (several per query while they fit one reply). For a message whose full
+  item does not fit the agent page, it reads only the bytes that the page needs (`substr` on the
+  BLOB cast, so offsets are bytes; the cut is made UTF-8-safe with `utf8_cut`). Today's markers
+  stay: a body prefix with `truncated` and `body_bytes`; `metadata_too_large` and `bytes`;
+  `id_prefix` and `id_bytes` (`shrink`, unchanged). The byte lengths come from the selection.
+- **Continuation**: `next_cursor` is `high` only if the selection was complete (no `more`, fewer rows
+  than `LIMIT`) and every selected message is on the page. Else it is the `seq` of the last item on
+  the page. A message committed after the snapshot has `seq` > `high`, so it is never skipped.
 
 ### Other actions
 
-| Action | hub.sql |
+| Action | In the handler's transaction |
 | --- | --- |
-| `messaging.ack` | Validate the whole request first, in Lua, as today: the argument shape, then each ID has a delivery row for the agent (today's `addressed`), else `refused` and no effect. An empty list, or a list with no unread delivery (one query), is a no-op: no batch, no bump, no notice (send.lua tests that an ack writes nothing then). Else the batch: bump; `UPDATE deliveries SET acked = 1 WHERE agent = ? AND acked = 0 AND seq IN (SELECT seq FROM messages WHERE id IN (SELECT value FROM json_each(?)))` (needs H6), expected at least 1, else `conflict` and a new read (a concurrent ack: then the no-op); outbox. No statement sets `acked = 0`. |
-| `view.seen` | The same no-op rule. Else the batch: bump; one `UPDATE deliveries SET acked = 1` with today's filter (group: `recipient = peer`; direct: `recipient = user AND sender = peer`); outbox. The reply `acked` is its change count (needs H2). |
-| `messaging.history` | `SELECT ... WHERE thread = ? AND seq < CAST(? AS INTEGER) ORDER BY seq DESC LIMIT ?`, one statement, fitted as today. Group history needs current membership (team: the roster). |
+| `messaging.ack` | Validate the whole request first, as today: the argument shape, then each ID has a delivery row for the agent (today's `addressed`), else `refused` and no effect. If no ID is unread: nothing more (no write, no notice; send.lua tests this). Else `UPDATE deliveries SET acked = 1 WHERE agent = ? AND acked = 0 AND seq IN (SELECT seq FROM messages WHERE id IN (SELECT value FROM json_each(?)))`, and the agent's notice. No statement sets `acked = 0`. |
+| `view.seen` | The same no-op rule. Else one `UPDATE deliveries SET acked = 1` with today's filter (group: `recipient = peer`; direct: `recipient = user AND sender = peer`) and the notice. The reply `acked` is its change count. |
+| `messaging.history` | `SELECT ... WHERE thread = ? AND seq < CAST(? AS INTEGER) ORDER BY seq DESC LIMIT ?`, fitted as today. Group history needs current membership (team: the roster). |
 | unread counts, tabs, thread list | `GROUP BY` over the agent's unread deliveries; homes, titles, opened, archived: one query each. |
-| `thread_members` | Batch: update `group_members` (current, pos); insert the member notice and its deliveries (`added` only); bump and outbox. No backfill (every message has its rows). |
-| draft save | Bump; `UPDATE drafts SET text = ?, rev = clock ... WHERE rev = CAST(? AS INTEGER)` expected 1, or `INSERT` (expected 1, no conflict) when the base is `0`. The operation result gets the new revision with `json_set(?, '$.draft_revision', CAST((SELECT n FROM clock) AS TEXT))`. |
-| view send | Send, plus the draft clear: `UPDATE drafts SET text = '', rev = clock ... WHERE rev = ?` expected 1, else `draft_conflict`. |
-| create, archive, rename, move | One row each + the operation row, in one batch. A title or a home gets `set_rev` = clock after a bump. |
+| `thread_members` | Update `group_members` (current, pos); insert the member notice message and its deliveries (`added` only, bump); notices for `added`. No backfill (every message has its rows). |
+| draft save | The draft's `rev` must equal `base_revision` (absent = `0`), else `draft_conflict`; bump; write `text` and `rev` = clock. The result has `draft_revision` = clock. Two saves from one base: the second fails, even with no message between them. |
+| create, archive, rename, move | One row each + the operation row. A title or a home gets `set_rev` = clock after a bump. |
+| gallery | Its three rows, with a bump for each new revision. |
 
-Operation keys and fingerprints stay exactly as today, and so does `normalized_fingerprint`.
+### Tabs
 
-### Lost replies
-
-A `hub.sql.batch` whose reply is lost has an unknown outcome. The plugin ends the action with
-`unavailable`. The agent retries with the same key; the retry finds the `operations` row (the batch
-committed) or does not (it did not commit). The operation row commits with its effect, so a replay
-never sends twice and never sets an acked delivery to unread. `messaging.ack` and `view.seen` have
-no key: setting `acked = 1` again is the same state. Needs H3: a batch commits completely or not at
-all, and a timeout never leaves it half-applied or still running.
-
-## Notices
-
-Today the `notify` op is inside the key-value batch. The SQL file is separate from the hub's
-notices, so this plan makes no claim of atomicity across them. It uses an outbox:
-
-1. Each batch that changes an agent's unread state writes `notice_outbox(agent, version = clock)`.
-2. After the commit, the plugin flushes the outbox: one statement reads, for a page of rows,
-   `agent, version, EXISTS (unread delivery) AS pending` (one snapshot). For each row it calls the
-   hub notice with `pending` and `version`, and then deletes the row `WHERE agent = ? AND version =
-   ?`. A newer change has a higher version, so its row stays and is flushed again.
-3. Stale clear: the hub notice must ignore a version lower than the last one it applied for that
-   agent (needs H5). Without H5, two flushes (two actions of one instance, or an old and a new
-   instance) can apply `false` after a newer `true`. This plan does not claim that one instance
-   flushes serially; it depends on H5, and on H8 for the old instance.
-4. **Retry without traffic.** A flush runs after each committed batch, and also from a timer
-   (`rex.every`; observed in the reviewer lab, 2026-10-20, docs/rex-protocol.md "Plugin timers"),
-   so a failed notice is retried even if nobody acts. The timer is armed at start; it flushes only
-   when the outbox has rows, with a backoff from 1 s to 60 s per failing agent (kept in Lua; reset
-   after a success). Rex runs handlers one at a time, so a timer flush and an action flush do not
-   run at the same time in one instance; the version guard (H5) covers the rest. The start-up
-   flush is paged and runs after the plugin starts to serve calls. A failed flush never stops the
-   plugin.
-   - A transient error: the row stays; the timer tries again.
-   - The hub refuses the agent: the row is deleted only if the agent is an alias (`alias_of` in
-     `hub.agents`, immutable). An alias's unread state moves to its identity in the alias
-     migration, which writes the identity's outbox row. Any other refusal (an agent that is absent
-     now and can come back) keeps the row: the timer retries it with the longest backoff, and a
-     roster change (`hub.changed agents`) retries it at once.
-5. A batch of 100 recipients makes 100 outbox rows, so 100 notice calls. A batched notice call
-   (a list of `{agent, pending, version}`) is proposed for H5.
-
-Render: the plugin declares its tabs after the commit, from committed rows, as today. A
-rolled-back batch declares nothing.
+Messaging declares its tabs (`hub.ui.tabs`) after each action that writes, as today. With G3, from
+`app.after_commit`; without it, at the end of the handler, from the handler's own state.
 
 ## Identity aliases
 
-One batch for each alias, with set-based statements only: the SQL text is constant per alias, and
-several aliases are several batches, in sorted order (one alias per batch keeps the request bounded;
-each batch is atomic and leaves a valid state). The row work is bounded by the hub's statement time
-limit (H2/H3).
+Today `migrate_aliases` rewrites eight key families and merges thread chains. On SQL it is one
+transaction for each alias (G1), in sorted order, at the start of each action as today (it runs
+only when a new alias exists). The SQL text is constant per alias; the row work is bounded by the
+5 s statement limit (the sender and recipient indexes keep it short).
 
-**Order inside the batch.** A direct `UPDATE` of a key column fails on the first collision with an
-existing key, before any `ON CONFLICT` clause can apply. So each keyed table is merged in three
-steps, never with an `UPDATE` of its key:
+**Order.** A direct `UPDATE` of a key column fails on the first collision with an existing key,
+before any `ON CONFLICT` clause can apply. So each keyed table is merged in two steps, never with an
+`UPDATE` of its key:
 
 1. Stage: `INSERT INTO <table> (<target key>, <values>) SELECT <canonical key>, <values> FROM
    <table> WHERE <key names x> ON CONFLICT (<key>) DO UPDATE SET <the winner rule>`. The canonical
-   key is computed in the SELECT: `y` for `x` in each column, and a pair sorted with
-   `min(a', b')`, `max(a', b')`. If several source rows map to one target, SQLite applies them
-   one at a time, and the winner rule decides each one, so the result does not depend on the order.
-2. Delete the source rows: `DELETE FROM <table> WHERE <key names x>`. (A source row whose key does
-   not change has no `x` in it, so it is not deleted.)
-3. `messages` has no keyed thread columns, so it is a plain `UPDATE` (no collision is possible).
+   key is computed in the SELECT: `y` for `x` in each column, and a pair sorted with `min(a', b')`,
+   `max(a', b')`. If several source rows map to one target, SQLite applies them one at a time, and
+   the winner rule decides each one, so the result does not depend on the order.
+2. Delete the source rows: `DELETE FROM <table> WHERE <key names x>`.
 
-For each alias `x` of identity `y` (SQL parameters):
+For each alias `x` of identity `y`:
 
-- `messages`: `UPDATE ... SET sender = y WHERE sender = x`; the same for `recipient`.
-- Threads in `messages`: `UPDATE` the pair to `min(a', b'), max(a', b')` where `a' = (CASE a WHEN
-  x THEN y ELSE a END)` (the same for `b'`), `WHERE thread_kind = 'direct' AND (thread_a = x OR
-  thread_b = x)`. One statement; SQLite reads the old row for every expression.
-- `thread_homes`: stage and delete. The winner rule is today's: a `moved` row with the newest
-  `set_rev` wins; else the row with the oldest `set_rev` wins. `set_rev` moves with the value.
-- Peers (titles, opened, archived, drafts): stage and delete, with the canonical `viewer`,
-  `peer_a`, `peer_b` (an `agent` peer, and an `observed` pair re-sorted). Titles: the newest
-  `set_rev` wins. Opened and archived: the union (`DO NOTHING`). Drafts: first an assertion,
-  expected 0 rows: two rows that map to one target, both with non-empty text, and different text;
-  a row means `migration_conflict`, and the batch rolls back (today's rule). Else the non-empty
-  text wins (with its `rev`).
-- `deliveries`: stage and delete. `INSERT INTO deliveries SELECT y, seq, acked FROM deliveries
-  WHERE agent = x ON CONFLICT (agent, seq) DO UPDATE SET acked = min(acked, excluded.acked)`, then
-  delete the `x` rows. A message unread under either name stays unread (today: the mailbox union).
-- `group_members`: stage and delete: one row for `y`, `pos` = the lower one (today keeps the first
-  occurrence), `current` = the higher one. Past members are canonical too.
-- `operations.owner` stays: `prior_operation` searches the owners of the identity and its aliases,
-  as today, in `operations` and then in the key-value fallback.
-- `aliases_applied (x, y)`; bump; outbox rows for `x` and `y`.
+- `messages` (no keyed columns, so plain updates): `sender`, `recipient`, and the thread pair, set
+  to `min(a', b'), max(a', b')` where `a' = (CASE a WHEN x THEN y ELSE a END)`.
+- `thread_homes`: the winner is today's: a `moved` row with the newest `set_rev`; else the row with
+  the oldest `set_rev`. `set_rev` moves with the value.
+- Titles: the newest `set_rev` wins. Opened and archived: the union (`DO NOTHING`). Drafts: first an
+  assertion (`expect_rows = 0`): two rows that map to one target, both with non-empty text, and
+  different text; a row means `migration_conflict` (today's rule). Else the non-empty text wins
+  (with its `rev`). Peers include the `observed` pairs, re-sorted.
+- `deliveries`: `INSERT INTO deliveries SELECT y, seq, acked FROM deliveries WHERE agent = x ON
+  CONFLICT (agent, seq) DO UPDATE SET acked = min(acked, excluded.acked)`, then delete the `x` rows.
+  A message unread under either name stays unread (today: the mailbox union).
+- `group_members`: one row for `y`, `pos` = the lower one (today keeps the first occurrence),
+  `current` = the higher one. Past members are canonical too.
+- `operations.owner` stays: `prior_operation` searches the owners of the identity and its aliases.
+- `aliases_applied (x, y)`; notices for `x` (false) and `y` (queried).
 
-A batch fails as a whole; the next call runs it again. Today's `identity-migrate/` operation key
-is not needed: `aliases_applied` commits in the same batch.
+A transaction fails as a whole; the next action runs it again.
 
 ## Migration from the key-value store (one time)
 
 ### States at start
 
-The plugin reads its state **before** it touches the key-value store. The state comes from two
-records: the SQL `meta` row `import` and the key-value fence record `sql-import` (below).
+The plugin reads the SQL state **first**. If SQL says `done`, it does not read the key-value state
+at all (only the read-only operation fallback stays). Else the state comes from the SQL `meta` row
+`import` and the key-value fence record `sql-import`:
 
-| State | How the plugin knows | What it does at start |
-| --- | --- | --- |
-| fresh | no SQL `import` row, no fence | `refresh_participants`; today's key-value `migrate_aliases` (unchanged code), so the source is canonical; write the fence (f0); save `{state = importing, f0, aliases = A0}` in SQL; import. |
-| importing | SQL `importing` | Source check (below). Unchanged: continue from the progress. Changed: reset. No key-value `migrate_aliases` (it would change the source). |
-| verified | SQL `verified` | Source check again; then write the cutover fence (f1, below). |
-| fence written | fence `{state = 'cutover'}`, SQL not `done` | f1 = the fence record's own revision (read it; it is not lost in a crash). Source check against f1 (every source revision below f1, equal to `import_source`); then the SQL `done` batch. |
-| done | SQL `done` | SQL only. No key-value access, except the read-only operation fallback. A key-value alias limit or a stale key-value record cannot block a start. |
+| State | SQL `import` | Fence | What the plugin does at start |
+| --- | --- | --- | --- |
+| fresh | absent | absent | `refresh_participants`; today's key-value `migrate_aliases` (unchanged code), so the source is canonical; write the fence (`if_rev = 0`), f0 = its revision; one transaction: `{state = importing, f0, aliases = A0}`; import. |
+| orphan fence | absent | `importing` | A crash after the fence write and before the SQL row. Like fresh, but the fence write is a rewrite with `if_rev` = its current revision; its new revision is f0, and A0 is the alias set read now. Today's `migrate_aliases` may run first (no SQL row exists yet, so nothing depends on an older source). |
+| importing | `importing` | `importing` | Source check (below). Unchanged: continue from the progress. Changed: reset. No key-value `migrate_aliases` (it would change the source). |
+| verified | `verified` | `importing` | Source check again; then the cutover. |
+| fence written | `verified` | `cutover` | A crash between the two cutover commits. f1 = the fence record's own revision (read it). Source check against f1; then the SQL cutover transaction. |
+| done | `done` | any | SQL only. A stale key-value record or alias state cannot block a start. |
+
+Any other combination (for example SQL `importing` with no fence) stops the start with
+`migration_conflict`: it means that someone changed one store by hand.
 
 - A0 is the alias set at the fence. The import canonicalizes with A0 only. An alias that appears
   during the import is not applied to the source: its records import under the old name, and the
-  SQL alias migration merges them after `done` (it has no `aliases_applied` row).
+  SQL alias merge applies it after `done` (it has no `aliases_applied` row).
 - A key that is not canonical under A0, or two source records with one canonical key, stops the
   import with `migration_conflict` and the keys.
-- Reset (the source changed): first the plugin rewrites the fence with `if_rev` = the fence's
-  current revision (never `if_rev = 0` against an existing record); its new revision is the new
-  f0. Then one SQL batch deletes every imported row and sets `{state = importing, f0 = new f0,
-  progress = start}`. A crash between the two leaves SQL with the old f0 and the old rows; the
-  next start finds the same change and resets again. The fence is not a source record, so its
-  rewrite alone never counts as a change.
-- After `done`, new aliases go through the SQL alias migration.
+- Reset (the source changed): first the plugin rewrites the fence with `if_rev` = its current
+  revision (never `if_rev = 0` against an existing record); its new revision is the new f0. Then one
+  transaction deletes every imported row and sets `{state = importing, f0 = new f0, progress =
+  start}`. A crash between the two leaves SQL with the old f0 and the old rows; the next start finds
+  the same change and resets again. The fence is not a source record, so its rewrite alone never
+  counts as a change.
 
 ### The source fence
 
 The key-value store gives each written record a revision from one global counter (hub store.go,
 `nextRev`). The import uses that:
 
-- **Fence**: at the first import step, the plugin writes the key-value record `sql-import` `{state
-  = 'importing'}` (if_rev `0`) and saves its revision `f0` in `meta`. Every key-value write after it
-  has a revision above `f0`.
-- Messaging code from this release onward refuses to write messaging families while `sql-import`
-  exists (it reads SQL instead). An older release does not know the fence; a rollback to it during
-  the import is the case the next point detects.
+- **Fence**: the key-value record `sql-import`. Every key-value write after the fence has a revision
+  above f0.
+- Messaging code from this release onward never writes the messaging key-value families: before
+  `done` it does not serve actions (the import runs first), and after `done` it uses SQL only. An
+  older release does not know the fence; a rollback to it during the import is what the source
+  check detects.
 - **Source records**: each imported key-value record adds `import_source (key, rev, complete)` in
-  the same batch as its rows.
+  the same transaction as its rows.
 - **Resume**: before it continues, the import checks that the source did not change: every
-  `import_source` row still has its revision and no family record has a revision above `f0`. A
-  change (an old release wrote, or a record was deleted) is a reset (see "States at start"). A
-  deleted record that the import has not reached yet is found by the verification. `INSERT OR IGNORE` is not used: every insert is a plain insert, so a duplicate
-  is an error, never a silent "equal".
+  `import_source` row still has its revision, and no family record has a revision above f0. A change
+  (an old release wrote, or a record was deleted) is a reset. A deleted record that the import has
+  not reached yet is found by the verification. Every insert is a plain insert, so a duplicate is an
+  error, never a silent "equal".
 - **Verification** (before the cutover) is a full scan of the families: the set of keys and
-  revisions equals `import_source`, and every revision is at or below `f0`. Then the content checks
+  revisions equals `import_source`, and every revision is at or below f0. Then the content checks
   below.
 
 ### Import steps
 
-Each step is one batch: its rows, its `import_source` rows, and the progress `{family, after}` in
-`meta`. A crash continues from the progress, after the resume check.
+The import runs in `{tx = false}` code (G1, G4). Each step is one transaction: its rows, its
+`import_source` rows, and the progress `{family, after}` in `meta`. A crash continues from the
+progress, after the resume check.
 
 - `message/` -> `messages`, `seq` = the record revision, sender and recipient canonical, the thread
   columns from today's `thread_key(from, to)`.
-  - **Large records**: a record that is larger than one hub.sql request is imported in chunks: the
-    body goes into `import_body` in parts (UTF-8-safe cuts, one part per batch), each batch checks
-    the stored length first (`length(body) = ?`, expected 1) and moves the progress to `{key,
-    offset}`; the last batch moves the row into `messages` and sets `complete = 1`. A resumed
-    import continues at `offset`. A record that the hub cannot return at all (`record_too_large`
-    today) stops the import with `migration_conflict` and the key; the source stays as it is, and
-    nothing is truncated or dropped.
+  - **Large records**: a record that is larger than one request is imported in chunks: the body goes
+    into `import_body` in parts (UTF-8-safe cuts, one part per transaction); each step checks the
+    stored length first (`length(body) = ?`, `expect_rows = 1`) and moves the progress to `{key,
+    offset}`; the last step moves the row into `messages` and sets `complete = 1`. A resumed import
+    continues at `offset`. A record that the hub cannot return at all (`record_too_large` today)
+    stops the import with `migration_conflict` and the key; the source stays as it is, and nothing
+    is truncated or dropped.
 - The audience -> `deliveries` (`acked = 1` at first): the message's `recipients`, else
   `delivery/<id>`, else today's fallback (the current members of the group, or the roster for
-  `team`, without the sender). The fallback is evaluated once, at the import; today it is
-  evaluated at each read, and a membership change snapshots it first. So it differs only for a
-  legacy `team` message whose roster changes after the import. README states it.
+  `team`, without the sender). The fallback is evaluated once, at the import; today it is evaluated
+  at each read, and a membership change snapshots it first. So it differs only for a legacy `team`
+  message whose roster changes after the import. README states it.
 - `mailbox/<agent>` -> `acked = 0` for each ID. An ID without a message or without a delivery row
   for the agent stops the import with `migration_conflict` (today it is `internal` at read time).
 - `groups` -> `groups`, `group_members` (members in order, then `past_members` not in members,
   `current = 0`).
-- `thread-meta/` -> `thread_homes`; `thread-title/`, `thread-open/`, `thread-archive/` (one row
-  per ID), `draft/` -> their tables. `set_rev` = the stored `set_rev`, else the record revision.
-  A draft record with empty text is a row with empty text and its revision; a missing draft is no
-  row (rev `0`), as today.
+- `thread-meta/` -> `thread_homes`; `thread-title/`, `thread-open/`, `thread-archive/` (one row per
+  ID), `draft/` -> their tables. `set_rev` = the stored `set_rev`, else the record revision. A draft
+  record with empty text is a row with empty text and its revision; a missing draft is no row (rev
+  `0`), as today.
 - `identity-migrated/` -> `aliases_applied`. `gallery/*` -> `gallery`.
 - `thread/`, `thread-seg/`: not imported (derived); used in the verification.
 - `thread-page/`: not imported. No code reads it today (only the alias migration lists it).
 
 ### Verification (before the cutover)
 
-After the source check above:
+After the source check:
 
-- each thread chain (tail and segments, in order) equals `SELECT id ... WHERE thread = ... ORDER
-  BY seq`;
+- each thread chain (tail and segments, in order) equals `SELECT id ... WHERE thread = ... ORDER BY
+  seq`;
 - for each message, the delivery rows equal its audience (recipients, delivery snapshot, or
   fallback);
 - for each agent, the unread deliveries equal its mailbox, and every other delivery is acked. So a
   message that was acked stays acked.
 
-A mismatch stops the start with `migration_conflict` and the key; nothing is cut over.
+A mismatch stops the start with `migration_conflict` and the key; nothing is cut over. Success sets
+SQL `import = verified`.
 
 ### Cutover
 
@@ -482,69 +409,41 @@ Two commits in two stores, in this order. A crash between them is the state "fen
 1. **Key-value**: the plugin rewrites the fence record (`sql-import` `{state = 'cutover'}`,
    `if_rev` = its revision). Its new revision is f1. Every value that Messaging gave out before
    (read `next_cursor` = a mailbox or message revision, history `before`/`next_before` = message
-   revisions, `draft_revision`, `set_rev`) is a key-value revision that the global counter gave
-   out before f1. So every one is below f1.
-2. **SQL**, one batch: `clock.n = f1`; the meta row `import = done`; outbox rows for every agent
-   with an unread delivery.
+   revisions, `draft_revision`, `set_rev`) is a key-value revision that the global counter gave out
+   before f1. So every one is below f1.
+2. **SQL**, one transaction (G1): `clock.n = f1`; `import = done`; a notice for every agent with an
+   unread delivery (queried). This is Messaging's first SQL commit with notices, so the hub moves
+   Messaging's notices to SQL here (`notices_moved`, draft 2 section 7).
 
-After step 2 the plugin reads and writes SQL only. The fence record stays, so a later start of
-this release never writes the key-value families.
+After step 2 the plugin reads and writes SQL only. The fence record stays.
 
 ### Old operation keys
 
 `hub.store.op` cannot list its records, so they are not imported. A lookup that misses in
-`operations` falls back to `hub.store.op` (read only), for the identity and its aliases (today's
+`operations` falls back to `hub.store.op` (read only, G4), for the identity and its aliases (today's
 `prior_operation`), so a retry from before the cutover replays its first result.
 
 ### Rollback and backup
 
-- **Rollback to a key-value release after the cutover is not supported.** The key-value records
-  stay as they were at the cutover. A release that reads them does not see new messages, and it
-  shows acked messages as unread again. A rollback needs an explicit recovery decision (an export
-  from SQL back to key-value is not in this plan).
-- A rollback during the import (before the cutover) is safe: the key-value records are the source
-  of truth, and the next import start detects the change and starts again.
-- Backup: the hub's backup path must include the SQL file (H9). Keep the key-value backup from the
-  cutover. After the cutover, the SQL file is the source of truth.
+- **Rollback to a key-value release after the cutover is not supported.** The key-value records stay
+  as they were at the cutover. A release that reads them does not see new messages, and it shows
+  acked messages as unread again; its notices are refused (`notices_moved`). A rollback needs an
+  explicit recovery decision (an export from SQL back to key-value is not in this plan).
+- A rollback during the import (before the cutover) is safe: the key-value records are the source of
+  truth, and the next import start detects the change and starts again.
+- Backup: draft 2's backup is for a stopped hub (`lazyrex-hub sql backup`): hub.db and the SQL files
+  as one set. It keeps the import states, because the fence is in hub.db and the progress is in the
+  SQL file. Release gate: a backup of the set right before the cutover release.
 
 ## Sizes and costs
 
-- A send's request holds the body twice (the message and the fingerprint in `operations`), the
-  recipient, fixed SQL text and, for `team`, the roster as one JSON array. It does not depend on
-  mailbox, group or thread size.
-- Row work of a send to a group of n: n delivery rows, n outbox rows, n notice calls after the
-  commit (one call with H5's list form). For n = 100: measured in the size test, not estimated.
-- The body limit (16384 encoded bytes) and the page rule (one message fits one read page) stay:
-  they bound replies, not storage.
-
-## What Messaging needs from hub.sql
-
-Sent to the coordinator and the Hub thread 2026-10-21; aligned with the reviewer's gates 1-8.
-
-- **H1 Parameters.** Bound parameters only; TEXT, INTEGER, NULL, BLOB. 64-bit integers stay exact
-  through JSON (decimal strings or a typed encoding, never a float).
-- **H2 Batch.** `hub.sql.batch` applies all statements in one transaction. A statement can carry
-  an expected change count (writes) or an expected row count (queries, as assertions); a mismatch
-  rolls back with `conflict` and the index. The reply has each statement's change count and rows,
-  in order.
-- **H3 Outcome.** A batch commits completely or not at all. A timeout or a cancel gives a defined
-  outcome (rolled back, or committed and reported); never "still running".
-- **H4 Results.** One statement's result is one snapshot, returned in one reply, inside the reply
-  limit by encoded bytes; a result that does not fit is a typed error (not a partial result).
-  One oversized cell: a typed error.
-- **H5 Notices.** A hub notice call that takes a version and ignores an older one, in a list form
-  for many agents. The plugin owns the outbox.
-- **H6 SQL features.** SQLite with `json_each`, `json_set`, `ON CONFLICT ... DO UPDATE`, partial
-  indexes, `WITHOUT ROWID`, `substr` and `length` on BLOB, multi-argument `min`/`max`, allowed by
-  the authorizer.
-- **H7 Schema.** `PRAGMA user_version` read and set, `PRAGMA foreign_keys = ON` per connection.
-- **H8 Fencing.** A retired plugin instance cannot write after its replacement starts (SQL and
-  key-value).
-- **H9 Lifecycle.** The file belongs to the plugin entry: kept across restart, replace and prune;
-  in the hub backup.
-- **H10 Harness.** `lazyrex-hub test` gives each run a fresh database; `hub.test.calls` records
-  SQL calls with their SQL and parameters, and reports dropped records; a fault hook can fail a
-  batch at a given statement and can drop a reply after commit.
+- A send's request (each SQL call) holds the body once in the message insert and once in the
+  fingerprint of the operation row, the recipient, fixed SQL text and, for `team`, the roster as one
+  JSON array. It does not depend on mailbox, group or thread size.
+- Row work of a send to a group of n: n delivery rows and n notices (pending is true, no query). For
+  n = 100: measured in the size test, not estimated.
+- The body limit (16384 encoded bytes) and the page rule (one message fits one read page) stay: they
+  bound replies, not storage.
 
 ## Tests (proposed)
 
@@ -555,49 +454,40 @@ Sent to the coordinator and the Hub thread 2026-10-21; aligned with the reviewer
 - Tests that inject key-value records during a run test machinery that goes away (chains, `if_rev`
   races). Before any is retired, a coverage map (each test, the behaviour that it proves, the SQL
   test that proves it after) goes to the reviewer.
-- New: the live case (a short send to a 9-member group whose members have hundreds of unread
-  messages) commits; a 100-member group send (sizes and costs measured); a lost reply after commit
-  replays the result; a batch that fails at its last statement leaves nothing; an ack and a send
-  race; a read race (a send commits between two reads; the second read returns it); the outbox
-  after a crash between commit and notice, a refused agent, a transient failure, and a stale clear
-  (with H5); an alias union where a message is unread under one name only, colliding homes,
-  titles and drafts, and an observed pair; import: a crash at each phase and resume, a source
-  change during the import (an old release writes), a chunked large body with a crash between
-  chunks, a `record_too_large` source, a verification mismatch, acked messages stay acked, a crash
-  before the f1 fence write and a crash after it (before SQL `done`), a restart in `done` with a
-  stale key-value alias state; `since`, `before` and `draft_revision` values from before the
-  cutover; integers above 2^53; two draft saves from one base with no send between them (the
-  second is `draft_conflict`); a repeated and an empty ack write nothing; a notice that fails once
-  with no later action (the timer delivers it); an oversized row in a read with a concurrent ack.
+- New:
+  - the live case: a short send to a 9-member group whose members have hundreds of unread messages
+    commits; a 100-member group send (sizes and costs measured);
+  - a lost reply after the commit replays the result (draft 2 fault point `lost-reply`); an error in
+    the last statement leaves nothing;
+  - a read whose snapshot is followed by a send: the next read returns it; an oversized row in a
+    read, with the byte-sized selection; a selection that does not fit one reply (`more`);
+  - notices: an ack that clears and a send that sets, in both orders; pending computed in the
+    transaction;
+  - alias merges: a message unread under one name only; colliding homes, titles and drafts (and
+    the draft conflict); an observed pair; member order;
+  - import: each start state of the table, including the orphan fence and a crash on both sides of
+    f1; a source change during the import; a chunked large body with a crash between chunks; a
+    `record_too_large` source; a verification mismatch; acked messages stay acked; a restart in
+    `done` with a stale key-value alias state;
+  - `since`, `before` and `draft_revision` values from before the cutover; integers above 2^53;
+    two draft saves from one base with no send between them; a repeated and an empty ack write
+    nothing.
 
 ## Order of commits (proposed)
 
-1. Schema, clock, the storage layer (a small module that wraps `hub.sql`), and the outbox.
-2. Send, read, ack, history, view.seen on SQL, with the tests.
+The order follows the SDK's delivery. The Messaging port needs the `lazyrex` module (the Tunnels
+pair builds it) and G1 to G4.
+
+1. The plumbing on the SDK: registration, the action dispatch, `hub.forward`, identity, errors.
+   Storage stays on the key-value store in this commit if the SDK allows raw hub calls (G4); else
+   commits 1 and 2 are one.
+2. The schema, send, read, ack, history, view.seen on SQL, with the tests (fresh database only).
 3. Threads, groups, members, homes, titles, drafts, gallery.
 4. Identity aliases on SQL.
-5. The import: fence, source records, chunks, verification, cutover; the operation-key fallback.
-6. Retire the key-value code paths (chains, mailboxes, M1 scans) and the tests of them, after the
-   reviewer accepts the coverage map.
+5. The import: states, fence, source records, chunks, verification, cutover; the operation-key
+   fallback.
+6. Retire the key-value code paths (chains, mailboxes, M1 scans) and their tests, after the reviewer
+   accepts the coverage map.
 
-Each commit keeps the suite green against a hub with `hub.sql`. Commits 1-4 run only on a fresh
-database; commit 5 makes the plugin safe for a store with data. No release before commit 5.
-
-## Plugin SDK v0 (user decision, 2026-10-21)
-
-The public face of `hub.sql` becomes part of a Lua Plugin SDK that the hub ships. The hub lead
-owns its design. Adopted for draft 2, from Messaging's input (hub lead, 2026-10-21):
-
-- Each action handler is one transaction. It begins at the handler's first SQL call, read or
-  write (`BEGIN DEFERRED`), so the reads that decide a write are in its snapshot. It commits on
-  return and rolls back on an error. A long handler can opt out (the Messaging import does, with a
-  transaction per bounded step).
-- `app.notice(agent, pending)` is queued into the handler's transaction (the hub outbox). It
-  replaces `pending_from`.
-- An action can opt out of the SDK result store; the store also takes a caller-given key and
-  fingerprint (Messaging's agent keys and normalized fingerprints).
-- Draft 2 lab tests: a timer or an event during a handler's wait on a Rex call, the rollback of an
-  old instance's open transaction at retirement, the commit before the reply, the 10 s limit.
-
-Revision 3 retargets this plan to the SDK when its contract is published: most guards, retries and
-the plugin outbox then go away, and the schema, the semantics, the import and the alias merge stay.
+Commits 2 to 4 run only on a fresh database; commit 5 makes the plugin safe for a store with data.
+No release before commit 5, and none before the hub's SQL work is on main.
