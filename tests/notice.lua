@@ -39,6 +39,23 @@ test('a reply names its sender once: the ack of the answered message and the new
   expect(got).to_equal({{agent = 'alice', pending = true, once = true}, {agent = 'bob', pending = false}})
 end)
 
+test('a failed read leaves no notice for a later alias merge to flush', function()
+  -- The reviewer's case: the read fails after it marked its agent; the merge that follows (alice
+  -- gets an identity) must not give bob's read in its own commit.
+  alice:call('messaging.send', {to = 'bob', body = 'unread mail', key = 'rollback-notice'})
+  local _, base = calls('none')
+  expect_error(function() bob:call('messaging.read', {thread = 'g-missing'}) end, 'Unknown thread')
+  alice:report({kind = 'claude', conversation_id = 'rollback-notice-alice'})
+  wait('the alias merge', function() return sql("SELECT identity FROM aliases_applied WHERE alias = 'alice'")[1] end)
+  local reads = 0
+  for _, c in ipairs(calls('hub.sql.commit', {after = base.next})) do
+    for _, n in ipairs(c.args.notices or {}) do
+      if n.agent == 'bob' and n.read then reads = reads + 1 end
+    end
+  end
+  expect(reads, 'a failed read records no read in another commit').to_be(0)
+end)
+
 test('an alias that appears during reads merges in a commit of its own; the read keeps its own notice', function()
   -- The report lands at a time that the test does not control: before, during or after a read.
   -- The handler never merges, so wherever it lands, a commit with a read notice has no other

@@ -329,7 +329,12 @@ local function migrate_aliases()
     if not applied[x] then
       -- In the import cutover, the cutover gives the notices; else this merge's own transaction does.
       -- A handler never merges: it runs after this, in a commit of its own.
-      db.transaction(function() merge_alias(x, aliases[x]); if not notes.inside then flush() end end)
+      db.transaction(function()
+        -- Outside the cutover, this merge starts with no marks (a failed merge before it can leave some).
+        if not notes.inside then notes.marked, notes.list = {}, {} end
+        merge_alias(x, aliases[x])
+        if not notes.inside then flush() end
+      end)
     elseif applied[x] ~= aliases[x] then fail('internal', 'An identity alias changed') end
   end
 end
@@ -2000,7 +2005,8 @@ local function handler(fn, declares, render)
         return r
       end)
       notes.inside = false
-      if not ok then error(out, 0) end
+      -- A failed handler gives no notices: clear its marks, so a later merge cannot flush them.
+      if not ok then notes.marked, notes.list = {}, {}; error(out, 0) end
       return out
     end)
     if declares then
