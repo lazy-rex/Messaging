@@ -4,7 +4,6 @@
 -- thread menu form. A file of its own: it restarts the hub. Navigation focuses the view's pane
 -- (session.focus_block), so focus is the session's active window.
 
-local function part(s) return #s .. ':' .. s end
 local function active(s) return rex.call('session.view', {session_id = s}).active_window_id end
 -- open_views returns the open views of a tab.
 local function open_views(t)
@@ -106,7 +105,6 @@ test('after another close, Threads… Open reopens the thread and shows it', fun
 end)
 
 test('a thread menu form keeps the thread draft', function()
-  local key = 'draft/' .. part('user') .. part('alice')
   local v = user:view('thread/alice')
   local composer = H.node(v:render(), 'composer')
   local saved = v:draft('composer', 'unsent draft', composer.draft_revision, 'hv-draft')
@@ -123,7 +121,7 @@ test('a thread menu form keeps the thread draft', function()
     for _, x in ipairs(views()) do if x.block_id == form.block then return nil end end
     return true
   end)
-  expect(store(key)).to_equal({value = {text = 'unsent draft'}, rev = rev})
+  expect(sql('SELECT text, CAST(rev AS TEXT) AS rev FROM drafts WHERE viewer = ? AND peer = ?', {'user', 'alice'})[1]).to_equal({text = 'unsent draft', rev = rev})
   composer = H.node(v:render(), 'composer')
   expect(composer.text).to_be('unsent draft')
   expect(composer.draft_revision).to_be(rev)

@@ -1,11 +1,36 @@
 -- Size admission of new messages (LazyRex docs/rex-protocol.md, "Rex Lua runtime"). What this
--- plugin sends is at most 64 KiB in one control message. A send's batch carries the body twice
--- (the record and the operation fingerprint), so the body limit is 16384 encoded bytes; the whole
--- batch request is measured too, and one that can never fit is invalid_input. Sizes count encoded
--- JSON as the hub's Go encoder writes it.
+-- plugin sends is at most 64 KiB in one control message. A send carries the body in two SQL
+-- requests (the message insert and the operation fingerprint), so the body limit is 16384 encoded
+-- bytes. No request depends on mailbox, group or thread size. Sizes count encoded JSON as the
+-- hub's Go encoder writes it.
 
 local function part(s) return #s .. ':' .. s end
-local function box(name) return 'mailbox/' .. part(name) end
+local function message(id) return sql('SELECT seq FROM messages WHERE id = ?', {id})[1] end
+local function draft_of(viewer, peer)
+  return sql('SELECT text, CAST(rev AS TEXT) AS rev FROM drafts WHERE viewer = ? AND peer = ?', {viewer, peer})[1]
+end
+local function revision() return sql('SELECT CAST(n AS TEXT) AS n FROM clock')[1].n end
+-- write_sql runs sql_write; while the plugin holds a transaction, it waits.
+local function write_sql(q, p)
+  local out = wait('a SQL fixture write', function()
+    local ok, r = pcall(sql_write, q, p)
+    if ok then return {r} end
+    local text = type(r) == 'table' and tostring(r.code) .. ': ' .. tostring(r.message) or tostring(r)
+    if not text:find('busy', 1, true) then return {nil, r} end -- another error: no retry
+  end)
+  if out[2] ~= nil then error(out[2], 0) end
+  return out[1]
+end
+local function put_operation(key, owner, fingerprint, result)
+  write_sql('INSERT INTO operations (key, owner, fingerprint, result) VALUES (?, ?, ?, ?)', {key, owner, fingerprint, rex.json.encode(result)})
+end
+-- put_group writes a created group from before the size rules.
+local function put_group(gid, name, members)
+  write_sql('INSERT INTO groups (gid, name) VALUES (?, ?)', {gid, name})
+  for pos, m in ipairs(members) do
+    write_sql('INSERT INTO group_members (gid, agent, pos, current) VALUES (?, ?, ?, 1)', {gid, m, pos})
+  end
+end
 local alice, bob = agent('alice'), agent('bob')
 local budget = 49152
 local limit = 16384
@@ -56,7 +81,7 @@ test('agent send: a body of exactly 16384 encoded bytes is accepted; one byte mo
     local over = 'over-' .. c[1]
     expect_error(function() alice:call('messaging.send', {to = 'bob', body = body .. 'a', key = over}) end,
       'body is 16385 bytes encoded; the limit is 16384')
-    expect(store('message/send/' .. part('alice') .. part(over)).rev, 'a refused send writes nothing').to_be('0')
+    expect(message('send/' .. part('alice') .. part(over)), 'a refused send writes nothing').to_be(nil)
   end
 end)
 
@@ -84,12 +109,12 @@ test('view send: the same limit, counted the same way, for every class', functio
     expect(op.status, c[1] .. ' at the limit').to_be('succeeded')
     local over = body .. 'a'
     saved = v:draft('composer', over, op.result.draft_revision, 'draft-over-' .. c[1])
-    local draft_before = store('draft/' .. part('user') .. part('bob'))
+    local draft_before = draft_of('user', 'bob')
     op = v:send('composer', over, saved.result.draft_revision, 'view-over-' .. c[1])
     expect(op.status, c[1] .. ' over the limit').to_be('failed')
     expect(op.error.code).to_be('invalid_input')
     expect(op.error.message).to_match('body is 16385 bytes encoded; the limit is 16384')
-    expect(store('draft/' .. part('user') .. part('bob')), 'a refused send keeps the draft').to_equal(draft_before)
+    expect(draft_of('user', 'bob'), 'a refused send keeps the draft').to_equal(draft_before)
     rev = saved.result.draft_revision
   end
 end)
@@ -108,11 +133,11 @@ test('a stored operation replays before the new limits, on both paths', function
   local key = string.rep('x', 300)
   local body = string.rep('b', 20000)
   local id = 'send/' .. part('alice') .. part(key)
-  put_operation({key = id, fingerprint = 'send-v2/' .. part('bob') .. part(body) .. part(''), result = {id = id, key = key}})
+  put_operation(id, 'alice', 'send-v2/' .. part('bob') .. part(body) .. part(''), {id = id, key = key})
   expect(alice:call('messaging.send', {to = 'bob', body = body, key = key})).to_equal({id = id, key = key})
   local view_id = 'send/' .. part('user') .. part('view-replay')
   local result = {message_id = view_id, cleared_draft_revision = '7'}
-  put_operation({key = view_id, fingerprint = 'view-send-v1/' .. part('/thread/bob') .. part('7') .. part(body), result = result})
+  put_operation(view_id, 'user', 'view-send-v1/' .. part('/thread/bob') .. part('7') .. part(body), result)
   local v = user:open('thread/bob')
   v:render()
   local op = v:send('composer', body, '7', 'view-replay')
@@ -120,43 +145,35 @@ test('a stored operation replays before the new limits, on both paths', function
   expect(op.result.message_id).to_be(view_id)
 end)
 
-test('a body that fits but a batch that cannot: invalid_input, and nothing is written', function()
-  -- A legacy mailbox of about 50 KB: the send batch must rewrite it, so it can never fit.
-  local unread = {}
-  for i = 1, 600 do unread['legacy/' .. i .. '/' .. string.rep('u', 80)] = true end
-  write({{key = box('bob'), value = {ids = unread}}})
-  local mailbox_before = store(box('bob'))
-  local key = 'big-mailbox'
-  local body = string.rep('h', 3000) -- within the body limit; the batch carries it twice
-  local ok, e = pcall(alice.call, alice, 'messaging.send', {to = 'bob', body = body, key = key})
-  expect(ok).to_be(false)
-  expect(e.code).to_be('invalid_input')
-  expect(e.message).to_match('hub.store.batch request is %d+ bytes encoded')
-  local id = 'send/' .. part('alice') .. part(key)
-  expect(store('message/' .. id).rev, 'no message').to_be('0')
-  expect(store(box('bob')), 'the mailbox is unchanged').to_equal(mailbox_before)
-  -- No operation result was stored: after the mailbox shrinks, the same key with another body is
-  -- a new send, not a conflict with a stored one.
-  write({{key = box('bob'), value = {ids = {}}}})
-  expect(alice:call('messaging.send', {to = 'bob', body = 'hello again', key = key}).id).to_be(id)
-  write({{key = box('bob'), value = {ids = unread}}})
-  -- The view path: the draft stays, and the operation fails with the same code.
+-- The key-value version rewrote the whole mailbox in each send batch, so a large backlog made every
+-- send fail (the All Teams defect). In SQL, a send writes one delivery row for each recipient.
+test('a large unread backlog does not block a send, on both paths', function()
+  local before = tonumber(revision())
+  write_sql([[INSERT INTO messages (seq, id, sender, recipient, thread_a, thread_b, body, at)
+    WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 600)
+    SELECT (SELECT c.n FROM clock c) + i, 'legacy/' || i || '/' || ?, 'alice', 'bob', 'alice', 'bob', 'old', '2026-01-01T00:00:00Z' FROM n]],
+    {string.rep('u', 80)})
+  write_sql('UPDATE clock SET n = n + 600')
+  write_sql([[INSERT INTO deliveries (agent, seq, acked) SELECT 'bob', seq, 0 FROM messages WHERE id LIKE 'legacy/%']])
+  expect(tonumber(revision())).to_be(before + 600)
+  local body = string.rep('h', 3000)
+  local sent = alice:call('messaging.send', {to = 'bob', body = body, key = 'big-mailbox'})
+  expect(message(sent.id), 'the send committed').to_be_truthy()
   local v = user:open('thread/bob')
   v:render()
-  local saved = v:draft('composer', body, store('draft/' .. part('user') .. part('bob')).rev, 'draft-big-mailbox')
-  local draft_before = store('draft/' .. part('user') .. part('bob'))
+  local current = draft_of('user', 'bob')
+  local saved = v:draft('composer', body, current and current.rev or '0', 'draft-big-mailbox')
   local op = v:send('composer', body, saved.result.draft_revision, 'view-big-mailbox')
-  expect(op.status).to_be('failed')
-  expect(op.error.code).to_be('invalid_input')
-  expect(store('draft/' .. part('user') .. part('bob')), 'the draft is not cleared').to_equal(draft_before)
-  expect(store('message/send/' .. part('user') .. part('view-big-mailbox')).rev, 'no message').to_be('0')
+  expect(op.status).to_be('succeeded')
+  expect(message('send/' .. part('user') .. part('view-big-mailbox'))).to_be_truthy()
+  write_sql([[UPDATE deliveries SET acked = 1 WHERE agent = 'bob' AND seq IN (SELECT seq FROM messages WHERE id LIKE 'legacy/%')]])
 end)
 
 local charlie = agent('charlie')
 test('a membership notice cuts a long thread title to fit, and the new member reads it in full', function()
   local gid = alice:call('messaging.thread_create', {members = {'bob', 'user'}, key = 'notice-title'}).id
   expect(gid:sub(1, 2)).to_be('g-')
-  write({{key = 'thread-title/' .. part('alice') .. part(gid), value = {title = string.rep('T', 60000)}}})
+  write_sql('INSERT INTO thread_titles (viewer, peer, title, set_rev) VALUES (?, ?, ?, (SELECT n FROM clock))', {'alice', gid, string.rep('T', 60000)})
   alice:call('messaging.thread_members', {thread = gid, members = {'bob', 'charlie', 'user'}, key = 'add-charlie'})
   local page = charlie:call('messaging.read', {thread = gid})
   expect(#rex.json.encode(page) <= budget).to_be(true)
@@ -171,30 +188,28 @@ end)
 
 test('a membership change whose notice cannot fit is refused, and nothing is written', function()
   local gid = 'g-' .. string.rep('n', 25000)
-  local groups = store('groups').value.groups
-  groups[gid] = {name = 'Long legacy group', members = {'alice', 'bob'}}
-  write({{key = 'groups', value = {groups = groups}}})
-  local before = store('groups')
-  local box_before = store(box('charlie'))
+  put_group(gid, 'Long legacy group', {'alice', 'bob'})
+  local members = 'SELECT agent, pos, current FROM group_members WHERE gid = ? ORDER BY agent'
+  local before = sql(members, {gid})
+  local mail = "SELECT count(*) AS n FROM deliveries WHERE agent = 'charlie'"
+  local box_before = sql(mail)[1].n
   local ok, e = pcall(alice.call, alice, 'messaging.thread_members', {thread = gid, members = {'bob', 'charlie'}, key = 'add-to-long'})
   expect(ok).to_be(false)
   expect(e.code).to_be('invalid_input')
-  expect(store('groups'), 'membership is unchanged').to_equal(before)
-  expect(store(box('charlie')), 'no notice was delivered').to_equal(box_before)
+  expect(sql(members, {gid}), 'membership is unchanged').to_equal(before)
+  expect(sql(mail)[1].n, 'no notice was delivered').to_be(box_before)
 end)
 
-test('a send to a legacy group with a long ID is refused by the page rule, before any batch', function()
-  -- admit runs before the batch is built: the read and history pages of this message would hold the
+test('a send to a legacy group with a long ID is refused by the page rule, before any write', function()
+  -- admit runs before the writes: the read and history pages of this message would hold the
   -- group ID twice (to, and the history thread), over 49152 bytes even with a one-byte body.
   local gid = 'g-' .. string.rep('p', 25000)
-  local groups = store('groups').value.groups
-  groups[gid] = {name = 'Long legacy group', members = {'alice', 'bob'}}
-  write({{key = 'groups', value = {groups = groups}}})
-  local writes = batches()
+  put_group(gid, 'Long legacy group', {'alice', 'bob'})
+  local before = revision()
   local ok, e = pcall(alice.call, alice, 'messaging.send', {to = gid, body = 'x', key = 'page-rule'})
   expect(ok).to_be(false)
   expect(e.code).to_be('invalid_input')
   expect(e.message).to_match('The message does not fit one read page: %d+ bytes encoded, limit 49152')
-  expect(batches(), 'no batch was sent').to_be(writes)
-  expect(store('message/send/' .. part('alice') .. part('page-rule')).rev).to_be('0')
+  expect(revision(), 'nothing was written').to_be(before)
+  expect(message('send/' .. part('alice') .. part('page-rule'))).to_be(nil)
 end)

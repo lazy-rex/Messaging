@@ -1,8 +1,7 @@
--- Stored messages from before size admission (written here with hub.test.write) must still read:
--- a page never exceeds 49152 encoded bytes, never skips a message, and always makes progress.
+-- Stored messages from before size admission (written here as SQL fixtures; the import from the
+-- key-value store brings such messages) must still read: a page never exceeds 49152 encoded
+-- bytes, never skips a message, and always makes progress.
 
-local function part(s) return #s .. ':' .. s end
-local function box(name) return 'mailbox/' .. part(name) end
 local alice, bob, charlie = agent('alice'), agent('bob'), agent('charlie')
 local budget = 49152
 local at = '2026-10-19T00:00:00Z'
@@ -13,23 +12,30 @@ local function within(page)
   return page
 end
 
--- deliver writes a legacy message record and adds it to the reader's mailbox and the thread.
-local function deliver(m, reader, thread_key)
-  write({{key = 'message/' .. m.id, value = m}})
-  local mb = store(box(reader))
-  local ids = mb.value and mb.value.ids or {}
-  ids[m.id] = true
-  write({{key = box(reader), value = {ids = ids}}})
-  if thread_key then
-    local t = store(thread_key)
-    local list = t.value and t.value.ids or {}
-    list[#list + 1] = m.id
-    write({{key = thread_key, value = {ids = list}}})
-  end
-  return store('message/' .. m.id).rev
+-- write_sql runs sql_write; while the plugin holds a transaction, it waits.
+local function write_sql(q, p)
+  local out = wait('a SQL fixture write', function()
+    local ok, r = pcall(sql_write, q, p)
+    if ok then return {r} end
+    local text = type(r) == 'table' and tostring(r.code) .. ': ' .. tostring(r.message) or tostring(r)
+    if not text:find('busy', 1, true) then return {nil, r} end -- another error: no retry
+  end)
+  if out[2] ~= nil then error(out[2], 0) end
+  return out[1]
 end
 
-local direct = 'thread/' .. part('alice') .. part('bob')
+-- deliver writes a legacy message in thread {a, b} and an unread delivery for the reader. It
+-- returns the message cursor.
+local function deliver(m, reader, thread)
+  write_sql('UPDATE clock SET n = n + 1')
+  write_sql([[INSERT INTO messages (seq, id, sender, recipient, thread_a, thread_b, body, at)
+    VALUES ((SELECT n FROM clock), ?, ?, ?, ?, ?, ?, ?)]], {m.id, m.from, m.to, thread[1], thread[2], m.body, m.at})
+  if m.reply_to then write_sql('UPDATE messages SET reply_to = ? WHERE id = ?', {m.reply_to, m.id}) end
+  write_sql('INSERT INTO deliveries (agent, seq, acked) VALUES (?, (SELECT n FROM clock), 0)', {reader})
+  return sql('SELECT CAST(n AS TEXT) AS n FROM clock')[1].n
+end
+
+local direct = {'alice', 'bob'}
 
 test('a body larger than one page arrives as a UTF-8-safe prefix, in read and in history', function()
   local body = string.rep('\195\169', 30000) -- 60000 bytes, 2 bytes a character
@@ -70,9 +76,11 @@ test('metadata larger than one page: a marker with the full ID, and the cursor m
 end)
 
 -- A legacy group whose ID leaves room only for small items in a history page.
--- legacy_group replaces the groups record with one legacy group (a write is at most 64 KiB).
 local function legacy_group(id, members)
-  write({{key = 'groups', value = {groups = {[id] = {name = 'Legacy group', members = members}}}}})
+  write_sql('INSERT INTO groups (gid, name) VALUES (?, ?)', {id, 'Legacy group'})
+  for pos, m in ipairs(members) do
+    write_sql('INSERT INTO group_members (gid, agent, pos, current) VALUES (?, ?, ?, 1)', {id, m, pos})
+  end
 end
 
 test('a long thread ID and a long message ID: history returns id_prefix and id_bytes', function()
@@ -80,7 +88,7 @@ test('a long thread ID and a long message ID: history returns id_prefix and id_b
   legacy_group(gid, {'alice', 'charlie'})
   local mid = 'legacy/' .. string.rep('m', 22000)
   local m = {id = mid, from = 'alice', to = 'charlie', recipients = {'charlie'}, body = 'hello', at = at}
-  local rev = deliver(m, 'charlie', 'thread/' .. part('') .. part(gid))
+  local rev = deliver(m, 'charlie', {'', gid})
   local h = within(charlie:call('messaging.history', {thread = gid}))
   expect(h.thread == gid).to_be(true)
   local item = h.messages[1]
@@ -104,12 +112,12 @@ test('a thread ID that fits an empty page but not the smallest marker: thread_id
   expect(#(e.message or '') < 400, 'the error is bounded').to_be(true)
 end)
 
-test('several long message IDs: requests are packed by size, and every message arrives with its full ID', function()
+test('several long message IDs: pages are packed by size, and every message arrives with its full ID', function()
   local ids = {}
   for i = 1, 4 do
     local id = 'legacy/' .. i .. '/' .. string.rep('l', 13000)
     ids[#ids + 1] = id
-    deliver({id = id, from = 'bob', to = 'alice', recipients = {'alice'}, body = 'long id ' .. i, at = at}, 'alice', nil)
+    deliver({id = id, from = 'bob', to = 'alice', body = 'long id ' .. i, at = at}, 'alice', direct)
   end
   local got, since, pages = {}, '0', 0
   repeat
@@ -124,27 +132,3 @@ test('several long message IDs: requests are packed by size, and every message a
   for i, id in ipairs(ids) do expect(got[id], 'message ' .. i).to_be('long id ' .. i) end
   expect(pages >= 2, 'four 13 KB IDs need more than one page').to_be(true)
 end)
-
--- add_unread puts an ID in a reader's mailbox (only the mailbox: no message record).
-local function add_unread(reader, id)
-  local mb = store(box(reader))
-  local unread = mb.value and mb.value.ids or {}
-  unread[id] = true
-  write({{key = box(reader), value = {ids = unread}}})
-end
-
-test('a 50 KB key is larger than the batch target but still reaches the store', function()
-  local id = 'legacy/' .. string.rep('k', 50000)
-  add_unread('bob', id)
-  local ok, e = pcall(bob.call, bob, 'messaging.read', {})
-  expect(ok).to_be(false)
-  -- The store answered: the record is missing, so the mailbox reference is invalid.
-  expect(e.code).to_be('internal')
-  expect(e.message).to_match('Mailbox references an invalid message')
-  write({{key = box('bob'), value = {ids = {}}}})
-end)
-
--- key_too_large (a key whose own hub.store.get request is over 64512 bytes) is not tested here: the
--- record that holds the ID (a mailbox or a thread) is written in one request with more overhead
--- than that get, so no Lua writer, including this runner, can store such an ID. A writer with a
--- larger limit (a Go test fixture) could.

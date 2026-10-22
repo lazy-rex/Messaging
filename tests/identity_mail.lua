@@ -54,7 +54,7 @@ end)
 test('after /clear, mail to the legacy name stays with the first conversation', function()
   a:report({kind = 'codex', conversation_id = 'native-a-new', source = 'clear'})
   to_alias = b:call('messaging.send', {to = 'alice', body = 'to the legacy name', key = 'im-to-alias'})
-  expect(store('message/' .. to_alias.id).value.to, 'the legacy name is an alias of the first conversation').to_be('codex:native-a')
+  expect(sql('SELECT recipient FROM messages WHERE id = ?', {to_alias.id})[1].recipient, 'the legacy name is an alias of the first conversation').to_be('codex:native-a')
   expect(ids(a:call('messaging.read', {})), 'the new conversation does not get it').not_to_contain(to_alias.id)
 end)
 

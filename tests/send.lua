@@ -1,16 +1,18 @@
--- Ported from the Node test messaging.mjs (coverage map: commit eaaf529): the send, read and ack contract, replies, and injected mailbox
--- races. Agents call through the agent face (the MCP path) unless a test says otherwise.
+-- The send, read and ack contract, replies, and commit faults. Agents call through the agent face
+-- (the MCP path) unless a test says otherwise. Storage is SQL: each handler is one transaction, so
+-- the hub.store races of the key-value version cannot happen; the commit faults replace them.
 
 local function part(s) return #s .. ':' .. s end
-local function box(name) return 'mailbox/' .. part(name) end
-local function ids_of(name)
-  local r = store(box(name))
+-- unread returns the unread message IDs of an agent, sorted.
+local function unread(name)
   local out = {}
-  for id in pairs(r.value and r.value.ids or {}) do out[#out + 1] = id end
-  table.sort(out)
+  for _, r in ipairs(sql([[SELECT m.id FROM deliveries d JOIN messages m ON m.seq = d.seq
+      WHERE d.agent = ? AND d.acked = 0 ORDER BY m.id]], {name})) do out[#out + 1] = r.id end
   return out
 end
-local function sorted(t) table.sort(t); return t end
+local function message(id) return sql('SELECT * FROM messages WHERE id = ?', {id})[1] end
+-- revision is the clock: every write that gives out a revision moves it.
+local function revision() return sql('SELECT CAST(n AS TEXT) AS n FROM clock')[1].n end
 local function plugin_client() return H.hub('hub.test.status', {}).plugins.messaging.client_id end
 
 local alice, bob = agent('alice'), agent('bob')
@@ -30,10 +32,12 @@ test('send replays its first result and refuses a changed body under the same ke
   local body = 'quote " slash \\ nul \0 snow 雪'
   first = alice:call('messaging.send', {key = 'a/:é', body = body, to = 'bob'})
   expect(first.id).to_be('send/' .. part('alice') .. part('a/:é'))
-  original = store('message/' .. first.id)
-  local before = batches()
+  original = message(first.id)
+  expect(original.body).to_be(body)
+  local before = revision()
   expect(alice:call('messaging.send', {key = 'a/:é', body = body, to = 'bob'})).to_equal(first)
-  expect(batches(), 'a saved operation does not write or notify again').to_be(before)
+  expect(revision(), 'a saved operation does not write again').to_be(before)
+  expect(unread('bob')).to_equal({first.id})
   expect_error(function() alice:call('messaging.send', {key = 'a/:é', body = 'different', to = 'bob'}) end, 'different content')
 end)
 
@@ -46,10 +50,12 @@ test('read does not acknowledge; keys are scoped by sender; ack validates the wh
   expect_error(function() bob:call('messaging.ack', {ids = {first.id, 'missing'}}) end, 'Unknown message')
   expect(bob:call('messaging.read', {}), 'an invalid batch acknowledges nothing').to_equal(incoming)
   bob:call('messaging.ack', {ids = {first.id, first.id}})
-  local after = batches()
+  expect(unread('bob')).to_equal({})
+  local after = revision()
   bob:call('messaging.ack', {ids = {first.id}})
   bob:call_raw('messaging.ack', '{"ids":[]}')
-  expect(batches(), 'a repeated or empty ack does not write').to_be(after)
+  expect(sql('SELECT count(*) AS n FROM deliveries WHERE agent = ? AND acked = 0', {'bob'})[1].n).to_be(0)
+  expect(revision(), 'a repeated or empty ack gives out no revision').to_be(after)
   expect(notice('bob').pending).to_be(false)
   expect_error(function() alice:call('messaging.ack', {ids = {first.id}}) end, 'Unknown message')
   -- A definite refusal, not 'unavailable': a retry cannot help.
@@ -61,130 +67,94 @@ test('a caller outside every pane is refused', function()
   expect_error(function() H.perform(plugin_client(), 'messaging.read', {}) end, 'does not recognize')
 end)
 
-local third
-test('a mailbox conflict retry keeps the concurrent entry', function()
-  write({{key = 'message/injected-message', value = {id = 'injected-message', from = 'alice', to = 'bob', body = 'concurrent', at = '2026-01-01T00:00:00Z'}}})
-  local current = store(box('bob')).value.ids
-  current['injected-message'] = true
-  third = with_injection({match = {writes = box('bob')}, ops = {{key = box('bob'), value = {ids = current}}}}, 1, function()
-    return alice:call('messaging.send', {key = 'conflict-once', body = 'hello', to = 'bob'})
+test('a failed commit writes nothing; the same key then sends once', function()
+  local before = revision()
+  with_injection({match = {sql_commit_writes = 'messages'}, fail = 'Commit lost'}, 1, function()
+    expect_error(function() alice:call('messaging.send', {key = 'commit-fails', body = 'hello', to = 'bob'}) end, 'Commit lost')
   end)
-  expect(ids_of('bob')).to_equal(sorted({'injected-message', third.id}))
+  expect(revision(), 'nothing of the send committed').to_be(before)
+  expect(message('send/' .. part('alice') .. part('commit-fails'))).to_be(nil)
+  local sent = alice:call('messaging.send', {key = 'commit-fails', body = 'hello', to = 'bob'})
+  expect(message(sent.id).body).to_be('hello')
+  bob:call('messaging.ack', {ids = {sent.id}})
 end)
 
-test('a send during an ack keeps its entry and its notice', function()
-  local ids = {['injected-message'] = true, [third.id] = true, ['arrived-during-ack'] = true}
-  with_injection({match = {writes = box('bob')}, ops = {
-    {key = 'message/arrived-during-ack', value = {id = 'arrived-during-ack', from = 'alice', to = 'bob', body = 'race', at = '2026-01-01T00:00:01Z'}},
-    {key = box('bob'), value = {ids = ids}},
-    {notify = {agent = 'bob', pending = true}},
-  }}, 1, function()
-    bob:call('messaging.ack', {ids = {'injected-message', third.id}})
+test('a lost reply after the commit replays the first result; nothing is sent twice', function()
+  local id = 'send/' .. part('alice') .. part('reply-lost')
+  with_injection({match = {sql_commit_writes = 'messages'}, fail = 'Reply lost', fail_code = 'unavailable', after = true}, 1, function()
+    expect_error(function() alice:call('messaging.send', {key = 'reply-lost', body = 'once', to = 'bob'}) end, 'Reply lost')
   end)
-  expect(ids_of('bob')).to_equal({'arrived-during-ack'})
-  expect(notice('bob').pending).to_be(true)
-  expect(store('message/' .. first.id), 'retries and acks keep message data').to_equal(original)
-end)
-
-test('the retry budget is bounded and saves no operation', function()
-  local before = batches()
-  local current = store(box('bob')).value
-  with_injection({match = {writes = box('bob')}, ops = {{key = box('bob'), value = current}}, times = 4}, 4, function()
-    expect_error(function() alice:call('messaging.send', {key = 'conflict-always', body = 'hello', to = 'bob'}) end, 'retry with the same send key')
-  end)
-  expect(batches() - before).to_be(4)
-  expect(store('message/send/' .. part('alice') .. part('conflict-always')).rev).to_be('0')
-  -- No operation was saved: the same key commits now, with a new message.
-  local later = alice:call('messaging.send', {key = 'conflict-always', body = 'hello', to = 'bob'})
-  expect(later.id).to_be('send/' .. part('alice') .. part('conflict-always'))
-  expect(store('message/' .. later.id).value.body).to_be('hello')
-end)
-
-test('a batch that another invocation already committed returns the saved result', function()
-  local replay = with_injection({match = {op_key = 'send/' .. part('alice') .. part('committed-before-batch')}, replay = true}, 1, function()
-    return alice:call('messaging.send', {key = 'committed-before-batch', body = 'hello', to = 'bob'})
-  end)
-  expect(replay.id).to_be('send/' .. part('alice') .. part('committed-before-batch'))
+  expect(message(id).body, 'the send committed').to_be('once')
+  local before = revision()
+  expect(alice:call('messaging.send', {key = 'reply-lost', body = 'once', to = 'bob'})).to_equal({id = id, key = 'reply-lost'})
+  expect(revision(), 'the retry replays and writes nothing').to_be(before)
+  expect(unread('bob')).to_equal({id})
+  bob:call('messaging.ack', {ids = {id}})
 end)
 
 test('a reply acknowledges only its question; invalid replies write nothing', function()
   local question = alice:call('messaging.send', {key = 'reply-question', body = 'hello', to = 'bob'})
   local args = {to = 'alice', body = 'answer', key = 'reply-answer', reply_to = question.id}
   local reply = bob:call('messaging.send', args)
-  expect(store(box('bob')).value.ids[question.id]).to_be(nil)
-  expect(store(box('alice')).value.ids[reply.id]).to_be(true)
-  expect(store('message/' .. reply.id).value.reply_to).to_be(question.id)
-  local after = batches()
+  expect(unread('bob')).to_equal({})
+  local alice_unread = unread('alice')
+  local found = false
+  for _, id in ipairs(alice_unread) do found = found or id == reply.id end
+  expect(found, 'the reply is unread for alice').to_be(true)
+  expect(message(reply.id).reply_to).to_be(question.id)
+  local after = revision()
   expect(bob:call('messaging.send', args)).to_equal(reply)
-  expect(batches(), 'a reply replay changes neither mailbox nor notice').to_be(after)
+  expect(revision(), 'a reply replay writes nothing').to_be(after)
   expect_error(function() bob:call('messaging.send', {to = 'alice', body = 'answer', key = 'reply-answer', reply_to = first.id}) end, 'different content')
-  local before = batches()
+  local before = revision()
   expect_error(function() bob:call('messaging.send', {to = 'alice', body = 'answer', key = 'foreign-reply', reply_to = second.id}) end, 'reply_to must name')
   expect_error(function() bob:call('messaging.send', {to = 'alice', body = 'answer', key = 'missing-reply', reply_to = 'missing'}) end, 'reply_to must name')
   expect_error(function() bob:call('messaging.send', {to = 'bob', body = 'answer', key = 'wrong-recipient', reply_to = question.id}) end, 'reply_to must name')
-  expect(batches(), 'invalid replies do not write').to_be(before)
+  expect(revision(), 'invalid replies do not write').to_be(before)
 end)
 
-test('an ack between the mailbox read and the reply commit forces one safe retry', function()
-  local q = alice:call('messaging.send', {key = 'reply-race-question', body = 'hello', to = 'bob'})
-  local ids = store(box('bob')).value.ids
-  ids[q.id] = nil
-  local before = batches()
-  with_injection({match = {writes = box('bob')}, ops = {{key = box('bob'), value = {ids = ids}}}}, 1, function()
-    bob:call('messaging.send', {to = 'alice', body = 'raced answer', key = 'reply-race', reply_to = q.id})
-  end)
-  expect(batches() - before, 'the reply retries once after a concurrent ack').to_be(2)
-  expect(store(box('bob')).value.ids[q.id]).to_be(nil)
-end)
-
-test('a new message during a reply keeps the notice; the last reply clears it', function()
+test('a reply keeps the notice while other mail is unread; the last reply clears it', function()
   local q = alice:call('messaging.send', {key = 'last-question', body = 'hello', to = 'bob'})
-  local others = {}
-  for _, id in ipairs(ids_of('bob')) do if id ~= q.id then others[#others + 1] = id end end
-  bob:call('messaging.ack', {ids = others})
-  with_injection({match = {op_key = 'send/' .. part('bob') .. part('reply-arrival')}, ops = {
-    {key = 'message/arrived-during-reply', value = {id = 'arrived-during-reply', from = 'alice', to = 'bob', body = 'new', at = '2026-01-01T00:00:02Z'}},
-    {key = box('bob'), value = {ids = {[q.id] = true, ['arrived-during-reply'] = true}}},
-    {notify = {agent = 'bob', pending = true}},
-  }}, 1, function()
-    bob:call('messaging.send', {to = 'alice', body = 'answer with race', key = 'reply-arrival', reply_to = q.id})
-  end)
-  expect(ids_of('bob')).to_equal({'arrived-during-reply'})
+  local other = alice:call('messaging.send', {key = 'other-question', body = 'new', to = 'bob'})
+  bob:call('messaging.send', {to = 'alice', body = 'answer', key = 'reply-arrival', reply_to = q.id})
+  expect(unread('bob')).to_equal({other.id})
   expect(notice('bob').pending).to_be(true)
-  bob:call('messaging.send', {to = 'alice', body = 'last answer', key = 'reply-last', reply_to = 'arrived-during-reply'})
-  expect(ids_of('bob')).to_equal({})
-  expect(notice('bob').pending, 'a reply clears the notice when the mailbox becomes empty').to_be(false)
+  bob:call('messaging.send', {to = 'alice', body = 'last answer', key = 'reply-last', reply_to = other.id})
+  expect(unread('bob')).to_equal({})
+  expect(notice('bob').pending, 'a reply clears the notice when no mail is unread').to_be(false)
 end)
 
 test('a self-reply leaves its new message pending', function()
   local self = bob:call('messaging.send', {key = 'self-question', body = 'note', to = 'bob'})
   local r = bob:call('messaging.send', {to = 'bob', body = 'self answer', key = 'self-reply', reply_to = self.id})
-  expect(ids_of('bob')).to_equal({r.id})
+  expect(unread('bob')).to_equal({r.id})
   expect(notice('bob').pending).to_be(true)
 end)
 
-test('revisions beyond the exact float range still order arrivals', function()
-  advance_rev('9007199254740992')
+test('cursors beyond the exact float range still order arrivals', function()
+  sql_write('UPDATE clock SET n = 9007199254740992')
   alice:call('messaging.send', {key = 'large-rev-1', body = 'one', to = 'bob'})
   local large = bob:call('messaging.read', {thread = 'alice'})
+  expect(large.next_cursor).to_be('9007199254740993')
   local last = alice:call('messaging.send', {key = 'large-rev-2', body = 'two', to = 'bob'})
   local after = bob:call('messaging.read', {thread = 'alice', since = large.next_cursor})
   local got = {}
   for _, m in ipairs(after.messages) do got[#got + 1] = m.id end
   expect(got).to_equal({last.id})
+  expect(after.messages[1].cursor).to_be('9007199254740994')
   expect_error(function() bob:call('messaging.read', {since = '1e3'}) end, 'since')
 end)
 
--- A hub error keeps its code (messaging.lua hub_error). A definite failure ends a view send; only a
--- transient code (unavailable, disconnected, timeout, or no code) is retried by the hub.
-test('a definite hub failure ends a view send; a transient one is retried', function()
+-- A hub error keeps its code. A definite failure ends a view send; only a transient code
+-- (unavailable, disconnected, timeout, or no code) is retried by the hub.
+test('a definite commit failure ends a view send; a transient one is retried', function()
   alice:call('messaging.send', {to = 'user', body = 'Code check', key = 'code-hello'})
   local v = user:open('thread/alice')
   v:render()
   local function send_with(key, spec)
     local saved = v:draft('composer', 'Code check ' .. key, H.node(v:render(), 'composer').draft_revision or '0', key .. '-draft')
     expect(saved.status, 'draft ' .. key).to_be('succeeded')
-    spec.match = {op_key = 'send/' .. part('user') .. part(key)}
+    spec.match = {sql_commit_writes = 'messages'}
     return with_injection(spec, 1, function() return v:send('composer', 'Code check ' .. key, saved.result.draft_revision, key) end)
   end
   local definite = send_with('code-definite', {fail = 'Definite refusal'})

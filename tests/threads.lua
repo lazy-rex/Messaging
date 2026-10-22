@@ -2,7 +2,12 @@
 -- unread status, cursors, and archive and restore. The human acts through the UI (forms, the
 -- thread menu, the threads panel); agents act as tools.
 
-local function part(s) return #s .. ':' .. s end
+-- writes is the write state of the plugin: a write that gives out a revision moves the clock; an
+-- open mark or a saved operation adds a row.
+local function writes()
+  return sql([[SELECT CAST((SELECT n FROM clock) AS TEXT) AS n, (SELECT count(*) FROM thread_opened) AS opened,
+    (SELECT count(*) FROM operations) AS operations, (SELECT count(*) FROM groups) AS groups]])[1]
+end
 local function has_tab(key) return tab(key) ~= nil end
 local function find(list, id)
   for _, t in ipairs(list or {}) do if t.id == id then return t end end
@@ -51,9 +56,9 @@ end)
 test('an explicit open declares the empty direct thread once (view.open through the hub)', function()
   user:open('thread/alice'):render()
   expect(has_tab('thread/alice')).to_be(true)
-  local before = batches()
+  local before = writes()
   user:open('thread/alice'):render()
-  expect(batches(), 'opening again does not write').to_be(before)
+  expect(writes(), 'opening again does not write').to_equal(before)
   expect_error(function() user:plugin_view('open', {route = '/thread/charlie', user = 'user'}) end, 'Only the hub')
 end)
 
@@ -93,23 +98,18 @@ test('thread_create makes a group; a replay returns it without a write', functio
   expect(created.members).to_equal({'alice', 'bob', 'user'})
   expect(find(alice:call('messaging.thread_list', {}).threads, created.id).title).to_be('Review')
   expect(has_tab('thread/' .. created.id)).to_be(true)
-  local before = batches()
+  local before = writes()
   expect(alice:call('messaging.thread_create', {key = 'group/:one', title = 'Review', members = {'user', 'bob', 'alice'}})).to_equal(created)
-  expect(batches(), 'a create replay does not write').to_be(before)
+  expect(writes(), 'a create replay does not write').to_equal(before)
   expect_error(function() alice:call('messaging.thread_create', {key = 'group/:one', title = 'Other', members = {'bob', 'user'}}) end, 'different content')
   local other = alice:call('messaging.thread_create', {key = 'groupone', title = 'Review', members = {'bob', 'user'}})
   expect(other.id, 'punctuation in operation keys is kept').not_to_be(created.id)
   expect_error(function() alice:call('messaging.thread_create', {key = 'missing', members = {'unknown'}}) end, 'Unknown recipient')
 end)
 
-test('a concurrent group write survives a create retry; a direct create returns the direct thread', function()
-  local groups = store('groups').value.groups
-  groups['g-concurrent'] = {name = 'Concurrent', members = {'alice', 'bob'}}
-  local raced = with_injection({match = {writes = 'groups'}, ops = {{key = 'groups', value = {groups = groups}}}}, 1, function()
-    return alice:call('messaging.thread_create', {key = 'create-race', title = 'Raced', members = {'bob'}})
-  end)
-  expect(store('groups').value.groups['g-concurrent']).to_be_truthy()
-  expect(store('groups').value.groups[raced.id]).to_be_truthy()
+test('a create keeps the other groups; a direct create returns the direct thread', function()
+  local made = alice:call('messaging.thread_create', {key = 'create-second', title = 'Second', members = {'bob'}})
+  expect(#sql('SELECT gid FROM groups WHERE gid IN (?, ?)', {created.id, made.id})).to_be(2)
   local direct = alice:call('messaging.thread_create', {key = 'direct', members = {'bob'}})
   expect(direct.id).to_be('bob')
   expect(direct.group).to_be(false)
@@ -126,7 +126,7 @@ end)
 local info, cursor
 test('FYI: reply_expected false is stored; unread shows on the user tab; a cursor does not acknowledge', function()
   info = alice:call('messaging.send', {to = created.id, key = 'fyi', body = 'Review complete', reply_expected = false})
-  expect(store('message/' .. info.id).value.reply_expected).to_be(false)
+  expect(sql('SELECT reply_expected FROM messages WHERE id = ?', {info.id})[1].reply_expected).to_be(0)
   expect_error(function() alice:call('messaging.send', {to = created.id, key = 'fyi', body = 'Review complete'}) end, 'different content')
   -- The user's tab before the user looks at it: the hub shows the view, and that acknowledges.
   local t = tab('thread/' .. created.id)
@@ -156,25 +156,25 @@ test('the thread view: no tree status, a menu button, FYI marked in history', fu
   expect(op.result).to_equal({form = '/forms/thread-menu'})
 end)
 
-local draft_key, draft_before
 test('archive from the menu keeps other archived threads, the draft and unread delivery', function()
   -- Unread mail for the user that the archive must keep.
   local unread = alice:call('messaging.send', {to = created.id, key = 'fyi-2', body = 'Second note'})
-  draft_key = 'draft/' .. part('user') .. part(created.id)
-  write({{key = draft_key, value = {text = 'keep this draft'}}})
-  draft_before = store(draft_key)
+  local function draft() return sql('SELECT text, rev FROM drafts WHERE viewer = ? AND peer = ?', {'user', created.id})[1] end
+  sql_write('INSERT INTO drafts (viewer, peer, text, rev) VALUES (?, ?, ?, 7)', {'user', created.id, 'keep this draft'})
+  sql_write("INSERT INTO thread_archived (viewer, peer) VALUES ('user', 'team')")
+  local draft_before = draft()
   local menu = user:view('/forms/thread-menu')
   menu:render()
-  local op = with_injection({match = {writes = 'thread-archive/' .. part('user')}, ops = {{key = 'thread-archive/' .. part('user'), value = {ids = {team = true}}}}}, 1, function()
-    return menu:action('thread_menu', 'archive', {item_id = 'archive'})
-  end)
+  local op = menu:action('thread_menu', 'archive', {item_id = 'archive'})
   expect(op.result).to_equal({panel = {command = 'threads'}})
-  local archived = store('thread-archive/' .. part('user')).value.ids
-  expect(archived.team, 'the retry keeps other archived threads').to_be(true)
+  local archived = {}
+  for _, r in ipairs(sql('SELECT peer FROM thread_archived WHERE viewer = ?', {'user'})) do archived[r.peer] = true end
+  expect(archived.team, 'archive keeps other archived threads').to_be(true)
   expect(archived[created.id]).to_be(true)
   expect(has_tab('thread/' .. created.id), 'archive omits the tab').to_be(false)
-  expect(store(draft_key), 'archive keeps the draft').to_equal(draft_before)
-  expect(store('mailbox/' .. part('user')).value.ids[unread.id], 'archive keeps unread delivery').to_be(true)
+  expect(draft(), 'archive keeps the draft').to_equal(draft_before)
+  expect(#sql([[SELECT 1 AS x FROM deliveries d JOIN messages m ON m.seq = d.seq
+    WHERE d.agent = 'user' AND d.acked = 0 AND m.id = ?]], {unread.id}), 'archive keeps unread delivery').to_be(1)
   local p = panel()
   expect(find(H.node(p:render(), 'archived_threads').items, created.id)).to_be_truthy()
   expect(find(bob:call('messaging.thread_list', {}).threads, created.id).archived, 'archive is per participant').to_be_falsy()

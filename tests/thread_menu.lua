@@ -1,8 +1,6 @@
 -- The thread menu actions on both paths: the agent tool (messaging.thread_rename, _members, _move,
 -- through the agent face) and the UI form submit (the hub view path). Both call one handler.
 
-local function part(s) return #s .. ':' .. s end
-
 local function thread_of(list, id)
   for _, t in ipairs(list.threads) do if t.id == id then return t end end
 end
@@ -50,7 +48,7 @@ test('rename in the UI form uses the same record', function()
   local g = the_group()
   local op = form(g.id, 'rename'):action('rename_thread', 'submit', {values = {title = 'User title'}})
   expect(op.status).to_be('succeeded')
-  expect(store('thread-title/' .. part('user') .. part(g.id)).value).to_equal({title = 'User title'})
+  expect(sql('SELECT title FROM thread_titles WHERE viewer = ? AND peer = ?', {'user', g.id})[1].title).to_be('User title')
   expect(tab('thread/' .. g.id).title).to_match('^User title')
 end)
 
@@ -75,8 +73,9 @@ test('members in the UI form uses the same handler', function()
   local g = the_group()
   local op = form(g.id, 'members'):action('thread_members', 'submit', {values = {member_alice = true, member_bob = true}})
   expect(op.status).to_be('succeeded')
-  local groups = store('groups').value.groups
-  expect(groups[g.id].members).to_equal({'alice', 'bob', 'user'})
+  local members = {}
+  for _, r in ipairs(sql('SELECT agent FROM group_members WHERE gid = ? AND current = 1 ORDER BY pos', {g.id})) do members[#members + 1] = r.agent end
+  expect(members).to_equal({'alice', 'bob', 'user'})
 end)
 
 test('move as a tool sets the thread home; the UI form does the same', function()
@@ -84,13 +83,13 @@ test('move as a tool sets the thread home; the UI form does the same', function(
   local g = the_group()
   local s1 = session('Move one')
   expect(alice:call('messaging.thread_move', {thread = g.id, session_id = s1, key = 'mv1'})).to_equal({id = g.id, moved = true})
-  local home = 'thread-meta/' .. part('') .. part(g.id)
-  expect(store(home).value.home_session).to_be(s1)
+  local function home() return sql("SELECT home_session FROM thread_homes WHERE thread_a = '' AND thread_b = ?", {g.id})[1].home_session end
+  expect(home()).to_be(s1)
   expect_error(function() alice:call('messaging.thread_move', {thread = g.id, session_id = 'session:closed', key = 'mv2'}) end, 'closed')
   local s2 = session('Move two')
   local op = form(g.id, 'move'):action('move_thread', 'submit', {values = {session_id = s2, session_name = ''}})
   expect(op.status).to_be('succeeded')
-  expect(store(home).value.home_session).to_be(s2)
+  expect(home()).to_be(s2)
   -- The new home moves the open thread view: the hub retires it and opens a view in s2, after
   -- the action replied. Wait for that, so that the next test does not act on the retiring view
   -- (reviewer's full run, 2026-10-22: 'the source view is closed').

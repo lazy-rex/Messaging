@@ -3,8 +3,27 @@
 -- (the form and a Rex tab rename), short identity names, and a draft conflict during migration.
 -- The hub makes the identities from real reports in the agent panes (hub.identity.report).
 
-local function part(s) return #s .. ':' .. s end
-local function box(name) return 'mailbox/' .. part(name) end
+local function one(q, p) return sql(q, p)[1] end
+local function unread(name) return one('SELECT count(*) AS n FROM deliveries WHERE agent = ? AND acked = 0', {name}).n end
+local function message(id) return one('SELECT * FROM messages WHERE id = ?', {id}) end
+local function draft(viewer, peer) return one('SELECT text FROM drafts WHERE viewer = ? AND peer = ?', {viewer, peer}) end
+local function title_of(viewer, peer) return one('SELECT title FROM thread_titles WHERE viewer = ? AND peer = ?', {viewer, peer}) end
+local function home(a, b) return one('SELECT home_session FROM thread_homes WHERE thread_a = ? AND thread_b = ?', {a, b}) end
+-- write runs sql_write; while a tab declaration of the plugin holds a transaction, it waits.
+local function write_sql(q, p)
+  local out = wait('a SQL fixture write', function()
+    local ok, r = pcall(sql_write, q, p)
+    if ok then return {r} end
+    local text = type(r) == 'table' and tostring(r.code) .. ': ' .. tostring(r.message) or tostring(r)
+    if not text:find('busy', 1, true) then return {nil, r} end -- another error: no retry
+  end)
+  if out[2] ~= nil then error(out[2], 0) end
+  return out[1]
+end
+local function writes()
+  return one([[SELECT CAST((SELECT n FROM clock) AS TEXT) AS n, (SELECT count(*) FROM operations) AS operations,
+    (SELECT count(*) FROM deliveries) AS deliveries]])
+end
 local function find(list, id)
   for _, t in ipairs(list or {}) do if t.id == id then return t end end
 end
@@ -22,28 +41,22 @@ local retry_result, historical, legacy_group
 
 test('legacy data before the identities exist', function()
   retry_result = alice:call('messaging.send', retry_args)
-  historical = store('message/' .. retry_result.id)
+  historical = message(retry_result.id)
   legacy_group = alice:call('messaging.thread_create', group_args)
   -- The user opens the direct thread with alice (explicit open intent) and keeps the view open.
   user:open('thread/alice'):render() -- an empty direct thread: view.open records the open intent
   alice:call('messaging.send', {to = 'user', body = 'hello user', key = 'to-user'})
-  write({
-    {key = 'thread-archive/' .. part('user'), value = {ids = {alice = true}}},
-    {key = 'draft/' .. part('user') .. part('alice'), value = {text = 'keep the legacy draft'}},
-    {key = 'message/canonical-before-migration', value = {id = 'canonical-before-migration', from = 'user', to = bob_id, body = 'existing canonical mail', at = '2026-10-17T00:00:00Z'}},
-    {key = box(bob_id), value = {ids = {['canonical-before-migration'] = true}}},
-    {key = 'thread-meta/' .. part('alice') .. part('bob'), value = {home_session = 'session:first-alias-home'}},
-    {key = 'thread-meta/' .. part(alice_id) .. part(bob_id), value = {home_session = 'session:later-alias-home'}},
-  })
+  sql_write("INSERT INTO thread_archived (viewer, peer) VALUES ('user', 'alice')")
+  sql_write("INSERT INTO drafts (viewer, peer, text, rev) VALUES ('user', 'alice', 'keep the legacy draft', 1)")
+  sql_write('UPDATE clock SET n = n + 1')
+  sql_write([[INSERT INTO messages (seq, id, sender, recipient, thread_a, thread_b, body, at)
+    SELECT n, 'canonical-before-migration', 'user', ?, ?, 'user', 'existing canonical mail', '2026-10-17T00:00:00Z' FROM clock]], {bob_id, bob_id})
+  sql_write("INSERT INTO deliveries (agent, seq, acked) SELECT ?, seq, 0 FROM messages WHERE id = 'canonical-before-migration'", {bob_id})
+  sql_write("INSERT INTO thread_homes (thread_a, thread_b, home_session, moved, set_rev) VALUES ('alice', 'bob', 'session:first-alias-home', 0, 1)")
+  sql_write("INSERT INTO thread_homes (thread_a, thread_b, home_session, moved, set_rev) VALUES (?, ?, 'session:later-alias-home', 0, 2)", {alice_id, bob_id})
 end)
 
 test('migration moves mailboxes, groups, drafts, archives and homes to the identities', function()
-  local ids = store(box('bob')).value.ids
-  ids['raced-legacy-mail'] = true
-  inject({match = {op_prefix = 'identity-migrate/'}, ops = {
-    {key = 'message/raced-legacy-mail', value = {id = 'raced-legacy-mail', from = 'user', to = 'bob', body = 'arrived during scan', at = '2026-10-17T00:00:01Z'}},
-    {key = box('bob'), value = {ids = ids}},
-  }})
   alice:report({kind = 'claude', conversation_id = 'conversation-a'})
   bob:report({kind = 'codex', conversation_id = 'conversation-b'})
   local migrated = bob:call('messaging.read', {})
@@ -51,17 +64,19 @@ test('migration moves mailboxes, groups, drafts, archives and homes to the ident
   expect(m.from).to_be(alice_id)
   expect(m.to).to_be(bob_id)
   expect(has_id(migrated.messages, 'canonical-before-migration')).to_be(true)
-  expect(has_id(migrated.messages, 'raced-legacy-mail'), 'mail that arrived during the scan moves too').to_be(true)
-  expect(store('thread-meta/' .. part(alice_id) .. part(bob_id)).value.home_session, 'the first alias home wins').to_be('session:first-alias-home')
-  expect(store('thread-meta/' .. part('alice') .. part('bob')).rev).to_be('0')
-  expect(store(box('bob')).rev).to_be('0')
-  expect(store(box('alice')).rev).to_be('0')
-  expect(store('message/' .. retry_result.id), 'historical messages and their cursors stay unchanged').to_equal(historical)
-  expect(store('groups').value.groups[legacy_group.id].members).to_equal({alice_id, bob_id, 'user'})
-  expect(store('draft/' .. part('user') .. part('alice')).rev).to_be('0')
-  expect(store('draft/' .. part('user') .. part(alice_id)).value.text).to_be('keep the legacy draft')
-  expect(store('thread-open/' .. part('user') .. part(alice_id)).value.opened, 'migration keeps the explicit open intent').to_be(true)
-  expect(store('thread-archive/' .. part('user')).value.ids[alice_id]).to_be(true)
+  expect(home(alice_id, bob_id).home_session, 'the first alias home wins').to_be('session:first-alias-home')
+  expect(home('alice', 'bob')).to_be(nil)
+  expect(unread('bob') + unread('alice'), 'no delivery keeps a legacy name').to_be(0)
+  local moved = message(retry_result.id)
+  expect(moved.seq, 'historical messages keep their cursors').to_be(historical.seq)
+  expect(moved.body).to_be(historical.body)
+  local members = {}
+  for _, r in ipairs(sql('SELECT agent FROM group_members WHERE gid = ? AND current = 1 ORDER BY pos', {legacy_group.id})) do members[#members + 1] = r.agent end
+  expect(members).to_equal({alice_id, bob_id, 'user'})
+  expect(draft('user', 'alice')).to_be(nil)
+  expect(draft('user', alice_id).text).to_be('keep the legacy draft')
+  expect(one('SELECT 1 AS x FROM thread_opened WHERE viewer = ? AND peer = ?', {'user', alice_id}), 'migration keeps the explicit open intent').to_be_truthy()
+  expect(one('SELECT 1 AS x FROM thread_archived WHERE viewer = ? AND peer = ?', {'user', alice_id})).to_be_truthy()
   expect(notice('bob').pending, 'the legacy notice is cleared').to_be(false)
   expect(notice(bob_id).pending).to_be(true)
   bob:call('messaging.ack', {ids = {retry_result.id}})
@@ -69,14 +84,14 @@ test('migration moves mailboxes, groups, drafts, archives and homes to the ident
 end)
 
 test('old operation keys return their original results after migration', function()
-  local before = batches()
+  local before = writes()
   expect(alice:call('messaging.send', retry_args)).to_equal(retry_result)
-  expect(batches(), 'a retry does not write or notify again').to_be(before)
+  expect(writes(), 'a retry does not write again').to_equal(before)
   expect(alice:call('messaging.thread_create', group_args)).to_equal(legacy_group)
   expect_error(function() alice:call('messaging.send', {to = 'bob', body = 'changed', key = 'migration-retry'}) end, 'different content')
   local fresh = alice:call('messaging.send', {to = 'bob tab', body = 'canonical new message', key = 'new-identity-send'})
-  expect(store('message/' .. fresh.id).value.from).to_be(alice_id)
-  expect(store('message/' .. fresh.id).value.to).to_be(bob_id)
+  expect(message(fresh.id).sender).to_be(alice_id)
+  expect(message(fresh.id).recipient).to_be(bob_id)
 end)
 
 test('the user sees the migrated thread: archive, history, draft; the old name still resolves', function()
@@ -154,7 +169,7 @@ test('rename from the menu form, then a Rex tab rename wins over an old form ret
     if t == 'Release notes' then return t end
   end)
   expect(title).to_be('Release notes')
-  expect(store('thread-title/' .. part('user') .. part(alice_id)).value.title).to_be('Release notes')
+  expect(title_of('user', alice_id).title).to_be('Release notes')
   expect(operation('rename-form').status, 'the form operation is final').to_be('succeeded')
   expect_error(function() user:plugin_view('rename', {route = '/thread/' .. alice_id, user = 'user', title = 'Wrong caller'}) end, 'Only the hub')
 end)
@@ -182,19 +197,17 @@ test('an unnamed identity shows a short ID; declared titles are never empty', fu
 end)
 
 test('two different drafts stop a migration until one is removed', function()
-  write({
-    {key = 'draft/' .. part('user') .. part('charlie'), value = {text = 'old draft'}},
-    {key = 'draft/' .. part('user') .. part(charlie_id), value = {text = 'new draft'}},
-    {key = 'thread-title/' .. part('user') .. part('charlie'), value = {title = 'Legacy title'}},
-    {key = 'thread-title/' .. part('user') .. part(charlie_id), value = {title = 'Latest title'}},
-  })
+  sql_write("INSERT INTO drafts (viewer, peer, text, rev) VALUES ('user', 'charlie', 'old draft', 1)")
+  sql_write("INSERT INTO drafts (viewer, peer, text, rev) VALUES ('user', ?, 'new draft', 2)", {charlie_id})
+  sql_write("INSERT INTO thread_titles (viewer, peer, title, set_rev) VALUES ('user', 'charlie', 'Legacy title', 1)")
+  sql_write("INSERT INTO thread_titles (viewer, peer, title, set_rev) VALUES ('user', ?, 'Latest title', 2)", {charlie_id})
   charlie:report({kind = 'claude', conversation_id = 'conversation-c'})
   expect_error(function() alice:call('messaging.read', {}) end, 'Two drafts have different text')
-  expect(store('draft/' .. part('user') .. part('charlie')).value.text).to_be('old draft')
-  expect(store('draft/' .. part('user') .. part(charlie_id)).value.text).to_be('new draft')
-  write({{key = 'draft/' .. part('user') .. part(charlie_id), delete = true}})
+  expect(draft('user', 'charlie').text).to_be('old draft')
+  expect(draft('user', charlie_id).text).to_be('new draft')
+  write_sql("DELETE FROM drafts WHERE viewer = 'user' AND peer = ?", {charlie_id})
   alice:call('messaging.read', {})
-  expect(store('draft/' .. part('user') .. part(charlie_id)).value.text).to_be('old draft')
-  expect(store('thread-title/' .. part('user') .. part(charlie_id)).value.title).to_be('Latest title')
-  expect(store('thread-title/' .. part('user') .. part('charlie')).rev).to_be('0')
+  expect(draft('user', charlie_id).text).to_be('old draft')
+  expect(title_of('user', charlie_id).title).to_be('Latest title')
+  expect(title_of('user', 'charlie')).to_be(nil)
 end)

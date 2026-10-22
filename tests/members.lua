@@ -1,9 +1,20 @@
--- Ported from the Node test messaging.mjs (coverage map: commit eaaf529): membership changes (the UI form and the tool), delivery
--- snapshots, history pages, a send race with a membership change, direct expansion, the team
--- refusal, and the replay of a creation that an older plugin version saved.
+-- Ported from the Node test messaging.mjs (coverage map: commit eaaf529): membership changes (the UI form and the tool), the
+-- audience fixed at send, history pages, a send after a membership change, direct expansion, the
+-- team refusal, and the replay of a creation that an older plugin version saved.
 
 local function part(s) return #s .. ':' .. s end
-local function box(name) return 'mailbox/' .. part(name) end
+local function members_of(gid)
+  local out = {}
+  for _, r in ipairs(sql('SELECT agent FROM group_members WHERE gid = ? AND current = 1 ORDER BY pos', {gid})) do out[#out + 1] = r.agent end
+  return out
+end
+local function delivered(agent, id)
+  return #sql('SELECT 1 AS x FROM deliveries d JOIN messages m ON m.seq = d.seq WHERE d.agent = ? AND m.id = ?', {agent, id}) == 1
+end
+local function writes()
+  return sql([[SELECT CAST((SELECT n FROM clock) AS TEXT) AS n, (SELECT count(*) FROM operations) AS operations,
+    (SELECT count(*) FROM group_members) AS members]])[1]
+end
 local function find(list, id)
   for _, t in ipairs(list or {}) do if t.id == id then return t end end
 end
@@ -34,35 +45,30 @@ test('the user creates a group in the New Thread form', function()
   expect(op.status).to_be('succeeded')
   local id = op.result.navigate:match('^thread/(.+)$')
   editable = {id = id}
-  expect(store('groups').value.groups[id].members).to_equal({'alice', 'bob', 'user'})
+  expect(members_of(id)).to_equal({'alice', 'bob', 'user'})
 end)
 
-test('a member change in the form keeps delivered mail and an unrelated concurrent group', function()
+test('a member change in the form keeps delivered mail and other groups', function()
   old_mail = alice:call('messaging.send', {to = editable.id, body = 'Before membership changed', key = 'before-members'})
-  -- A message from before immutable recipient snapshots: no recipients field.
-  local legacy = store('message/' .. old_mail.id).value
-  legacy.recipients = nil
-  write({{key = 'message/' .. old_mail.id, value = legacy}})
-  old_rev = store('message/' .. old_mail.id).rev
+  old_rev = sql('SELECT * FROM messages WHERE id = ?', {old_mail.id})[1]
+  local other = alice:call('messaging.thread_create', {key = 'other-group', title = 'Other group', members = {'bob', 'user'}})
   local f = menu_form(editable.id, 'members')
   expect(find(H.node(f:render(), 'thread_members').fields, 'member_bob').value).to_be(true)
-  local groups = store('groups').value
-  groups.groups['g-concurrent-members'] = {name = 'Concurrent group', members = {'bob', 'user'}}
-  local op = with_injection({match = {op_prefix = 'members/'}, ops = {{key = 'groups', value = groups}}}, 1, function()
-    return f:action('thread_members', 'submit', {values = {member_alice = true, member_charlie = true}}, 'change-members')
-  end)
+  local op = f:action('thread_members', 'submit', {values = {member_alice = true, member_charlie = true}}, 'change-members')
   expect(op.result).to_equal({close_form = true})
-  expect(store('groups').value.groups['g-concurrent-members'], 'the retry keeps an unrelated group').to_be_truthy()
-  expect(store('groups').value.groups[editable.id].members).to_equal({'alice', 'charlie', 'user'})
-  expect(store('message/' .. old_mail.id).rev, 'membership never rewrites old messages').to_be(old_rev)
+  expect(members_of(other.id), 'another group is unchanged').to_equal({'alice', 'bob', 'user'})
+  expect(members_of(editable.id)).to_equal({'alice', 'charlie', 'user'})
+  expect(sql('SELECT * FROM messages WHERE id = ?', {old_mail.id})[1], 'membership never rewrites old messages').to_equal(old_rev)
+  expect(delivered('bob', old_mail.id), 'the audience of a sent message stays').to_be(true)
+  expect(delivered('charlie', old_mail.id)).to_be(false)
 end)
 
 test('members as a tool: a replay returns the first result; changed members under the key conflict', function()
   local args = {thread = editable.id, members = {'charlie', 'user'}, key = 'tool-members'}
   local first = alice:call('messaging.thread_members', args)
-  local before = batches()
+  local before = writes()
   expect(alice:call('messaging.thread_members', args)).to_equal(first)
-  expect(batches(), 'a replay does not write').to_be(before)
+  expect(writes(), 'a replay does not write').to_equal(before)
   expect_error(function() alice:call('messaging.thread_members', {thread = editable.id, members = {'bob', 'user'}, key = 'tool-members'}) end, 'different content')
 end)
 
@@ -96,14 +102,11 @@ test('history pages: newest first, an older cursor excludes later arrivals, no a
   expect_error(function() charlie:call('messaging.history', {thread = editable.id, limit = 51}) end, 'limit')
 end)
 
-test('a send whose membership snapshot goes stale uses the new members on retry', function()
-  local groups = store('groups').value
-  groups.groups[editable.id].members = {'alice', 'bob', 'user'}
-  local raced = with_injection({match = {op_key = 'send/' .. part('alice') .. part('membership-race')}, ops = {{key = 'groups', value = groups}}}, 1, function()
-    return alice:call('messaging.send', {to = editable.id, body = 'Membership race', key = 'membership-race'})
-  end)
-  expect(store(box('bob')).value.ids[raced.id]).to_be(true)
-  expect((store(box('charlie')).value or {ids = {}}).ids[raced.id]).to_be(nil)
+test('a send after a membership change goes to the new members', function()
+  alice:call('messaging.thread_members', {thread = editable.id, members = {'bob', 'user'}, key = 'members-back'})
+  local sent = alice:call('messaging.send', {to = editable.id, body = 'New members', key = 'membership-after'})
+  expect(delivered('bob', sent.id)).to_be(true)
+  expect(delivered('charlie', sent.id)).to_be(false)
 end)
 
 test('adding members to a direct thread creates a group; the direct history stays', function()
@@ -123,14 +126,14 @@ end)
 
 test('a creation saved by an older plugin version replays without adding a home', function()
   local key = 'thread-create/' .. part('user') .. part('old-create-no-home')
-  put_operation({key = key, fingerprint = 'thread-create-v1/' .. part('') .. part('charlie') .. part('user'),
-    result = {id = 'charlie', title = 'charlie', members = {'charlie', 'user'}, group = false}})
-  write({{key = 'thread-meta/' .. part('charlie') .. part('user'), delete = true}})
+  sql_write('INSERT INTO operations (key, owner, fingerprint, result) VALUES (?, ?, ?, ?)', {key, 'user',
+    'thread-create-v1/' .. part('') .. part('charlie') .. part('user'),
+    '{"id":"charlie","title":"charlie","members":["charlie","user"],"group":false}'})
   user:command('new_thread')
   local f = user:view('/forms/new-thread')
   f:render()
   local op = f:action('new_thread', 'submit', {values = {member_charlie = true}}, 'old-create-no-home')
   expect(op.status).to_be('succeeded')
   expect(tab('thread/charlie').session_id or '', 'an old operation replay does not add a home').to_be('')
-  expect(store('thread-meta/' .. part('charlie') .. part('user')).rev).to_be('0')
+  expect(#sql("SELECT 1 AS x FROM thread_homes WHERE thread_a = 'charlie' AND thread_b = 'user'")).to_be(0)
 end)

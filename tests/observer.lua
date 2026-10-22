@@ -8,6 +8,11 @@ local function find(list, id)
   for _, t in ipairs(list or {}) do if t.id == id then return t end end
 end
 local function count(t) local n = 0 for _ in pairs(t or {}) do n = n + 1 end return n end
+-- user_mail is the user's delivery rows: what observation must not change.
+local function user_mail() return sql("SELECT seq, acked FROM deliveries WHERE agent = 'user' ORDER BY seq") end
+local function is_member(gid, agent)
+  return #sql('SELECT 1 AS x FROM group_members WHERE gid = ? AND agent = ? AND current = 1', {gid, agent}) == 1
+end
 
 local alice, bob, charlie = agent('alice'), agent('bob'), agent('charlie')
 local group, old, direct_id
@@ -52,20 +57,20 @@ test('an observed direct opens read-only, without status or token, and refuses d
 end)
 
 test('observing acknowledges and delivers nothing; agents get no observer threads', function()
-  local before = store('mailbox/' .. part('user'))
+  local before = user_mail()
   direct_view:seen()
   local gv = user:open('thread/' .. group.id)
   gv:render()
   gv:seen()
   rex.sleep(1) -- view.seen runs in the hub's view worker
-  expect(store('mailbox/' .. part('user')), 'observation does not acknowledge or deliver mail').to_equal(before)
+  expect(user_mail(), 'observation does not acknowledge or deliver mail').to_equal(before)
   local list = charlie:call('messaging.thread_list', {}).threads
   expect(find(list, group.id) or find(list, direct_id), 'agents do not get observer threads').to_be(nil)
   expect_error(function() charlie:call('messaging.history', {thread = group.id}) end, 'Only a current member')
 end)
 
 local joined
-test('the first message joins the group atomically, retries a concurrent rename, and backfills nothing', function()
+test('the first message joins the group atomically and backfills nothing', function()
   local v = user:view('thread/' .. group.id)
   local tree = v:render()
   expect(H.node(tree, 'observer_notice').text).to_match('first message')
@@ -75,38 +80,26 @@ test('the first message joins the group atomically, retries a concurrent rename,
   local bad = v:send('composer', 'Joining the discussion', '0', 'bad-join')
   expect(bad.status).to_be('failed')
   expect(bad.error.message).to_match('draft differs')
-  local members = store('groups').value.groups[group.id].members
-  for _, m in ipairs(members) do expect(m, 'a refused send does not join').not_to_be('user') end
-  -- A legacy message has no inline delivery snapshot; joining must keep its old audience.
-  local legacy = store('message/' .. old.id).value
-  legacy.recipients = nil
-  write({{key = 'message/' .. old.id, value = legacy}})
-  local user_box = store('mailbox/' .. part('user'))
-  local groups = store('groups').value
-  groups.groups[group.id].name = 'Agent discussion after concurrent rename'
+  expect(is_member(group.id, 'user'), 'a refused send does not join').to_be(false)
+  local user_box = user_mail()
   local join_key = 'send/' .. part('user') .. part('join-group')
   -- Atomic join: a failed commit leaves neither the membership nor the message. The hub retries
-  -- the operation (the outcome was unknown); three failures, then a concurrent rename.
-  local failing = inject({match = {op_key = join_key}, fail = 'Injected join failure', fail_code = 'unavailable', times = 3})
-  local renaming = inject({match = {op_key = join_key}, ops = {{key = 'groups', value = groups}}})
+  -- the operation (the outcome was unknown); three failures, then the commit.
+  local failing = inject({match = {sql_commit_writes = 'messages'}, fail = 'Injected join failure', fail_code = 'unavailable', times = 3})
   local _, k = v:admit('send', {node_id = 'composer', text = 'Joining the discussion', draft_revision = saved.result.draft_revision, operation_key = 'join-group'})
   wait('a failed join commit', function() if injection(failing).consumed >= 1 then return true end end)
-  expect(operation(k).status, 'the join is still pending').to_be('pending')
-  for _, m in ipairs(store('groups').value.groups[group.id].members) do expect(m, 'a failed join commits no membership').not_to_be('user') end
-  expect(store('message/' .. join_key).rev, 'and no message').to_be('0')
   joined = v:settle(k)
   expect(injection(failing).consumed).to_be(3)
-  expect(injection(renaming).consumed, 'the join retried a concurrent group rename').to_be(1)
   expect(joined.status).to_be('succeeded')
-  local writes = batches()
+  local before = sql('SELECT CAST(n AS TEXT) AS n FROM clock')[1].n
   local again = v:send('composer', 'Joining the discussion', saved.result.draft_revision, 'join-group')
   expect(again.result, 'joining and sending are idempotent').to_equal(joined.result)
-  expect(batches(), 'the repeat writes nothing').to_be(writes)
-  local n = 0
-  for _, m in ipairs(store('groups').value.groups[group.id].members) do if m == 'user' then n = n + 1 end end
-  expect(n).to_be(1)
-  expect(store('mailbox/' .. part('user')), 'joining does not backfill unread history').to_equal(user_box)
-  expect(store('delivery/' .. part(old.id)).value.ids, 'legacy history keeps its recipients').to_equal({'bob'})
+  expect(sql('SELECT CAST(n AS TEXT) AS n FROM clock')[1].n, 'the repeat writes nothing').to_be(before)
+  expect(#sql("SELECT 1 AS x FROM group_members WHERE gid = ? AND agent = 'user'", {group.id})).to_be(1)
+  expect(#sql('SELECT 1 AS x FROM messages WHERE id = ?', {join_key})).to_be(1)
+  expect(user_mail(), 'joining does not backfill unread history').to_equal(user_box)
+  expect(#sql([[SELECT 1 AS x FROM deliveries d JOIN messages m ON m.seq = d.seq WHERE m.id = ?]], {old.id}),
+    'old history keeps its audience').to_be(1)
   local tree2 = panel():render()
   expect(find(H.node(tree2, 'observed_threads').items, group.id)).to_be(nil)
   expect(H.node(v:render(), 'observer_notice')).to_be(nil)

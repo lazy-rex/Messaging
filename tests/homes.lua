@@ -4,9 +4,25 @@
 -- creation that a failure interrupted.
 
 local function part(s) return #s .. ':' .. s end
-local function meta(a, b)
+-- home_of returns the stored home session of the direct thread of a and b.
+local function home_of(a, b)
   if b < a then local t = a; a = b; b = t end -- not a, b = b, a: wrong in Rex Lua (rex-protocol.md)
-  return 'thread-meta/' .. part(a) .. part(b)
+  local r = sql('SELECT home_session FROM thread_homes WHERE thread_a = ? AND thread_b = ?', {a, b})[1]
+  return r and r.home_session
+end
+-- write_sql runs sql_write; while the plugin holds a transaction, it waits.
+local function write_sql(q, p)
+  local out = wait('a SQL fixture write', function()
+    local ok, r = pcall(sql_write, q, p)
+    if ok then return {r} end
+    local text = type(r) == 'table' and tostring(r.code) .. ': ' .. tostring(r.message) or tostring(r)
+    if not text:find('busy', 1, true) then return {nil, r} end -- another error: no retry
+  end)
+  if out[2] ~= nil then error(out[2], 0) end
+  return out[1]
+end
+local function draft_of(viewer, peer)
+  return sql('SELECT text, CAST(rev AS TEXT) AS rev FROM drafts WHERE viewer = ? AND peer = ?', {viewer, peer})[1]
 end
 local function index_of(items, id)
   for i, t in ipairs(items or {}) do if t.id == id then return i end end
@@ -53,7 +69,7 @@ test('a direct thread gets its first home and keeps it', function()
   op = new_thread(pane_in(elsewhere), {member_alice = true}, 'home-direct-again')
   expect(op.result).to_equal({navigate = 'thread/alice'})
   expect(home_tab('alice').session_id, 'an existing direct thread keeps its first home').to_be(here)
-  expect(store(meta('alice', 'user')).value.home_session).to_be(here)
+  expect(home_of('alice', 'user')).to_be(here)
 end)
 
 test('a rename and a view do not change the reopen token; a new message does', function()
@@ -100,16 +116,17 @@ test('a closed home: the tab moves to a replacement session; the panel follows t
   expect(v.session, 'the tab lives in the replacement session').to_be(replacement)
   local items = panel_items(v)
   expect(index_of(items, 'charlie') < index_of(items, 'team'), 'a redirected thread comes first in the replacement session').to_be(true)
-  expect(store(meta('charlie', 'user')).value.home_session, 'the stored home stays').to_be(home)
+  expect(home_of('charlie', 'user'), 'the stored home stays').to_be(home)
 end)
 
-test('a concurrent first home wins without losing the creation', function()
-  local key = meta('bob', 'user')
-  with_injection({match = {writes = key}, ops = {{key = key, value = {home_session = 'session:winner'}}}}, 1, function()
-    local op = new_thread(nil, {member_bob = true}, 'home-race')
-    expect(op.result).to_equal({navigate = 'thread/bob'})
-  end)
-  expect(store(key).value.home_session).to_be('session:winner')
+-- Each handler is one SQL transaction, so two first homes cannot race. A home that exists before
+-- the creation stays.
+test('an existing home stays when the thread is created', function()
+  write_sql([[INSERT INTO thread_homes (thread_a, thread_b, home_session, moved, set_rev)
+    VALUES ('bob', 'user', 'session:winner', 0, (SELECT n FROM clock))]])
+  local op = new_thread(nil, {member_bob = true}, 'home-race')
+  expect(op.result).to_equal({navigate = 'thread/bob'})
+  expect(home_of('bob', 'user')).to_be('session:winner')
   expect(home_tab('bob').session_id).to_be('session:winner')
 end)
 
@@ -155,14 +172,15 @@ test('a menu move changes the home, keeps the token and the draft; @new names a 
   local field
   for _, f in ipairs(H.node(tree, 'move_thread').fields) do if f.id == 'session_id' then field = f end end
   expect(field.value, 'the current home is the default').to_be(here)
-  write({{key = 'draft/' .. part('user') .. part('alice'), value = {text = 'draft before the move'}}})
-  local draft = store('draft/' .. part('user') .. part('alice'))
+  write_sql([[INSERT INTO drafts (viewer, peer, text, rev) VALUES ('user', 'alice', 'draft before the move', (SELECT n FROM clock))
+    ON CONFLICT (viewer, peer) DO UPDATE SET text = excluded.text, rev = excluded.rev]])
+  local draft = draft_of('user', 'alice')
   local before = home_tab('alice').revision
   local op = form:action('move_thread', 'submit', {values = {session_id = elsewhere}}, 'move-existing')
   expect(op.result).to_equal({navigate = 'thread/alice'})
   expect(home_tab('alice').session_id).to_be(elsewhere)
   expect(home_tab('alice').revision, 'a move does not change the token').to_be(before)
-  expect(store('draft/' .. part('user') .. part('alice')), 'a move keeps the draft').to_equal(draft)
+  expect(draft_of('user', 'alice'), 'a move keeps the draft').to_equal(draft)
 end)
 
 test('move as a tool: @new, an old replay does not undo a later move, a changed input conflicts, closed refused', function()
@@ -182,7 +200,8 @@ end)
 
 test('a creation interrupted after its session exists reuses that session on retry', function()
   local args = {members = {'bob', 'user'}, title = 'Interrupted session creation', new_session = 'Resumed workspace', key = 'interrupted-new-session'}
-  with_injection({match = {op_key = 'thread-create/' .. part('alice') .. part('interrupted-new-session')}, fail = 'Injected failure after session creation'}, 1, function()
+  -- The session exists before the commit; the commit then fails, and nothing of the creation stays.
+  with_injection({match = {sql_commit_writes = 'operations'}, fail = 'Injected failure after session creation'}, 1, function()
     expect_error(function() alice:call('messaging.thread_create', args) end, 'Injected failure')
   end)
   expect(#named('Resumed workspace')).to_be(1)
