@@ -320,6 +320,63 @@ test('a draft larger than one request stops the import with its key', function()
   write({{key = key, delete = true}})
   reimport()
 end)
+test('an orphan fence (a crash before the import began) begins a new import', function()
+  write({{key = 'sql-import', value = {state = 'importing'}}})
+  local orphan = store('sql-import').rev
+  write_sql("DELETE FROM meta WHERE key LIKE 'import%'")
+  hub:restart()
+  wait_done()
+  expect(meta('import_f0') ~= orphan, 'a new fence').to_be(true)
+end)
+
+test('a crash after the fence moved to cutover and before the SQL commit ends at that fence', function()
+  -- The fence says cutover; SQL is still verified.
+  write_sql("UPDATE meta SET value = 'verified' WHERE key = 'import'")
+  write_sql("DELETE FROM meta WHERE key = 'import_f1'")
+  write({{key = 'sql-import', value = {state = 'cutover'}}})
+  local f1 = store('sql-import').rev
+  hub:restart()
+  wait_done()
+  expect(meta('import_f1')).to_be(f1)
+  expect(store('sql-import').rev, 'the fence is not written again').to_be(f1)
+  expect(sql('SELECT CAST(n AS TEXT) AS n FROM clock')[1].n).to_be(f1)
+end)
+
+test('a restart after the cutover changes nothing', function()
+  local f1, rev = meta('import_f1'), store('sql-import').rev
+  hub:restart()
+  wait_done()
+  expect(meta('import_f1')).to_be(f1)
+  expect(store('sql-import').rev).to_be(rev)
+end)
+
+test('an imported operation key replays only the same content, also under an alias', function()
+  -- alice has her identity since an earlier test; kv-key was saved under her old name.
+  expect(alice:call('messaging.send', {to = 'bob', body = 'direct one', key = 'kv-key'})).to_equal({id = 'kv/d1', key = 'kv-key'})
+  expect_error(function() alice:call('messaging.send', {to = 'bob', body = 'other content', key = 'kv-key'}) end, 'different content')
+end)
+
+test('a late alias whose merge has a draft conflict keeps the import verified until the conflict goes', function()
+  local bob_id = 'claude:conversation-bob'
+  -- A crash after verified, with two different drafts of the user: one for bob, one for the
+  -- identity that bob is about to get.
+  write_sql("INSERT INTO drafts (viewer, peer, text, rev) VALUES ('user', 'bob', 'draft for bob', 1)")
+  write_sql('INSERT INTO drafts (viewer, peer, text, rev) VALUES (?, ?, ?, 2)', {'user', bob_id, 'another draft'})
+  write_sql("UPDATE meta SET value = 'verified' WHERE key = 'import'")
+  write({{key = 'sql-import', value = {state = 'importing'}}})
+  bob:report({kind = 'claude', conversation_id = 'conversation-bob'})
+  hub:restart()
+  local e = wait('the import error', function() return sql("SELECT value FROM meta WHERE key = 'import_error'")[1] end)
+  expect(e.value:find('Two drafts have different text', 1, true) ~= nil, e.value).to_be(true)
+  expect(import_state(), 'the cutover rolled back').to_be('verified')
+  expect(sql("SELECT 1 AS x FROM aliases_applied WHERE alias = 'bob'")[1]).to_be(nil)
+  -- The conflict goes (here: one draft is removed); the next start ends the cutover.
+  write_sql('DELETE FROM drafts WHERE viewer = ? AND peer = ?', {'user', bob_id})
+  hub:restart()
+  wait_done()
+  expect(sql("SELECT identity FROM aliases_applied WHERE alias = 'bob'")).to_equal({{identity = bob_id}})
+  expect(sql('SELECT text FROM drafts WHERE viewer = ? AND peer = ?', {'user', bob_id})).to_equal({{text = 'draft for bob'}})
+end)
 -- A key-value store with 3000 messages: its import takes many steps.
 local bulk = {}
 local function write_bulk()
