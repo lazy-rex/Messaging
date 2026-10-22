@@ -118,7 +118,8 @@ test('only future messages become unread for the joined user', function()
 end)
 
 test('a long thread: the view holds the newest messages; history pages reach the first one', function()
-  for i = 0, 204 do alice:call('messaging.send', {to = 'bob', key = 'observer-page-' .. i, body = 'Older message ' .. i}) end
+  -- About 67 KB of messages: more than one view (the plugin measures the exact encoded size).
+  for i = 0, 204 do alice:call('messaging.send', {to = 'bob', key = 'observer-page-' .. i, body = 'Older message ' .. i .. ' ' .. string.rep('x', 200)}) end
   local history = H.node(direct_view:render(), 'history')
   expect(history.has_more).to_be(true)
   expect(#history.messages > 0).to_be(true)

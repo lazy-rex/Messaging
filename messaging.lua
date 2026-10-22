@@ -1233,9 +1233,10 @@ local page_budget = 40000
 
 
 -- history_page returns the newest messages older than the message ID before (nil: the newest
--- messages), oldest first, within budget bytes of estimated JSON, and whether older messages
--- exist. JSON escapes can double a body, so the estimate counts each body twice. The first message
--- always fits. A message larger than a page is cut, with a note, in the tree and in pages alike.
+-- messages), oldest first, within budget bytes of encoded JSON, and whether older messages exist.
+-- Each item is measured exactly (encoded_size): a JSON escape takes up to 6 bytes for 1. The first
+-- message always fits. A message larger than a page is cut, with a note, in the tree and in pages
+-- alike.
 local function history_page(user, peer, before, budget)
   local ta, tb = thread_pair(user, peer.id)
   local cursor
@@ -1269,16 +1270,24 @@ local function history_page(user, peer, before, budget)
       break
     end
     for _, r in ipairs(chunk) do
-      local body = r.body
-      local author = names[r.sender] or r.sender
-      local cost = 2 * r.body_bytes + #author + #r.id + 200
+      -- author is display text. own (optional) marks the user's own messages for styling.
+      local item = {id = r.id, author = names[r.sender] or r.sender, own = r.sender == user, text = r.body, at = r.at, fyi = r.reply_expected == 0}
+      local cut = r.body_bytes > #r.body -- the query read a prefix: the full item is over a page
+      local cost = cut and budget + page_budget or encoded_size(item) + 1
       if #newest_first > 0 and size + cost > budget then return older(), true end
       if cost > page_budget then
-        body = utf8_cut(body, math.floor((page_budget - 400) / 2)) .. '\n\n… (message cut: ' .. math.floor(r.body_bytes / 1024) .. ' KB)'
-        cost = page_budget
+        local note = '\n\n… (message cut: ' .. math.floor(r.body_bytes / 1024) .. ' KB)'
+        -- Each step removes at least the bytes over the page: one raw byte is 1 to 6 encoded.
+        local text = utf8_cut(r.body, page_budget)
+        item.text = text .. note
+        cost = encoded_size(item) + 1
+        while cost > page_budget and text ~= '' do
+          text = utf8_cut(text, #text - (cost - page_budget))
+          item.text = text .. note
+          cost = encoded_size(item) + 1
+        end
       end
-      -- author is display text. own (optional) marks the user's own messages for styling.
-      newest_first[#newest_first + 1] = {id = r.id, author = author, own = r.sender == user, text = body, at = r.at, fyi = r.reply_expected == 0}
+      newest_first[#newest_first + 1] = item
       size = size + cost
       cursor = r.seq
     end
@@ -1290,7 +1299,7 @@ local function render_thread(user, route)
   local peer = thread_peer(route, user)
   local text, draft_rev = draft(user, peer.id)
   -- The draft shares the tree's control message with the newest messages.
-  local messages, has_more = history_page(user, peer, nil, math.max(4000, page_budget - 2 * #text))
+  local messages, has_more = history_page(user, peer, nil, math.max(4000, page_budget - encoded_size(text)))
   local tree = {
     title = thread_title(user, peer),
     back = nil, -- the Rex sidebar lists the threads; no Back control
