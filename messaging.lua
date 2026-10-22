@@ -1618,6 +1618,10 @@ end
 
 local function render_form(args)
   local context = form_context(args)
+  if args.route == '/forms/thread-menu' and not (type(context.source_route) == 'string' and context.source_route:match('^/thread/')) then
+    -- Thread Settings… from the palette outside a thread view: there is no thread to set.
+    return {title = 'Thread settings', nodes = {{id = 'no_thread', type = 'widget', text = 'Open a thread, then choose Thread Settings… again.'}, cancel_node('Close')}}
+  end
   if args.route == '/forms/thread-menu' then
     -- The thread overview: who is in the thread, then what the user can do with it.
     local peer = form_peer(args)
@@ -2137,7 +2141,9 @@ app.on('hub.changed', function(args)
 end, {tx = false})
 
 for _, command in ipairs({{id = 'new_thread', title = 'New Thread…', description = 'Start a conversation with agents', keywords = {'message', 'conversation'}, route = '/forms/new-thread', action = 'messaging.thread_create'},
-    {id = 'threads', title = 'Threads…', description = 'List all threads, with this session first', keywords = {'message', 'conversation'}, surface = 'panel', landing = true, route = '/panels/threads', user_only = 'navigation'}}) do app.command(command) end
+    {id = 'threads', title = 'Threads…', description = 'List all threads, with this session first', keywords = {'message', 'conversation'}, surface = 'panel', landing = true, route = '/panels/threads', user_only = 'navigation'},
+    -- One entry for the settings of the thread in the source view (user decision 2026-10-22).
+    {id = 'thread_settings', title = 'Thread Settings…', description = 'Rename, members, move or archive the thread you are viewing', keywords = {'thread', 'rename', 'members', 'archive', 'move'}, route = '/forms/thread-menu', user_only = 'navigation'}}) do app.command(command) end
 
 -- Spike 3 has one UI user. Each conversation has one tab.
 -- The import runs in steps: each step is one transaction or one page of a check (import.lua).
