@@ -1275,14 +1275,17 @@ local function history_page(user, peer, before, budget)
       local cut = r.body_bytes > #r.body -- the query read a prefix: the full item is over a page
       local cost = cut and budget + page_budget or encoded_size(item) + 1
       if #newest_first > 0 and size + cost > budget then return older(), true end
-      if cost > page_budget then
+      -- Only the first item gets here over the budget: it is cut to the budget (the render passes
+      -- what remains after the draft), at most one page.
+      local limit = math.min(page_budget, budget)
+      if cost > limit then
         local note = '\n\n… (message cut: ' .. math.floor(r.body_bytes / 1024) .. ' KB)'
-        -- Each step removes at least the bytes over the page: one raw byte is 1 to 6 encoded.
-        local text = utf8_cut(r.body, page_budget)
+        -- Each step removes at least the bytes over the limit: one raw byte is 1 to 6 encoded.
+        local text = utf8_cut(r.body, limit)
         item.text = text .. note
         cost = encoded_size(item) + 1
-        while cost > page_budget and text ~= '' do
-          text = utf8_cut(text, #text - (cost - page_budget))
+        while cost > limit and text ~= '' do
+          text = utf8_cut(text, #text - (cost - limit))
           item.text = text .. note
           cost = encoded_size(item) + 1
         end

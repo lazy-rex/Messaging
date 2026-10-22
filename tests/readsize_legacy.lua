@@ -132,3 +132,19 @@ test('several long message IDs: pages are packed by size, and every message arri
   for i, id in ipairs(ids) do expect(got[id], 'message ' .. i).to_be('long id ' .. i) end
   expect(pages >= 2, 'four 13 KB IDs need more than one page').to_be(true)
 end)
+
+-- The view keeps room for the draft: the first history item is cut to the budget that remains
+-- after the draft, not to a whole page. (Review of 1ba9952: 56877 bytes, over the 48 KiB view
+-- limit of the SDK.)
+test('a stored message larger than a page and an admitted draft fit one view together', function()
+  local m = {id = 'legacy/view-with-draft', from = 'bob', to = 'user', body = string.rep('x', 50000), at = at}
+  deliver(m, 'user', {'bob', 'user'})
+  local v = user:open('thread/bob')
+  v:render()
+  local draft = string.rep('d', 16384)
+  local op = v:draft('composer', draft, '0', 'legacy-view-draft')
+  expect(op.status).to_be('succeeded')
+  local tree = v:render()
+  expect(H.node(tree, 'history').messages[1].id).to_be(m.id)
+  expect(#rex.json.encode(tree) <= 49152, 'the view fits the SDK limit').to_be(true)
+end)
