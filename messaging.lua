@@ -1237,19 +1237,24 @@ local function history_page(user, peer, before, budget)
   end
   local names = {}
   for _, a in ipairs(participants) do names[a.id] = display_name(a) end
-  local query = 'SELECT ' .. message_columns(page_budget) .. ' FROM messages m WHERE m.thread_a = ? AND m.thread_b = ?'
-    .. ' AND m.seq < CAST(? AS INTEGER) ORDER BY m.seq DESC LIMIT 8'
+  local function query(op)
+    return 'SELECT ' .. message_columns(page_budget) .. ' FROM messages m WHERE m.thread_a = ? AND m.thread_b = ?'
+      .. ' AND m.seq ' .. op .. ' CAST(? AS INTEGER) ORDER BY m.seq DESC LIMIT 8'
+  end
   local newest_first, size = {}, 0
   local function older()
     local out = {}
     for n = #newest_first, 1, -1 do out[#out + 1] = newest_first[n] end
     return out
   end
-  -- Bounded chunks, newest first. A cursor above every seq starts at the newest message.
+  -- Bounded chunks, newest first. Without a cursor, the first chunk includes the largest
+  -- sequence, 9223372036854775807; later chunks start below the oldest row read.
+  local op = cursor and '<' or '<='
   cursor = cursor or '9223372036854775807'
   while true do
     -- A partial chunk is fine: the next query starts after its oldest row.
-    local chunk, more = db.query(query, ta, tb, cursor)
+    local chunk, more = db.query(query(op), ta, tb, cursor)
+    op = '<'
     if #chunk == 0 then
       if more then fail('internal', 'One message is over one reply') end
       break
