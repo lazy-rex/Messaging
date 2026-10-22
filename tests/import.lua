@@ -61,6 +61,21 @@ local function deliveries(id)
   return out
 end
 
+-- craft writes an import in progress, as a crash leaves it: the fence and the meta rows, no rows.
+local function craft(meta_rows)
+  for _, t in ipairs(TABLES) do write_sql('DELETE FROM ' .. t) end
+  write_sql("DELETE FROM meta WHERE key LIKE 'import%'")
+  for k, v in pairs(meta_rows) do write_sql('INSERT INTO meta (key, value) VALUES (?, ?)', {k, v}) end
+end
+local function meta(key) return (sql('SELECT value FROM meta WHERE key = ?', {key})[1] or {}).value end
+local function wait_done()
+  return wait('the import', function()
+    if import_state() == 'done' then return true end
+    local e = sql("SELECT value FROM meta WHERE key = 'import_error'")[1]
+    if e then error('the import failed: ' .. e.value, 0) end
+  end)
+end
+
 local revs = {}
 test('a key-value store imports: messages, audiences, unread, threads, groups, viewer state, gallery, operations', function()
   revs.d1 = msg('kv/d1', 'alice', 'bob', 'direct one')
@@ -132,21 +147,36 @@ test('a body larger than one request is imported in parts', function()
   expect(r).to_equal({n = #body, same = 1})
   expect(#sql('SELECT key FROM import_body')).to_be(0)
 end)
+-- body_of compares the imported body with the source byte for byte.
+local function body_of(id, body)
+  return sql('SELECT length(CAST(body AS BLOB)) AS n, CAST(body AS BLOB) = CAST(? AS BLOB) AS same FROM messages WHERE id = ?', {body, id})[1]
+end
 
--- craft writes an import in progress, as a crash leaves it: the fence and the meta rows, no rows.
-local function craft(meta_rows)
-  for _, t in ipairs(TABLES) do write_sql('DELETE FROM ' .. t) end
-  write_sql("DELETE FROM meta WHERE key LIKE 'import%'")
-  for k, v in pairs(meta_rows) do write_sql('INSERT INTO meta (key, value) VALUES (?, ?)', {k, v}) end
-end
-local function meta(key) return (sql('SELECT value FROM meta WHERE key = ?', {key})[1] or {}).value end
-local function wait_done()
-  return wait('the import', function()
-    if import_state() == 'done' then return true end
-    local e = sql("SELECT value FROM meta WHERE key = 'import_error'")[1]
-    if e then error('the import failed: ' .. e.value, 0) end
-  end)
-end
+test('a chunked body with multibyte characters and a NUL byte is imported exactly', function()
+  -- 2 bytes for each character: the byte offsets of the parts differ from the character counts.
+  local body = string.rep('é', 25000) .. '\0' .. string.rep('ü', 5000)
+  msg('kv/unicode', 'alice', 'charlie', body, {recipients = {'charlie'}})
+  chain('alice', 'charlie', {'kv/large', 'kv/unicode'})
+  reimport()
+  expect(body_of('kv/unicode', body)).to_equal({n = #body, same = 1})
+end)
+
+test('an import that stopped between two parts of a body continues at its byte offset', function()
+  local body = string.rep('é', 25000) .. '\0' .. string.rep('ü', 5000)
+  -- The first message key: no other chunked body comes before it, so the saved offset is its own.
+  msg('kv/0resume', 'alice', 'charlie', body, {recipients = {'charlie'}})
+  chain('alice', 'charlie', {'kv/large', 'kv/unicode', 'kv/0resume'})
+  write({{key = 'sql-import', value = {state = 'importing'}}})
+  -- The state a crash leaves after the first part: 10000 bytes stored (5000 characters). The
+  -- families before message/ run again, on empty tables.
+  craft({import = 'importing', import_f0 = store('sql-import').rev, import_aliases = '{}', import_roster = '["alice","bob","charlie"]',
+    import_progress = rex.json.encode({phase = 'families', family = 1, key = 'message/kv/0resume', offset = 10000})})
+  write_sql('INSERT INTO import_body (key, body) VALUES (?, CAST(? AS BLOB))', {'message/kv/0resume', body:sub(1, 10000)})
+  hub:restart()
+  wait_done()
+  expect(body_of('kv/0resume', body)).to_equal({n = #body, same = 1})
+  expect(#sql('SELECT key FROM import_body')).to_be(0)
+end)
 
 test('a resumed import keeps the roster of its start for the team fallback', function()
   msg('kv/t1', 'alice', 'team', 'to the team')

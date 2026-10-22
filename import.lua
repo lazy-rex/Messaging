@@ -272,14 +272,16 @@ return function(env)
       return true
     end
     local offset = p.key == r.key and p.offset or 0
+    -- body is a BLOB: length counts bytes, as offset does (on TEXT it counts characters).
     local stored = db.first('SELECT length(body) AS n FROM import_body WHERE key = ?', r.key)
     if (stored and stored.n or 0) ~= offset then conflict('A chunked body has another length', r.key) end
     if offset < #m.body then
       local piece = utf8_cut(m.body:sub(offset + 1), CHUNK)
       while encoded_size(piece) > CHUNK do piece = utf8_cut(piece, math.floor(#piece / 2)) end
       if piece == '' then conflict('A body cannot be cut', r.key) end
+      -- || gives TEXT, also for two BLOBs: the CAST keeps the stored body a BLOB.
       db.exec([[INSERT INTO import_body (key, body) VALUES (?, CAST(? AS BLOB))
-        ON CONFLICT (key) DO UPDATE SET body = body || excluded.body]], r.key, piece)
+        ON CONFLICT (key) DO UPDATE SET body = CAST(body || excluded.body AS BLOB)]], r.key, piece)
       p.key, p.offset = r.key, offset + #piece
       return false
     end
