@@ -25,6 +25,8 @@ local function import_state() return (sql("SELECT value FROM meta WHERE key = 'i
 
 -- reimport empties the SQL state and the fence, and restarts the hub: the plugin imports the
 -- key-value records at start. It returns when the import state is `want` (default done).
+-- The wait is 60 s: the import of all records written by the tests before it can take longer
+-- than the default 10 s on a loaded machine (fixture readiness, not a product latency limit).
 local function reimport(want)
   for _, t in ipairs(TABLES) do write_sql('DELETE FROM ' .. t) end
   write_sql("DELETE FROM meta WHERE key LIKE 'import%'")
@@ -34,7 +36,7 @@ local function reimport(want)
     if import_state() == (want or 'done') then return true end
     local e = sql("SELECT value FROM meta WHERE key = 'import_error'")[1]
     if e and not want then error('the import failed: ' .. e.value, 0) end
-  end)
+  end, 60)
 end
 
 -- msg writes a message record as the key-value release did and returns its revision.
