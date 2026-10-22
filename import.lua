@@ -707,7 +707,7 @@ return function(env)
           if not a.alias_of then
             pending = db.first('SELECT 1 AS x FROM deliveries WHERE agent = ? AND acked = 0 LIMIT 1', a.id) ~= nil
           end
-          env.notice(a.id, pending)
+          env.notice(a.id, pending, pending and {once = true} or nil)
         end
       end
     end)

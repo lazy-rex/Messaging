@@ -105,6 +105,11 @@ test('a key-value store imports: messages, audiences, unread, threads, groups, v
     result = {id = 'kv/d1', key = 'kv-key'}})
   local draft_rev = store('draft/' .. part('user') .. part('g-kv')).rev
   reimport()
+  -- The cutover gives each agent one notice; a pending one has once (notice v2).
+  local cut = {}
+  for _, c in ipairs(calls('hub.sql.commit')) do for _, n in ipairs(c.args.notices or {}) do cut[n.agent] = n end end
+  expect(cut.bob).to_equal({agent = 'bob', pending = true, once = true})
+  expect(cut.alice).to_equal({agent = 'alice', pending = false})
 
   expect(deliveries('kv/d1')).to_equal({'bob=0'})
   expect(deliveries('kv/d2')).to_equal({'alice=1'})

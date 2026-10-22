@@ -162,17 +162,26 @@ end
 -- Notices. A handler marks each agent whose unread state it may change; at its end, flush gives
 -- the hub one notice for each agent (the hub admits one for each agent in a commit), with
 -- pending queried after the writes, so it is exact. inside: a handler runs, and its end flushes.
-local notes = {marked = {}, list = {}, inside = false}
+-- Notice v2 (hub contract, SDK app.notice once and app.notice_read): a pending notice has once, so
+-- the hub nudges an agent one time until it reads. A read marks its agent read: the agent gets
+-- {read} while mail stays unread (pending does not change), or pending = false.
+local notes = {marked = {}, list = {}, read = {}, inside = false}
 local function notify(agent)
   if not notes.marked[agent] then notes.marked[agent] = true; notes.list[#notes.list + 1] = agent end
 end
+local function notify_read(agent)
+  notes.read[agent] = true
+  notify(agent)
+end
 local function flush()
-  local list = notes.list
-  notes.marked, notes.list = {}, {}
+  local list, read = notes.list, notes.read
+  notes.marked, notes.list, notes.read = {}, {}, {}
   if #list == 0 then return end
   for _, r in ipairs(rows([[SELECT value AS agent,
       EXISTS (SELECT 1 FROM deliveries d WHERE d.agent = value AND d.acked = 0) AS p FROM json_each(?)]], json(list))) do
-    app.notice(r.agent, r.p == 1)
+    if r.p ~= 1 then app.notice(r.agent, false)
+    elseif read[r.agent] then app.notice_read(r.agent)
+    else app.notice(r.agent, true, {once = true}) end
   end
 end
 
@@ -706,6 +715,8 @@ local function read(agent, args)
   if type(since) ~= 'string' or not since:match('^%d+$') or (#since > 1 and since:sub(1, 1) == '0') then
     fail('invalid_input', 'since must be a decimal revision cursor')
   end
+  -- The agent reads: the hub may nudge it again for mail that comes later (notice v2).
+  notify_read(agent)
   local filter, ta, tb = '', nil, nil
   if args.thread ~= nil then
     if type(args.thread) ~= 'string' or args.thread == '' then fail('invalid_input', 'thread must be a nonempty ID') end
@@ -1973,7 +1984,7 @@ local function handler(fn, declares, render)
       return fn(ctx, args)
     end
     local result = db.transaction(function()
-      notes.marked, notes.list, notes.inside = {}, {}, true
+      notes.marked, notes.list, notes.read, notes.inside = {}, {}, {}, true
       local ok, out = pcall(function()
         refresh_participants()
         migrate_aliases()
@@ -2072,7 +2083,7 @@ local import = require('import')({
     local inside = notes.inside
     notes.inside = true
     migrate_aliases()
-    notes.inside, notes.marked, notes.list = inside, {}, {}
+    notes.inside, notes.marked, notes.list, notes.read = inside, {}, {}, {}
   end,
 })
 local import_timer = {}

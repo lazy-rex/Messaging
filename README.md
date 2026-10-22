@@ -12,7 +12,7 @@ Check this repository out next to LazyRex, and add the plugin to the hub config:
 
 The plugin loads its other files from its own directory, so keep them together.
 
-Messaging runs on the LazyRex Plugin SDK v0. Its `lazyrex.json` has `"sdk": "0"`, so the hub starts it through the SDK launcher (`sdk/lua/boot.lua`). A hub without the launcher cannot start it. Messaging keeps its data in the plugin's SQL database (`hub.sql`), so it also needs a hub with `hub.sql`. It reads a result of any size with `db.each`, and a render only reads, so it needs SDK commit eb9654d or later.
+Messaging runs on the LazyRex Plugin SDK v0. Its `lazyrex.json` has `"sdk": "0"`, so the hub starts it through the SDK launcher (`sdk/lua/boot.lua`). A hub without the launcher cannot start it. Messaging keeps its data in the plugin's SQL database (`hub.sql`), so it also needs a hub with `hub.sql`. It reads a result of any size with `db.each`, and a render only reads, so it needs SDK commit eb9654d or later. It gives notice v2 forms (`once` and `read`), so it needs SDK commit 7e59a2a or later and a hub with notice v2 in `hub.sql.commit`.
 
 Plugin args (hub config `plugins[].args`):
 
@@ -35,6 +35,8 @@ Each action and each view action is one SQL transaction (`app.db`). The schema i
 
 A send writes one message row and one delivery row for each recipient. No request depends on the
 size of a mailbox, a thread or a group. The hub admits one notice for each agent in a commit.
+New mail gives a pending notice with `once`: the hub nudges the agent one time until it reads.
+`messaging.read` records the read (`read`), or gives `pending = false` when no mail is unread.
 
 ## Import from the key-value release
 
@@ -119,6 +121,7 @@ lazyrex-hub test -file send.lua
 | concat.lua | Joins of lists that a caller controls do not overflow table.concat (the Gallery form with 2600 fields; lazyrex.json test.files sets gallery = true). |
 | gallery.lua | The Gallery view with the plugin arg gallery = true (lazyrex.json test.files): render, actions, draft and send. |
 | tab_coalesce.lua | A burst of `hub.changed agents` gives one or two tab declarations, and the declaration still has the threads (needs hub.test.calls). |
+| notice.lua | The notice forms of each commit (notice v2): `once` for new mail, `read` for a read, `pending = false` without unread mail (needs hub.test.calls). |
 
 `lazyrex.json` is the test manifest. `tests/parity_fixture.lua` renders the thread menu forms for
 the parity sweep.
