@@ -495,3 +495,119 @@ test('an import that the hub kill stops in the middle of the messages continues'
   expect(meta('import_f0'), 'the import continued').to_be(f0)
   expect(sql("SELECT count(*) AS n FROM messages WHERE id LIKE 'kv/n%'")[1].n).to_be(3000)
 end)
+
+-- Interruptions of a running import. An injection (sql_commit_writes) fails one real commit of the
+-- import at a boundary; the import stops with that error and keeps the state that it committed.
+-- The injection lives in hub memory, so the test arms it after the start, while the bulk import
+-- runs in timer steps. Then a hub kill (crash = true) restarts on that persisted state. The kill
+-- comes after the failure: it does not land inside a commit.
+local function progress() return rex.json.decode(meta('import_progress') or '{}') end
+local function import_error()
+  return wait('the injected failure', function()
+    local e = meta('import_error')
+    if e then return e end
+  end, 300)
+end
+local function count_bulk() return sql("SELECT count(*) AS n FROM messages WHERE id LIKE 'kv/n%'")[1].n end
+
+test('an import stopped between two parts of a body continues at the committed offset', function()
+  write_bulk()
+  -- kv/unicode (an earlier test) comes after the 3000 bulk messages. Its body needs three parts.
+  -- kv/0resume and kv/large come before the bulk messages: their parts are done when the import
+  -- is in the bulk messages.
+  local body = string.rep('é', 25000) .. '\0' .. string.rep('ü', 5000)
+  expect(store('message/kv/unicode').value.body == body, 'the kv/unicode record').to_be(true)
+  restart_empty()
+  wait('the import in the bulk messages', function()
+    local p = progress()
+    return import_state() == 'importing' and p.family == 3 and (p.after or '') >= 'message/kv/n0500'
+  end)
+  -- The first part of kv/unicode commits; the commit of its second part fails.
+  inject({match = {sql_commit_writes = 'import_body'}, skip = 1, fail = 'interrupted between parts'})
+  expect(import_error()).to_match('interrupted between parts')
+  local p = progress()
+  expect(p.key).to_be('message/kv/unicode')
+  expect(p.offset > 0 and p.offset < #body, 'one part is committed').to_be(true)
+  local stored = sql('SELECT length(body) AS n, body = CAST(? AS BLOB) AS same FROM import_body WHERE key = ?',
+    {body:sub(1, p.offset), 'message/kv/unicode'})[1]
+  expect(stored).to_equal({n = p.offset, same = 1})
+  expect(#sql("SELECT id FROM messages WHERE id = 'kv/unicode'")).to_be(0)
+  hub:restart({crash = true})
+  wait_done(300)
+  expect(body_of('kv/unicode', body)).to_equal({n = #body, same = 1})
+  expect(#sql('SELECT key FROM import_body')).to_be(0)
+  expect(count_bulk()).to_be(3000)
+end)
+
+test('a reset whose new fence commits and whose begin fails continues from the old SQL state', function()
+  -- Not the orphan fence of a first start (no SQL meta): a reset keeps the meta of the import
+  -- before it. The orphan fence test above crafts that state.
+  write_bulk()
+  restart_empty()
+  wait('the groups family', function() return import_state() == 'importing' and (progress().family or 0) >= 2 end)
+  local f0 = meta('import_f0')
+  expect(#sql('SELECT gid FROM groups'), 'the groups are imported').to_be(1)
+  -- Only the begin of a reset changes the groups table from now on: it deletes the imported rows.
+  inject({match = {sql_commit_writes = 'groups'}, fail = 'interrupted at the reset'})
+  -- A changed source record: the verification finds it and resets the import.
+  write({{key = 'groups', value = {groups = {['g-kv'] = {name = 'KV group renamed', members = {'alice', 'bob', 'user'}, past_members = {'charlie'}}}}}})
+  expect(import_error()).to_match('interrupted at the reset')
+  local fence = store('sql-import')
+  expect(fence.value.state).to_be('importing')
+  expect(fence.rev ~= f0, 'the reset wrote a new fence').to_be(true)
+  expect(meta('import'), 'the begin did not commit').to_be('importing')
+  expect(meta('import_f0')).to_be(f0)
+  expect(sql('SELECT name FROM groups')).to_equal({{name = 'KV group'}})
+  hub:restart({crash = true})
+  wait_done(300)
+  expect(meta('import_f0') ~= f0, 'a new import began').to_be(true)
+  expect(sql('SELECT name FROM groups')).to_equal({{name = 'KV group renamed'}})
+  expect(count_bulk()).to_be(3000)
+end)
+
+-- cutover_case runs the bulk import to its cutover commit, which the injection fails (after =
+-- false: nothing commits; after = true: the commit happens and its reply is lost).
+local function cutover_case(after)
+  write_bulk()
+  put_operation({key = 'send/' .. part('bob') .. part('kv-cut'), fingerprint = 'send-v2/' .. part('user') .. part('bulk 1') .. part(''),
+    result = {id = 'kv/n0001', key = 'kv-cut'}})
+  restart_empty()
+  wait('the import to start', function() return import_state() == 'importing' end)
+  -- Only the cutover changes the clock during the import.
+  inject({match = {sql_commit_writes = 'clock'}, fail = 'interrupted at the cutover', after = after})
+  expect(import_error()).to_match('interrupted at the cutover')
+  local fence = store('sql-import')
+  expect(fence.value.state).to_be('cutover')
+  return fence.rev
+end
+local function clock() return sql('SELECT CAST(n AS TEXT) AS n FROM clock')[1].n end
+local function after_cutover(f1)
+  expect(meta('import_f1')).to_be(f1)
+  expect(store('sql-import').rev, 'the fence is not written again').to_be(f1)
+  expect(clock()).to_be(f1)
+  -- The tick after the cutover clears the error, in its own commit.
+  wait('the import error to clear', function() return meta('import_error') == nil end)
+  expect(count_bulk()).to_be(3000)
+  expect(bob:call('messaging.send', {to = 'user', body = 'bulk 1', key = 'kv-cut'})).to_equal({id = 'kv/n0001', key = 'kv-cut'})
+  expect_error(function() bob:call('messaging.send', {to = 'user', body = 'other', key = 'kv-cut'}) end, 'different content')
+end
+
+test('a refused cutover commit leaves the fence at cutover; the restart ends at that fence', function()
+  local f1 = cutover_case(false)
+  expect(import_state(), 'nothing committed').to_be('verified')
+  expect(meta('import_f1')).to_be(nil)
+  expect(clock() ~= f1, 'the clock did not move').to_be(true)
+  hub:restart({crash = true})
+  wait_done(300)
+  after_cutover(f1)
+end)
+
+test('a cutover commit whose reply is lost is done; the restart changes nothing', function()
+  local f1 = cutover_case(true)
+  expect(import_state(), 'the commit happened').to_be('done')
+  expect(meta('import_f1')).to_be(f1)
+  expect(clock()).to_be(f1)
+  hub:restart({crash = true})
+  wait_done(300)
+  after_cutover(f1)
+end)
