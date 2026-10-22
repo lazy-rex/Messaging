@@ -28,6 +28,29 @@ return function(env)
     fail('migration_conflict', message .. (key and (': ' .. key) or ''))
   end
 
+  -- batches cuts a list of strings into lists of at most BATCH encoded bytes: each list goes into
+  -- one request as JSON, and a request holds at most 64 KiB with its SQL text. An item larger than
+  -- BATCH alone stops the import.
+  local BATCH = 48000
+  local function batches(list)
+    local out, block, size = {}, {}, 2
+    for _, item in ipairs(list) do
+      local cost = encoded_size(item) + 1
+      if cost + 2 > BATCH then conflict('A key or ID is too large for one request', utf8_cut(item, 200)) end
+      if size + cost > BATCH then out[#out + 1] = block; block, size = {}, 2 end
+      block[#block + 1] = item
+      size = size + cost
+    end
+    if #block > 0 then out[#out + 1] = block end
+    return out
+  end
+  -- fits stops the import when the values of one row are larger than one request.
+  local function fits(key, ...)
+    local size = 0
+    for i = 1, select('#', ...) do size = size + encoded_size(select(i, ...) or '') end
+    if size > LARGE then conflict('A record is too large for one request', key) end
+  end
+
   -- meta -----------------------------------------------------------------------------------------
 
   local function meta(key)
@@ -186,8 +209,9 @@ return function(env)
     local key = 'delivery/' .. part(m.id)
     local delivery = m.recipients == nil and kv_get({key})[key] or nil
     -- The audience has no duplicates; a row from an earlier record cannot exist (a new seq).
-    db.exec('INSERT INTO deliveries (agent, seq, acked) SELECT value, CAST(? AS INTEGER), 1 FROM json_each(?)',
-      r.rev, json(audience(m, delivery, groups)))
+    for _, block in ipairs(batches(audience(m, delivery, groups))) do
+      db.exec('INSERT INTO deliveries (agent, seq, acked) SELECT value, CAST(? AS INTEGER), 1 FROM json_each(?)', r.rev, json(block))
+    end
   end
 
   -- Families: one function for each, called with one source record ------------------------------
@@ -198,6 +222,7 @@ return function(env)
     if type(r.value) ~= 'table' or type(r.value.groups) ~= 'table' then conflict('Invalid groups record', r.key) end
     for gid, g in pairs(r.value.groups) do
       if type(g) ~= 'table' or type(g.name) ~= 'string' or type(g.members) ~= 'table' then conflict('Invalid group', gid) end
+      fits('groups ' .. utf8_cut(gid, 200), gid, g.name)
       db.exec('INSERT INTO groups (gid, name) VALUES (?, ?)', gid, g.name)
       local pos = 0
       for _, id in ipairs(g.members) do pos = pos + 1; member(gid, c(str(id, gid, 'member')), pos, 1) end
@@ -215,8 +240,11 @@ return function(env)
       ids[#ids + 1] = id
     end
     if #ids == 0 then return end
-    local changed = db.exec([[UPDATE deliveries SET acked = 0 WHERE agent = ?
-      AND seq IN (SELECT m.seq FROM messages m JOIN json_each(?) j ON m.id = j.value)]], agent, json(ids)).changes
+    local changed = 0
+    for _, block in ipairs(batches(ids)) do
+      changed = changed + db.exec([[UPDATE deliveries SET acked = 0 WHERE agent = ?
+        AND seq IN (SELECT m.seq FROM messages m JOIN json_each(?) j ON m.id = j.value)]], agent, json(block)).changes
+    end
     if changed ~= #ids then conflict('A mailbox names a message without a delivery to its agent', r.key) end
   end
   import_record['thread-meta/'] = function(r)
@@ -225,6 +253,7 @@ return function(env)
     if type(v) ~= 'table' or type(v.home_session) ~= 'string' then conflict('Invalid thread home', r.key) end
     if a:sub(1, 2) == 'd-' then a = c_thread(a)
     elseif a ~= '' then a, b = sorted(c(a), c(b)) end
+    fits(r.key, a, b, v.home_session)
     home(a, b, v.home_session, v.moved == true and 1 or 0, type(v.set_rev) == 'string' and v.set_rev or r.rev)
   end
   import_record['thread-title/'] = function(r)
@@ -232,6 +261,7 @@ return function(env)
     local v = r.value
     -- Today a title without a visible character shows the display name: no row.
     if type(v) ~= 'table' or type(v.title) ~= 'string' or not v.title:match('%S') then return end
+    fits(r.key, viewer, peer, v.title)
     title(c(viewer), c_thread(peer), v.title, type(v.set_rev) == 'string' and v.set_rev or r.rev)
   end
   import_record['thread-open/'] = function(r)
@@ -251,9 +281,11 @@ return function(env)
   import_record['draft/'] = function(r)
     local viewer, peer = pair2(r.key:sub(#'draft/' + 1), r.key)
     local text = type(r.value) == 'table' and type(r.value.text) == 'string' and r.value.text or ''
+    fits(r.key, viewer, peer, text)
     draft(c(viewer), c_thread(peer), text, r.rev, r.key)
   end
   import_record['gallery/'] = function(r)
+    fits(r.key, r.key, json(r.value))
     db.exec('INSERT INTO gallery (key, value, rev) VALUES (?, ?, CAST(? AS INTEGER))', r.key:sub(#'gallery/' + 1), json(r.value), r.rev)
   end
   -- Provenance only: the source check covers it; aliases_applied comes from M.
@@ -271,7 +303,8 @@ return function(env)
     local m = message_value(r)
     local rest = {id = m.id, from = m.from, to = m.to, reply_to = m.reply_to, at = m.at, recipients = m.recipients}
     if encoded_size(rest) > LARGE then conflict('A message has fields too large for one request', r.key) end
-    if encoded_size(m.body) <= LARGE then
+    -- Inline: the body and the other fields go into one request together.
+    if encoded_size(rest) + encoded_size(m.body) <= LARGE then
       insert_message(r, m, '?', m.body, groups)
       source(r.key, r.rev)
       return true
@@ -367,7 +400,7 @@ return function(env)
     function t.step()
       if t.family <= #FAMILIES then
         local prefix = FAMILIES[t.family]
-        local list, more = scan(prefix, t.after, 200) -- the keys go into one request (64 KiB)
+        local list, more = scan(prefix, t.after, 200)
         local keys = {}
         for _, r in ipairs(list) do
           t.after = r.key
@@ -377,7 +410,12 @@ return function(env)
             t.seen[r.key] = r.rev
           end
         end
-        local found = env.rows('SELECT key, rev FROM import_source WHERE key IN (SELECT value FROM json_each(?))', json(keys))
+        local found = {}
+        for _, block in ipairs(batches(keys)) do
+          for _, row in ipairs(env.rows('SELECT key, rev FROM import_source WHERE key IN (SELECT value FROM json_each(?))', json(block))) do
+            found[#found + 1] = row
+          end
+        end
         for _, row in ipairs(found) do
           if t.seen[row.key] ~= row.rev then return false, row.key end
         end
@@ -402,11 +440,14 @@ return function(env)
   local function ops_task(complete)
     local t = {after = '', count = 0}
     function t.step()
-      local page = hub('hub.store.ops_scan', {after = t.after, limit = 200}) -- the keys go into one request
+      local page = hub('hub.store.ops_scan', {after = t.after, limit = 200})
       local keys, by_key = {}, {}
       for _, op in ipairs(page.ops or {}) do keys[#keys + 1] = op.key; by_key[op.key] = op; t.after = op.key end
-      local found = env.rows([[SELECT o.key, o.fingerprint, o.result FROM operations o JOIN import_ops i ON i.key = o.key
-        WHERE o.key IN (SELECT value FROM json_each(?))]], json(keys))
+      local found = {}
+      for _, block in ipairs(batches(keys)) do
+        for _, row in ipairs(env.rows([[SELECT o.key, o.fingerprint, o.result FROM operations o JOIN import_ops i ON i.key = o.key
+          WHERE o.key IN (SELECT value FROM json_each(?))]], json(block))) do found[#found + 1] = row end
+      end
       for _, row in ipairs(found) do
         local op = by_key[row.key]
         if op.fingerprint ~= row.fingerprint or not same_value(op.result, rex.json.decode(row.result)) then return false, row.key end
@@ -420,12 +461,10 @@ return function(env)
     return t
   end
 
-  -- seq_of_ids looks the IDs up in blocks of 200: one request holds at most 64 KiB.
+  -- seq_of_ids looks the IDs up in byte-bounded batches.
   local function seq_of_ids(ids)
     local out = {}
-    for k = 1, #ids, 200 do
-      local block = {}
-      for i = k, math.min(k + 199, #ids) do block[#block + 1] = ids[i] end
+    for _, block in ipairs(batches(ids)) do
       for _, r in ipairs(env.rows([[SELECT m.id, CAST(m.seq AS TEXT) AS seq, m.thread_a, m.thread_b FROM messages m
         JOIN json_each(?) j ON m.id = j.value]], json(block))) do out[r.id] = r end
     end

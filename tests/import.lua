@@ -286,6 +286,40 @@ test('an alias that appears after the verification merges at the cutover', funct
   expect(sql("SELECT identity FROM aliases_applied WHERE alias = 'alice'")).to_equal({{identity = alice_id}})
 end)
 
+test('long IDs go into requests by byte size: 200 messages with 1000-byte IDs', function()
+  -- Each record fits one request, as the key-value release wrote it: the chain is in segments of
+  -- 50 IDs. A page of 200 keys or IDs is about 200 KB.
+  local ids, ops = {}, {}
+  for n = 1, 200 do
+    local id = 'kv/long/' .. string.format('%03d', n) .. string.rep('i', 989)
+    ids[n] = id
+    ops[#ops + 1] = {key = 'message/' .. id, value = {id = id, from = 'bob', to = 'claude:conversation-alice', body = 'long ' .. n, at = at}}
+    if #ops == 20 then write(ops); ops = {} end
+  end
+  -- alice has her identity since the test before; this chain is under the identity.
+  local pair = part('bob') .. part('claude:conversation-alice')
+  for k = 0, 3 do
+    local seg = {}
+    for n = k * 50 + 1, k * 50 + 50 do seg[#seg + 1] = ids[n] end
+    write({{key = 'thread-seg/' .. pair .. '/0/' .. k, value = {ids = seg}}})
+  end
+  write({{key = 'thread/' .. pair, value = {ids = {}, seg = 4, chain = '0'}}})
+  local unread = {}
+  for n = 1, 40 do unread[n] = ids[n] end
+  box('claude:conversation-alice', unread)
+  reimport()
+  expect(sql("SELECT count(*) AS n FROM messages WHERE id LIKE 'kv/long/%'")[1].n).to_be(200)
+  expect(sql("SELECT count(*) AS n FROM deliveries d JOIN messages m ON m.seq = d.seq WHERE m.id LIKE 'kv/long/%' AND d.acked = 0")[1].n).to_be(40)
+end)
+test('a draft larger than one request stops the import with its key', function()
+  local key = 'draft/' .. part('user') .. part('bob')
+  write({{key = key, value = {text = string.rep('d', 50000)}}})
+  reimport('importing')
+  local e = wait('the import error', function() return sql("SELECT value FROM meta WHERE key = 'import_error'")[1] end)
+  expect(e.value:find('A record is too large for one request: ' .. key, 1, true) ~= nil, e.value).to_be(true)
+  write({{key = key, delete = true}})
+  reimport()
+end)
 -- A key-value store with 3000 messages: its import takes many steps.
 local bulk = {}
 local function write_bulk()
