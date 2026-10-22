@@ -16,8 +16,10 @@ return function(env)
   local CHUNK = 30000 -- encoded bytes of one body part in import_body
   local LARGE = 40000 -- a message whose encoded body is larger is imported in chunks
   -- The families in import order: groups first (the audience fallback), messages before mailboxes.
+  -- The thread chains give no rows: they are sources of the verification, so the source check
+  -- covers them.
   local FAMILIES = {'groups', 'delivery/', 'message/', 'mailbox/', 'thread-meta/', 'thread-title/',
-    'thread-open/', 'thread-archive/', 'draft/', 'gallery/', 'identity-migrated/'}
+    'thread-open/', 'thread-archive/', 'draft/', 'gallery/', 'identity-migrated/', 'thread/', 'thread-seg/'}
   -- Saved operation families whose key has an agent part (the owner); others have owner ''.
   local OWNED = {['send/'] = true, ['thread-create/'] = true, ['thread-move/'] = true, ['rename/'] = true,
     ['thread-archive/'] = true, ['draft/'] = true, ['members/'] = true, ['create-restore/'] = true}
@@ -256,6 +258,9 @@ return function(env)
   end
   -- Provenance only: the source check covers it; aliases_applied comes from M.
   import_record['identity-migrated/'] = function() end
+  -- Read by verify_threads.
+  import_record['thread/'] = function() end
+  import_record['thread-seg/'] = function() end
 
   -- The message family has large records: a body over LARGE goes into import_body in parts.
   local function source(key, rev) db.exec("INSERT INTO import_source (key, rev, complete) VALUES (?, ?, 1)", key, rev) end
@@ -421,7 +426,7 @@ return function(env)
   -- verify_threads: each key-value chain maps through M to one SQL thread, ascends in seq, and the
   -- union of the chains of a thread equals its SQL messages.
   local function verify_threads()
-    local union = {} -- part(a) .. part(b) -> count of chain IDs
+    local union = {} -- part(a) .. part(b) -> {n = distinct chain IDs, ids = set}
     local after, more = nil, true
     while more do
       local list
@@ -449,14 +454,19 @@ return function(env)
           last = m.seq
         end
         local k = part(a) .. part(b)
-        union[k] = (union[k] or 0) + #ids
+        local u = union[k] or {n = 0, ids = {}}
+        union[k] = u
+        for _, id in ipairs(ids) do
+          if not u.ids[id] then u.ids[id] = true; u.n = u.n + 1 end
+        end
       end
     end
-    -- Each SQL thread has as many messages as its chains (chains do not share IDs: a message is
-    -- appended once).
+    -- Each chain ID is a message of its thread (above). So a thread whose distinct chain IDs are
+    -- as many as its SQL messages has exactly those messages. Two chains that meet under M can
+    -- share IDs: a sum of their lengths would hide a missing message.
     for _, t in ipairs(env.rows('SELECT thread_a, thread_b, count(*) AS n FROM messages GROUP BY thread_a, thread_b')) do
       local k = part(t.thread_a) .. part(t.thread_b)
-      if (union[k] or 0) ~= t.n then conflict('A thread has another set of messages', k) end
+      if (union[k] and union[k].n or 0) ~= t.n then conflict('A thread has another set of messages', k) end
       union[k] = nil
     end
     for k in pairs(union) do conflict('A thread has another set of messages', k) end

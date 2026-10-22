@@ -246,6 +246,28 @@ test('an alias in the hub maps every imported name to its identity; old operatio
   expect(notice('alice').pending, 'the cutover clears an agent with all mail acknowledged').to_be(false)
 end)
 
+test('two chains that meet under M and share an ID do not hide a message missing from both', function()
+  msg('kv/x1', 'charlie', 'bob', 'in both chains')
+  msg('kv/x2', charlie_id, 'bob', 'in no chain')
+  chain(charlie_id, 'bob', {'kv/c1', 'kv/c2', 'kv/c3', 'kv/x1'})
+  chain('charlie', 'bob', {'kv/x1'})
+  -- The chain lengths add up to the five messages of the thread; the distinct IDs are four.
+  reimport('importing')
+  local e = wait('the import error', function() return sql("SELECT value FROM meta WHERE key = 'import_error'")[1] end)
+  expect(e.value:find('A thread has another set of messages', 1, true) ~= nil, e.value).to_be(true)
+  chain(charlie_id, 'bob', {'kv/c1', 'kv/c2', 'kv/c3', 'kv/x1', 'kv/x2'})
+  reimport()
+end)
+
+test('a thread chain that changes after the verification resets the import', function()
+  local f0 = meta('import_f0')
+  write_sql("UPDATE meta SET value = 'verified' WHERE key = 'import'")
+  chain('charlie', 'bob', {'kv/x1'}) -- the same IDs, a new revision
+  write({{key = 'sql-import', value = {state = 'importing'}}})
+  hub:restart()
+  wait_done()
+  expect(meta('import_f0') ~= f0, 'the import began again').to_be(true)
+end)
 test('an alias that appears after the verification merges at the cutover', function()
   local alice_id = 'claude:conversation-alice'
   msg('kv/a1', 'alice', 'bob', 'from alice')
