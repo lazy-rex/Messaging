@@ -84,6 +84,7 @@ lazyrex-hub test -file send.lua
 | chain_growth.lua | F1 growth: 2000 messages, every send commits, history to the oldest message. |
 | migration_scan.lua | M1: the alias migration reads only the records it can change: archive values, the canonical mailbox, and the request evidence (needs hub.test.calls). |
 | tab_reads.lua | The tab declaration reads: the number of gets does not grow with the number of peers; the scans still grow with their pages (needs hub.test.calls). |
+| gallery.lua | The Gallery view with the plugin arg gallery = true (lazyrex.json test.files): render, actions, draft and send. |
 | tab_coalesce.lua | A burst of `hub.changed agents` gives one or two tab declarations, and the declaration still has the threads (needs hub.test.calls). |
 
 `lazyrex.json` is the test manifest. `tests/parity_fixture.lua` renders the thread menu forms for

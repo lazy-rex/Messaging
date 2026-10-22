@@ -18,6 +18,15 @@
     "name": "Charlie"
    }
   ],
+  "files": {
+   "gallery.lua": {
+    "args": {
+     "messaging": {
+      "gallery": "true"
+     }
+    }
+   }
+  },
   "parity_fixture": "tests/parity_fixture.lua",
   "parity_routes": [
    "/forms/thread-menu",
