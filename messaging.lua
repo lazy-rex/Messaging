@@ -1211,7 +1211,8 @@ end
 -- a 134 KB render, which the hub refused (too_large). The panel shows the user's own threads by
 -- name. Agent-only and archived threads are a count that opens a section page
 -- (/forms/threads/<list>/<from>). A list over list_budget bytes ends with a More item that opens
--- the next page. A label is cut to label_bytes, so one item always fits.
+-- the next page. A label is cut to label_bytes. A thread whose ID alone is over a page (a legacy ID
+-- has no size limit) shows as a row without an action.
 local list_budget = 36000
 local label_bytes = 200
 local sections = {threads = 'Conversations', observed_threads = 'Agent-only threads', archived_threads = 'Archived'}
@@ -1235,11 +1236,10 @@ local function home_lists(user, context)
       local archived = s.archived[a.id]
       local label = thread_title(user, a, s)
       if #label > label_bytes then label = utf8_cut(label, label_bytes - 3) .. '…' end
-      -- Only an unread count is detail text. An observed thread says how the user can join it.
+      -- Names only: the detail is an unread count, when there is one.
       local item = {id = a.id, label = label, detail = n > 0 and (n .. ' unread') or nil,
         action = archived and {name = 'restore', label = 'Restore', enabled = true, tool = 'messaging.thread_archive'}
           or {name = 'open', label = 'Open', enabled = true, user_only = 'navigation'}}
-      if a.observer then item.detail = a.readonly and 'Read-only direct thread' or 'Send a message to join' end
       local target = archived and lists.archived_threads or (a.observer and lists.observed_threads or lists.threads)
       target[#target + 1] = item
     end
@@ -1248,7 +1248,8 @@ local function home_lists(user, context)
 end
 
 -- list_page returns the items from index from on that fit in list_budget bytes, then a More item
--- (ID more:<next index>) when items remain. The first item always fits.
+-- (ID more:<next index>) when items remain. An item over a page by itself becomes a row without
+-- an action (ID long:<index>), so every page holds at least one item.
 local function list_page(items, from)
   local function more(next)
     return {id = 'more:' .. next, label = 'More…', detail = (#items - next + 1) .. ' more',
@@ -1258,11 +1259,16 @@ local function list_page(items, from)
   local out, size = {}, 0
   for i = from, #items do
     local cost = encoded_size(items[i]) + 1
-    if #out > 0 and size + cost + reserve > list_budget then
+    local item = items[i]
+    if cost + reserve > list_budget then
+      item = {id = 'long:' .. i, label = 'A thread whose ID is too long to show'}
+      cost = encoded_size(item) + 1
+    end
+    if size + cost + reserve > list_budget then
       out[#out + 1] = more(i)
       return out
     end
-    out[#out + 1] = items[i]
+    out[#out + 1] = item
     size = size + cost
   end
   return out

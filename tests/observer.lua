@@ -41,8 +41,10 @@ test('agent-only threads appear as observed, with no tab and no unread', functio
   local tree = panel():render()
   expect(H.node(tree, 'observed_threads').text).to_match('^Agent%-only threads %(%d+%)$')
   local observed = H.node(section('observed_threads'):render(), 'observed_threads').items
-  expect(find(observed, group.id).detail).to_be('Send a message to join')
-  expect(find(observed, direct_id).detail).to_be('Read-only direct thread')
+  -- Names only: no detail without unread messages.
+  expect(find(observed, group.id).detail).to_be(nil)
+  expect(find(observed, direct_id).label ~= nil).to_be(true)
+  expect(find(observed, direct_id).detail).to_be(nil)
   expect(find(H.node(tree, 'threads').items, group.id)).to_be(nil)
 end)
 

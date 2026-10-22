@@ -106,3 +106,21 @@ test('a thread on a later page opens; New thread opens its form', function()
   op = panel():action('new_thread', 'new', {})
   expect(op.result).to_equal({form = '/forms/new-thread'})
 end)
+
+test('a thread whose ID alone is over a page shows as a row without an action', function()
+  -- A legacy group ID has no size limit. This one is 40000 characters.
+  local gid = 'g-x' .. string.rep('0', 39997)
+  write_sql("INSERT INTO groups (gid, name) VALUES (?, 'Long ID')", {gid})
+  write_sql("INSERT INTO group_members (gid, agent, pos, current) VALUES (?, 'user', 1, 1), (?, 'alice', 2, 1)", {gid, gid})
+  local tree = panel():render()
+  expect(size(tree) < limit, 'the panel is ' .. size(tree) .. ' bytes').to_be(true)
+  local items = H.node(tree, 'threads').items
+  local ids = walk('threads', panel(), 'more', {item_id = items[#items].id})
+  for _, item in ipairs(items) do ids[#ids + 1] = item.id end
+  local long = 0
+  for _, id in ipairs(ids) do
+    if id:match('^long:') then long = long + 1 end
+    expect(#id < 1000, 'no page carries the long ID').to_be(true)
+  end
+  expect(long).to_be(1)
+end)
