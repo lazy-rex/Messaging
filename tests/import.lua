@@ -331,7 +331,14 @@ local function write_bulk()
     ops[#ops + 1] = {key = 'message/' .. id, value = {id = id, from = 'bob', to = 'user', body = 'bulk ' .. i, at = at}}
     if #ops == 300 then write(ops); ops = {} end
   end
-  chain('bob', 'user', bulk)
+  -- The chain in 60 segments of 50 IDs, as the key-value release stored a long thread.
+  local pair = part('bob') .. part('user')
+  for k = 0, 59 do
+    local seg = {}
+    for n = k * 50 + 1, k * 50 + 50 do seg[#seg + 1] = bulk[n] end
+    write({{key = 'thread-seg/' .. pair .. '/0/' .. k, value = {ids = seg}}})
+  end
+  write({{key = 'thread/' .. pair, value = {ids = {}, seg = 60, chain = '0'}}})
 end
 local function restart_empty()
   for _, t in ipairs(TABLES) do write_sql('DELETE FROM ' .. t) end
@@ -340,13 +347,26 @@ local function restart_empty()
   hub:restart()
 end
 
-test('a call during the import fails with unavailable at once', function()
+test('every call during the import and its verification fails with unavailable at once', function()
   write_bulk()
   restart_empty()
-  expect(import_state(), 'the import still runs').to_be('importing')
-  -- The import gives way to calls between its steps; it does not hold them until its end.
-  expect_error(function() bob:call('messaging.read', {}) end, 'importing')
-  wait_done(300)
+  -- The plugin starts the import after its registration.
+  wait('the import to start', function() return import_state() == 'importing' end)
+  -- The import gives way to calls between its steps, also while it verifies the 60 segments of the
+  -- chain; it does not hold a call until its end (a held call times out after 10 s).
+  -- A table field, not a captured local: a change of a captured local in the wait callback is lost
+  -- (the pcall rule, LazyRex docs/rex-protocol.md).
+  local calls = {n = 0}
+  wait('the import, with calls during it', function()
+    local ok, err = pcall(bob.call, bob, 'messaging.read', {})
+    calls.n = calls.n + 1
+    if not ok then
+      local text = type(err) == 'table' and tostring(err.code) .. ': ' .. tostring(err.message) or tostring(err)
+      if not text:find('importing', 1, true) then error('a call during the import: ' .. text, 0) end
+    end
+    return import_state() == 'done' and ok
+  end, 300)
+  expect(calls.n > 1, 'calls ran during the import').to_be(true)
   expect(#bob:call('messaging.history', {thread = 'user', limit = 1}).messages).to_be(1)
 end)
 

@@ -474,50 +474,74 @@ return function(env)
   -- threads_task: each key-value chain maps through M to one SQL thread, ascends in seq, and the
   -- union of the chains of a thread equals its SQL messages.
   local function threads_task()
-    local t = {after = nil, done = false, union = {}} -- union: part(a) .. part(b) -> {n = distinct IDs, ids = set}
+    -- cur: the chain in progress {key, a, b, v, seg (next segment), ids, blocks, block (next), last}.
+    -- union: part(a) .. part(b) -> {n = distinct IDs, ids = set}. groups_after: the SQL page cursor.
+    local t = {after = nil, cur = nil, scanned = false, union = {}, groups_after = nil}
+    -- One unit for each call: a chain record, one segment, one lookup batch, or one SQL page.
     function t.step()
-      if not t.done then
-        local list, more = scan('thread/', t.after, 100)
-        for _, r in ipairs(list) do
-          t.after = r.key
-          local a, b = pair2(r.key:sub(#'thread/' + 1), r.key)
-          if a ~= '' then a, b = sorted(c(a), c(b)) end
-          local v = r.value
-          if type(v) ~= 'table' or type(v.ids) ~= 'table' then conflict('Invalid thread record', r.key) end
-          local ids = {}
-          for k = 0, (v.seg or 0) - 1 do
-            local key = 'thread-seg/' .. r.key:sub(#'thread/' + 1) .. '/' .. (v.chain or '0') .. '/' .. k
-            local seg = kv_get({key})[key]
-            if seg.rev == '0' or type(seg.value) ~= 'table' or type(seg.value.ids) ~= 'table' then conflict('A thread segment is missing', key) end
-            for _, id in ipairs(seg.value.ids) do ids[#ids + 1] = id end
-          end
-          for _, id in ipairs(v.ids) do ids[#ids + 1] = id end
-          local found, last = seq_of_ids(ids), nil
-          for _, id in ipairs(ids) do
-            local m = found[id]
-            if not m then conflict('A thread names a message that is not imported', r.key .. ' ' .. id) end
-            if m.thread_a ~= a or m.thread_b ~= b then conflict('A message is in another thread', r.key .. ' ' .. id) end
-            if last and not later(m.seq, last) then conflict('A thread is not in message order', r.key) end
-            last = m.seq
-          end
-          local k = part(a) .. part(b)
+      if not t.scanned and not t.cur then
+        local list, more = scan('thread/', t.after, 1)
+        local r = list[1]
+        if not r then t.scanned = true; return nil end
+        t.after = r.key
+        if not more then t.scanned = true end
+        local a, b = pair2(r.key:sub(#'thread/' + 1), r.key)
+        if a ~= '' then a, b = sorted(c(a), c(b)) end
+        local v = r.value
+        if type(v) ~= 'table' or type(v.ids) ~= 'table' then conflict('Invalid thread record', r.key) end
+        t.cur = {key = r.key, a = a, b = b, v = v, seg = 0, ids = {}}
+        return nil
+      end
+      local cur = t.cur
+      if cur then
+        if cur.seg < (cur.v.seg or 0) then
+          local key = 'thread-seg/' .. cur.key:sub(#'thread/' + 1) .. '/' .. (cur.v.chain or '0') .. '/' .. cur.seg
+          local seg = kv_get({key})[key]
+          if seg.rev == '0' or type(seg.value) ~= 'table' or type(seg.value.ids) ~= 'table' then conflict('A thread segment is missing', key) end
+          for _, id in ipairs(seg.value.ids) do cur.ids[#cur.ids + 1] = id end
+          cur.seg = cur.seg + 1
+          return nil
+        end
+        if not cur.blocks then
+          for _, id in ipairs(cur.v.ids) do cur.ids[#cur.ids + 1] = id end
+          cur.blocks, cur.block = batches(cur.ids), 1
+          return nil
+        end
+        local block = cur.blocks[cur.block]
+        if block then
+          local found = seq_of_ids(block)
+          local k = part(cur.a) .. part(cur.b)
           local u = t.union[k] or {n = 0, ids = {}}
           t.union[k] = u
-          for _, id in ipairs(ids) do
+          for _, id in ipairs(block) do
+            local m = found[id]
+            if not m then conflict('A thread names a message that is not imported', cur.key .. ' ' .. id) end
+            if m.thread_a ~= cur.a or m.thread_b ~= cur.b then conflict('A message is in another thread', cur.key .. ' ' .. id) end
+            if cur.last and not later(m.seq, cur.last) then conflict('A thread is not in message order', cur.key) end
+            cur.last = m.seq
             if not u.ids[id] then u.ids[id] = true; u.n = u.n + 1 end
           end
+          cur.block = cur.block + 1
+          return nil
         end
-        t.done = not more
+        t.cur = nil
         return nil
       end
       -- Each chain ID is a message of its thread (above). So a thread whose distinct chain IDs are
       -- as many as its SQL messages has exactly those messages. Two chains that meet under M can
-      -- share IDs: a sum of their lengths would hide a missing message.
-      for _, row in ipairs(env.rows('SELECT thread_a, thread_b, count(*) AS n FROM messages GROUP BY thread_a, thread_b')) do
+      -- share IDs: a sum of their lengths would hide a missing message. One page of threads for
+      -- each call.
+      local g = t.groups_after or {a = '', b = ''}
+      local page = env.rows([[SELECT thread_a, thread_b, count(*) AS n FROM messages
+        WHERE thread_a > ? OR (thread_a = ? AND thread_b > ?)
+        GROUP BY thread_a, thread_b ORDER BY thread_a, thread_b LIMIT 200]], g.a, g.a, g.b)
+      for _, row in ipairs(page) do
         local k = part(row.thread_a) .. part(row.thread_b)
         if (t.union[k] and t.union[k].n or 0) ~= row.n then conflict('A thread has another set of messages', k) end
         t.union[k] = nil
+        t.groups_after = {a = row.thread_a, b = row.thread_b}
       end
+      if #page == 200 then return nil end
       for k in pairs(t.union) do conflict('A thread has another set of messages', k) end
       return true
     end
