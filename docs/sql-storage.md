@@ -58,6 +58,13 @@ From `docs/sql.md` draft 2 (proposed; the hub lead's lab tests prove each row be
 Sent to the hub lead and the Tunnels pair on 2026-10-22 (`msg-sdk-d2-gaps`). None blocks the SDK's
 to-do target; each blocks part of the Messaging port.
 
+Answers (2026-10-22, proposed, not yet implemented): G1: `hub.sql.batch` (one transaction without
+a token, from any code) and `app.db.transaction(fn)` (SDK v0). G2: any hub call of the instance
+counts as activity (hub lead). G4: `app.hub` (SDK v0). G3: open; Messaging declares tabs at the end
+of the handler. Views (G5 in the SDK gaps thread): raw `app.view` in v0. Wire fact (claude-22,
+observed on Rex 0.0.1792158932-g88fd41): `rex.json.decode` drops a `null` inside an array, so the
+SDK and the hub tag NULL; Messaging sees `nil` in rows keyed by column name.
+
 - **G1 Atomic steps outside a handler.** The start-up work (the alias merge, the import steps, the
   cutover with its notices) runs outside an action handler, and `{tx = false}` runs each SQL call
   alone. Each of those steps must commit several statements together. Proposed: an advanced
