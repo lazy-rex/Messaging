@@ -164,23 +164,25 @@ end
 -- pending queried after the writes, so it is exact. inside: a handler runs, and its end flushes.
 -- Notice v2 (hub contract, SDK app.notice once and app.notice_read): a pending notice has once, so
 -- the hub nudges an agent one time until it reads. A read marks its agent read: the agent gets
--- {read} while mail stays unread (pending does not change), or pending = false.
-local notes = {marked = {}, list = {}, read = {}, inside = false}
-local function notify(agent)
-  if not notes.marked[agent] then notes.marked[agent] = true; notes.list[#notes.list + 1] = agent end
+-- {read} while mail stays unread (pending does not change), or pending = false. {read} does not
+-- set pending, so it is only for an agent that nothing else in the commit marked: an identity
+-- migration in the same commit can move unread mail to an agent that the hub has no notice for.
+-- marked[agent]: 'read' when only a read marked it, else 'changed'.
+local notes = {marked = {}, list = {}, inside = false}
+local function mark(agent, how)
+  if not notes.marked[agent] then notes.list[#notes.list + 1] = agent end
+  if notes.marked[agent] ~= 'changed' then notes.marked[agent] = how end
 end
-local function notify_read(agent)
-  notes.read[agent] = true
-  notify(agent)
-end
+local function notify(agent) mark(agent, 'changed') end
+local function notify_read(agent) mark(agent, 'read') end
 local function flush()
-  local list, read = notes.list, notes.read
-  notes.marked, notes.list, notes.read = {}, {}, {}
+  local list, marked = notes.list, notes.marked
+  notes.marked, notes.list = {}, {}
   if #list == 0 then return end
   for _, r in ipairs(rows([[SELECT value AS agent,
       EXISTS (SELECT 1 FROM deliveries d WHERE d.agent = value AND d.acked = 0) AS p FROM json_each(?)]], json(list))) do
     if r.p ~= 1 then app.notice(r.agent, false)
-    elseif read[r.agent] then app.notice_read(r.agent)
+    elseif marked[r.agent] == 'read' then app.notice_read(r.agent)
     else app.notice(r.agent, true, {once = true}) end
   end
 end
@@ -1984,7 +1986,7 @@ local function handler(fn, declares, render)
       return fn(ctx, args)
     end
     local result = db.transaction(function()
-      notes.marked, notes.list, notes.read, notes.inside = {}, {}, {}, true
+      notes.marked, notes.list, notes.inside = {}, {}, true
       local ok, out = pcall(function()
         refresh_participants()
         migrate_aliases()
@@ -2083,7 +2085,7 @@ local import = require('import')({
     local inside = notes.inside
     notes.inside = true
     migrate_aliases()
-    notes.inside, notes.marked, notes.list, notes.read = inside, {}, {}, {}
+    notes.inside, notes.marked, notes.list = inside, {}, {}
   end,
 })
 local import_timer = {}
