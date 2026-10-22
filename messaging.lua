@@ -1545,8 +1545,8 @@ end
 -- view exist only when the plugin arg gallery is true (hub config plugins[].args).
 local gallery_tab = app.args.gallery == true
 
--- declare_tabs declares conversation tabs and, if gallery_tab, the gallery.
-local function declare_tabs(user)
+-- tab_list returns the conversation tabs and, if gallery_tab, the gallery.
+local function tab_list(user)
   local s = view_state(user)
   local function title(name, n) return n > 0 and (name .. ' (' .. n .. ')') or name end
   local tabs = {}
@@ -1564,7 +1564,13 @@ local function declare_tabs(user)
     end
   end
   if gallery_tab then tabs[#tabs + 1] = {key = 'gallery', title = 'Gallery', route = gallery_route} end
-  hub('hub.ui.tabs', {tabs = tabs})
+  return tabs
+end
+
+-- declare_tabs declares the tabs from committed state: it reads in its own transaction, after the
+-- writes of the call have committed, and calls the hub outside it.
+local function declare_tabs(user)
+  hub('hub.ui.tabs', {tabs = db.transaction(tab_list, user)})
 end
 
 -- A tab rename changes this user's thread title. It does not rename the participant.
@@ -1820,26 +1826,34 @@ local actions = {
       required = {'thread', 'key'}, additionalProperties = false}}
 }
 
--- Each action and view handler runs in one SQL transaction (the SDK; a render reads the committed
--- state). store = false: Messaging keeps its own operations table (saved_operation). A call first
--- reads the roster and applies new aliases. At its end it gives the notices of its writes; a call
--- that can change a thread then declares the tabs from its own writes. A failed declaration fails
--- the call, and its writes roll back.
+-- Each action and view handler runs its writes in one SQL transaction (db.transaction; the SDK
+-- frame has tx = false). store = false: Messaging keeps its own operations table
+-- (saved_operation). A call first reads the roster and applies new aliases. At its end it gives
+-- the notices of its writes, in the same commit. A call that can change a thread then declares the
+-- tabs, after the commit: a rolled-back call declares nothing. A failed declaration does not fail
+-- the committed call: it is logged, and the next change declares the tabs again.
 local ui_user = 'user'
-local plain = {store = false}
-local function handler(fn, declares)
+local plain = {store = false, tx = false}
+local function handler(fn, declares, render)
   return function(ctx, args)
-    notes.marked, notes.list, notes.inside = {}, {}, true
-    local ok, result = pcall(function()
-      refresh_participants()
-      migrate_aliases()
-      local out = fn(ctx, args)
-      flush()
-      if declares then declare_tabs(ui_user) end
+    -- A render reads only: it runs in the SDK's render frame, without a transaction.
+    local result = (render and function(f) return f() end or db.transaction)(function()
+      notes.marked, notes.list, notes.inside = {}, {}, true
+      local ok, out = pcall(function()
+        refresh_participants()
+        migrate_aliases()
+        local r = fn(ctx, args)
+        flush()
+        return r
+      end)
+      notes.inside = false
+      if not ok then error(out, 0) end
       return out
     end)
-    notes.inside = false
-    if not ok then error(result, 0) end
+    if declares then
+      local ok, err = pcall(declare_tabs, ui_user)
+      if not ok then print('messaging: the tab declaration failed: ' .. tostring(type(err) == 'table' and err.message or err)) end
+    end
     return result
   end
 end
@@ -1850,19 +1864,19 @@ for _, a in ipairs(actions) do
   app.action(a.name, a.args, handler(function(ctx, args)
     args.key = ctx.key
     return fn(ctx.agent, args, ctx.session_id)
-  end, a.declares), {title = a.title, description = a.description, store = false})
+  end, a.declares), {title = a.title, description = a.description, store = false, tx = false})
 end
 
 -- Views: only the hub calls them, for the user.
 local function view(fn, declares) return handler(function(_, args) return fn(args) end, declares) end
+local function render(fn) return handler(function(_, args) return fn(args) end, false, true) end
 app.view('/thread/*', {
-  render = view(function(args) return render_thread(args.user, args.route) end),
+  render = render(function(args) return render_thread(args.user, args.route) end),
   ['view.open'] = view(function(args)
     local peer = thread_peer(args.route, args.user)
     remember_thread_open(args.user, peer.id)
-    declare_tabs(args.user)
     return {}
-  end),
+  end, true),
   -- A page of messages older than args.before, for the transcript pane.
   ['view.history'] = view(function(args)
     if type(args.before) ~= 'string' or args.before == '' then fail('invalid_input', 'before is required') end
@@ -1876,17 +1890,17 @@ app.view('/thread/*', {
   ['view.seen'] = view(view_seen, true),
 }, plain)
 app.view('/panels/threads', {
-  render = view(function(args) return render_home(args.user, args.context) end),
+  render = render(function(args) return render_home(args.user, args.context) end),
   ['view.action'] = view(view_action, true),
 }, plain)
-app.view('/forms/*', {render = view(form_view), ['view.action'] = view(view_action, true)}, plain)
+app.view('/forms/*', {render = render(form_view), ['view.action'] = view(view_action, true)}, plain)
 if gallery_tab then
   app.view(gallery_route, {
     render = function() return render_gallery() end,
     ['view.action'] = function(_, args) return gallery_action(args) end,
     ['view.draft.save'] = function(_, args) return gallery_draft_save(args) end,
     ['view.send'] = function(_, args) return gallery_send(args) end,
-  }, plain)
+  }, {store = false})
 end
 
 -- hub.changed: the hub sends one for each change of agents, workers and plugins, and does not
