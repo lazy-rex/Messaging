@@ -89,6 +89,7 @@ lazyrex-hub test -file send.lua
 | tabs_commit.lua | The tabs come from committed state: a failed send, move or archive leaves the tabs as they were. |
 | sql_paging.lua | Results over one hub.sql reply: the group list, the alias migration of large drafts (values stay in SQL), history after a partial result. |
 | max_sequence.lua | A message at the largest sequence (9223372036854775807) appears in history and in the thread view. |
+| concat.lua | Joins of lists that a caller controls do not overflow table.concat (the Gallery form with 2600 fields; lazyrex.json test.files sets gallery = true). |
 | gallery.lua | The Gallery view with the plugin arg gallery = true (lazyrex.json test.files): render, actions, draft and send. |
 | tab_coalesce.lua | A burst of `hub.changed agents` gives one or two tab declarations, and the declaration still has the threads (needs hub.test.calls). |
 
