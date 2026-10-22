@@ -32,9 +32,8 @@ covers G4-G7, Messaging uses the raw escape (`app.hub`, raw dispatch; coordinato
   `resolve_recipient`, `display_name`.
 - The UI: `render_home`, `render_thread`, `history_page`, forms, menus, `view_*` handlers,
   `declare_tabs`. They read queries instead of records. Through raw dispatch until G5.
-- The gallery (`gallery/*`), behind `gallery = "true"`. Question for the coordinator: the user wants
-  one-off code gone; the gallery is a renderer preview (about 120 lines). Keep it, or move it out of
-  Messaging?
+- The gallery, behind `gallery = "true"` (`app.args`), as one `app.view` route (coordinator,
+  2026-10-22: the user keeps it and wants it tested).
 
 ## Data
 
