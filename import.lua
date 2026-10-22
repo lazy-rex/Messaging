@@ -258,7 +258,7 @@ return function(env)
   end
   -- Provenance only: the source check covers it; aliases_applied comes from M.
   import_record['identity-migrated/'] = function() end
-  -- Read by verify_threads.
+  -- Read by threads_task.
   import_record['thread/'] = function() end
   import_record['thread-seg/'] = function() end
 
@@ -342,7 +342,13 @@ return function(env)
     return page.next ~= nil
   end
 
-  -- Source checks -----------------------------------------------------------------------------------
+  -- Checks and verification: tasks ------------------------------------------------------------------
+  --
+  -- A task does one bounded part of a check in each call of its step: one page of source records,
+  -- of saved operations or of SQL rows. step returns nil while work remains, true at a successful
+  -- end, and false, key when a source changed (the import begins again). A content mismatch stops
+  -- the import (conflict). The checks only read, so a task that a crash stops starts again from its
+  -- beginning at the next start.
 
   -- same_value compares two decoded JSON values.
   local function same_value(x, y)
@@ -353,63 +359,66 @@ return function(env)
     return true
   end
 
-  -- check_sources fails with stale when a source record changed: a revision of an imported record
-  -- differs, a record was added or deleted after the fence. complete = true also requires the
-  -- family key set to equal import_source (verification).
-  local function check_sources(complete)
-    local seen = {}
-    for _, prefix in ipairs(FAMILIES) do
-      local after, more = nil, true
-      while more do
-        local list
-        list, more = scan(prefix, after, 200) -- the keys go into one request (64 KiB)
+  -- sources_task fails when a source record changed: a revision of an imported record differs, or
+  -- a record was added or deleted after the fence. complete = true also requires the family key set
+  -- to equal import_source (verification).
+  local function sources_task(complete)
+    local t = {family = 1, after = nil, seen = {}, deleted_after = nil}
+    function t.step()
+      if t.family <= #FAMILIES then
+        local prefix = FAMILIES[t.family]
+        local list, more = scan(prefix, t.after, 200) -- the keys go into one request (64 KiB)
         local keys = {}
         for _, r in ipairs(list) do
-          after = r.key
+          t.after = r.key
           if in_family(prefix, r.key) then
             if later(r.rev, state.f0) then return false, r.key end
             keys[#keys + 1] = r.key
-            seen[r.key] = r.rev
+            t.seen[r.key] = r.rev
           end
         end
-        for _, row in ipairs(env.rows('SELECT key, rev FROM import_source WHERE key IN (SELECT value FROM json_each(?))', json(keys))) do
-          if seen[row.key] ~= row.rev then return false, row.key end
+        local found = env.rows('SELECT key, rev FROM import_source WHERE key IN (SELECT value FROM json_each(?))', json(keys))
+        for _, row in ipairs(found) do
+          if t.seen[row.key] ~= row.rev then return false, row.key end
         end
-        if complete and #env.rows('SELECT key FROM import_source WHERE key IN (SELECT value FROM json_each(?))', json(keys)) ~= #keys then
-          return false, 'a record that is not imported'
-        end
+        if complete and #found ~= #keys then return false, 'a record that is not imported' end
+        if not more then t.family, t.after = t.family + 1, nil end
+        return nil
       end
+      -- A deleted record: an import_source row whose key no longer exists. One page for each step.
+      local page = env.rows('SELECT key FROM import_source WHERE key > ? ORDER BY key LIMIT 500', t.deleted_after or '')
+      for _, row in ipairs(page) do
+        if not t.seen[row.key] then return false, row.key end
+        t.deleted_after = row.key
+      end
+      if #page == 500 then return nil end
+      return true
     end
-    -- A deleted record: an import_source row whose key no longer exists.
-    for _, row in ipairs(env.rows('SELECT key FROM import_source ORDER BY key')) do
-      if not seen[row.key] then return false, row.key end
-    end
-    return true
+    return t
   end
 
-  -- check_ops compares every saved operation with the operations rows: the key set equals
+  -- ops_task compares every saved operation with the operations rows: the key set equals
   -- import_ops (complete) or contains it (partial), and each fingerprint and result are equal.
-  local function check_ops(complete)
-    local after, count = '', 0
-    repeat
-      local page = hub('hub.store.ops_scan', {after = after, limit = 200}) -- the keys go into one request
+  local function ops_task(complete)
+    local t = {after = '', count = 0}
+    function t.step()
+      local page = hub('hub.store.ops_scan', {after = t.after, limit = 200}) -- the keys go into one request
       local keys, by_key = {}, {}
-      for _, op in ipairs(page.ops or {}) do keys[#keys + 1] = op.key; by_key[op.key] = op; after = op.key end
+      for _, op in ipairs(page.ops or {}) do keys[#keys + 1] = op.key; by_key[op.key] = op; t.after = op.key end
       local found = env.rows([[SELECT o.key, o.fingerprint, o.result FROM operations o JOIN import_ops i ON i.key = o.key
         WHERE o.key IN (SELECT value FROM json_each(?))]], json(keys))
       for _, row in ipairs(found) do
         local op = by_key[row.key]
         if op.fingerprint ~= row.fingerprint or not same_value(op.result, rex.json.decode(row.result)) then return false, row.key end
       end
-      count = count + #found
+      t.count = t.count + #found
       if complete and #found ~= #keys then return false, 'a saved operation that is not imported' end
-    until page.next == nil
-    local total = db.first('SELECT count(*) AS n FROM import_ops').n
-    if total ~= count then return false, 'a saved operation that was deleted' end
-    return true
+      if page.next ~= nil then return nil end
+      if db.first('SELECT count(*) AS n FROM import_ops').n ~= t.count then return false, 'a saved operation that was deleted' end
+      return true
+    end
+    return t
   end
-
-  -- Verification of the content ------------------------------------------------------------------
 
   -- seq_of_ids looks the IDs up in blocks of 200: one request holds at most 64 KiB.
   local function seq_of_ids(ids)
@@ -423,98 +432,114 @@ return function(env)
     return out
   end
 
-  -- verify_threads: each key-value chain maps through M to one SQL thread, ascends in seq, and the
+  -- threads_task: each key-value chain maps through M to one SQL thread, ascends in seq, and the
   -- union of the chains of a thread equals its SQL messages.
-  local function verify_threads()
-    local union = {} -- part(a) .. part(b) -> {n = distinct chain IDs, ids = set}
-    local after, more = nil, true
-    while more do
-      local list
-      list, more = scan('thread/', after, 100)
-      for _, r in ipairs(list) do
-        after = r.key
-        local a, b = pair2(r.key:sub(#'thread/' + 1), r.key)
-        if a ~= '' then a, b = sorted(c(a), c(b)) end
-        local v = r.value
-        if type(v) ~= 'table' or type(v.ids) ~= 'table' then conflict('Invalid thread record', r.key) end
-        local ids = {}
-        for k = 0, (v.seg or 0) - 1 do
-          local key = 'thread-seg/' .. r.key:sub(#'thread/' + 1) .. '/' .. (v.chain or '0') .. '/' .. k
-          local seg = kv_get({key})[key]
-          if seg.rev == '0' or type(seg.value) ~= 'table' or type(seg.value.ids) ~= 'table' then conflict('A thread segment is missing', key) end
-          for _, id in ipairs(seg.value.ids) do ids[#ids + 1] = id end
+  local function threads_task()
+    local t = {after = nil, done = false, union = {}} -- union: part(a) .. part(b) -> {n = distinct IDs, ids = set}
+    function t.step()
+      if not t.done then
+        local list, more = scan('thread/', t.after, 100)
+        for _, r in ipairs(list) do
+          t.after = r.key
+          local a, b = pair2(r.key:sub(#'thread/' + 1), r.key)
+          if a ~= '' then a, b = sorted(c(a), c(b)) end
+          local v = r.value
+          if type(v) ~= 'table' or type(v.ids) ~= 'table' then conflict('Invalid thread record', r.key) end
+          local ids = {}
+          for k = 0, (v.seg or 0) - 1 do
+            local key = 'thread-seg/' .. r.key:sub(#'thread/' + 1) .. '/' .. (v.chain or '0') .. '/' .. k
+            local seg = kv_get({key})[key]
+            if seg.rev == '0' or type(seg.value) ~= 'table' or type(seg.value.ids) ~= 'table' then conflict('A thread segment is missing', key) end
+            for _, id in ipairs(seg.value.ids) do ids[#ids + 1] = id end
+          end
+          for _, id in ipairs(v.ids) do ids[#ids + 1] = id end
+          local found, last = seq_of_ids(ids), nil
+          for _, id in ipairs(ids) do
+            local m = found[id]
+            if not m then conflict('A thread names a message that is not imported', r.key .. ' ' .. id) end
+            if m.thread_a ~= a or m.thread_b ~= b then conflict('A message is in another thread', r.key .. ' ' .. id) end
+            if last and not later(m.seq, last) then conflict('A thread is not in message order', r.key) end
+            last = m.seq
+          end
+          local k = part(a) .. part(b)
+          local u = t.union[k] or {n = 0, ids = {}}
+          t.union[k] = u
+          for _, id in ipairs(ids) do
+            if not u.ids[id] then u.ids[id] = true; u.n = u.n + 1 end
+          end
         end
-        for _, id in ipairs(v.ids) do ids[#ids + 1] = id end
-        local found, last = seq_of_ids(ids), nil
-        for _, id in ipairs(ids) do
-          local m = found[id]
-          if not m then conflict('A thread names a message that is not imported', r.key .. ' ' .. id) end
-          if m.thread_a ~= a or m.thread_b ~= b then conflict('A message is in another thread', r.key .. ' ' .. id) end
-          if last and not later(m.seq, last) then conflict('A thread is not in message order', r.key) end
-          last = m.seq
-        end
-        local k = part(a) .. part(b)
-        local u = union[k] or {n = 0, ids = {}}
-        union[k] = u
-        for _, id in ipairs(ids) do
-          if not u.ids[id] then u.ids[id] = true; u.n = u.n + 1 end
-        end
+        t.done = not more
+        return nil
       end
+      -- Each chain ID is a message of its thread (above). So a thread whose distinct chain IDs are
+      -- as many as its SQL messages has exactly those messages. Two chains that meet under M can
+      -- share IDs: a sum of their lengths would hide a missing message.
+      for _, row in ipairs(env.rows('SELECT thread_a, thread_b, count(*) AS n FROM messages GROUP BY thread_a, thread_b')) do
+        local k = part(row.thread_a) .. part(row.thread_b)
+        if (t.union[k] and t.union[k].n or 0) ~= row.n then conflict('A thread has another set of messages', k) end
+        t.union[k] = nil
+      end
+      for k in pairs(t.union) do conflict('A thread has another set of messages', k) end
+      return true
     end
-    -- Each chain ID is a message of its thread (above). So a thread whose distinct chain IDs are
-    -- as many as its SQL messages has exactly those messages. Two chains that meet under M can
-    -- share IDs: a sum of their lengths would hide a missing message.
-    for _, t in ipairs(env.rows('SELECT thread_a, thread_b, count(*) AS n FROM messages GROUP BY thread_a, thread_b')) do
-      local k = part(t.thread_a) .. part(t.thread_b)
-      if (union[k] and union[k].n or 0) ~= t.n then conflict('A thread has another set of messages', k) end
-      union[k] = nil
-    end
-    for k in pairs(union) do conflict('A thread has another set of messages', k) end
+    return t
   end
 
-  -- verify_audience: the delivery agents of each message equal c of its audience.
-  local function verify_audience()
-    local groups = groups_value()
-    local after, more = nil, true
-    while more do
-      local list
-      list, more = scan('message/', after, 100)
+  -- audience_task: the delivery agents of each message equal c of its audience.
+  local function audience_task()
+    local t = {after = nil, groups = nil}
+    function t.step()
+      t.groups = t.groups or groups_value()
+      local list, more = scan('message/', t.after, 100)
       for _, r in ipairs(list) do
-        after = r.key
+        t.after = r.key
         local m = message_value(r)
         local key = 'delivery/' .. part(m.id)
-        local want = audience(m, m.recipients == nil and kv_get({key})[key] or nil, groups)
+        local want = audience(m, m.recipients == nil and kv_get({key})[key] or nil, t.groups)
         local got = env.rows('SELECT agent FROM deliveries WHERE seq = CAST(? AS INTEGER) ORDER BY agent', r.rev)
         table.sort(want)
         if #got ~= #want then conflict('A message has another audience', r.key) end
         for i, row in ipairs(got) do if row.agent ~= want[i] then conflict('A message has another audience', r.key) end end
       end
+      if more then return nil end
+      return true
     end
+    return t
   end
 
-  -- verify_unread: the unread deliveries of each agent equal the union of its mailboxes.
-  local function verify_unread()
-    local unread = {} -- agent -> {id = true}
-    local after, more = nil, true
-    while more do
-      local list
-      list, more = scan('mailbox/', after, 100)
-      for _, r in ipairs(list) do
-        after = r.key
-        local agent = c(r.key:sub(#'mailbox/' + 1):match('^%d+:(.*)$'))
-        unread[agent] = unread[agent] or {}
-        for id in pairs(r.value.ids) do unread[agent][id] = true end
+  -- unread_task: the unread deliveries of each agent equal the union of its mailboxes.
+  local function unread_task()
+    local t = {after = nil, done = false, unread = {}, rows_after = nil} -- unread: agent -> {id = true}
+    function t.step()
+      if not t.done then
+        local list, more = scan('mailbox/', t.after, 100)
+        for _, r in ipairs(list) do
+          t.after = r.key
+          local agent = c(r.key:sub(#'mailbox/' + 1):match('^%d+:(.*)$'))
+          t.unread[agent] = t.unread[agent] or {}
+          for id in pairs(r.value.ids) do t.unread[agent][id] = true end
+        end
+        t.done = not more
+        return nil
       end
+      -- One page of unread deliveries for each step, in (agent, seq) order.
+      local a, s = '', -1
+      if t.rows_after then a, s = t.rows_after.agent, t.rows_after.seq end
+      local page = env.rows([[SELECT d.agent, d.seq, m.id FROM deliveries d JOIN messages m ON m.seq = d.seq
+        WHERE d.acked = 0 AND (d.agent > ? OR (d.agent = ? AND d.seq > ?)) ORDER BY d.agent, d.seq LIMIT 500]], a, a, s)
+      for _, row in ipairs(page) do
+        local set = t.unread[row.agent]
+        if not set or not set[row.id] then conflict('A delivery is unread without a mailbox entry', row.agent .. ' ' .. row.id) end
+        set[row.id] = nil
+        t.rows_after = row
+      end
+      if #page == 500 then return nil end
+      for agent, set in pairs(t.unread) do
+        for id in pairs(set) do conflict('A mailbox entry is not an unread delivery', agent .. ' ' .. id) end
+      end
+      return true
     end
-    for _, row in ipairs(env.rows([[SELECT d.agent, m.id FROM deliveries d JOIN messages m ON m.seq = d.seq
-      WHERE d.acked = 0 ORDER BY d.agent, m.seq]])) do
-      local set = unread[row.agent]
-      if not set or not set[row.id] then conflict('A delivery is unread without a mailbox entry', row.agent .. ' ' .. row.id) end
-      set[row.id] = nil
-    end
-    for agent, set in pairs(unread) do
-      for id in pairs(set) do conflict('A mailbox entry is not an unread delivery', agent .. ' ' .. id) end
-    end
+    return t
   end
 
   -- States -----------------------------------------------------------------------------------------
@@ -539,49 +564,36 @@ return function(env)
       set_meta('import_roster', json(roster))
       set_progress({phase = 'families', family = 1})
     end)
-  end
-
-  -- reset rewrites the fence (a new f0) and begins again.
-  local function reset(rev)
-    begin(write_fence('importing', rev))
-  end
-
-  local function import_all()
     load_state()
-    while true do
-      local p = progress()
-      local more = db.transaction(function()
-        local m
-        if p.phase == 'families' then m = family_step(p)
-        else m = ops_step(p) end
-        if p.phase == 'families' and not m then p.phase, p.after, m = 'ops', nil, true end
-        set_progress(p)
-        return m or p.phase == 'families'
-      end)
-      if not more then return end
-    end
   end
 
-  local function verify()
-    local ok, key = check_sources(true)
-    if not ok then return false, key end
-    ok, key = check_ops(true)
-    if not ok then return false, key end
-    verify_threads()
-    verify_audience()
-    verify_unread()
+  -- import_step runs one step of the import, in one transaction. It returns false at the end.
+  local function import_step()
+    local p = progress()
+    return db.transaction(function()
+      local m
+      if p.phase == 'families' then m = family_step(p)
+      else m = ops_step(p) end
+      if p.phase == 'families' and not m then p.phase, p.after, m = 'ops', nil, true end
+      set_progress(p)
+      return m or p.phase == 'families'
+    end)
+  end
+
+  local function mark_verified()
     db.transaction(function()
       for alias, identity in pairs(state.aliases) do
         db.exec('INSERT INTO aliases_applied (alias, identity) VALUES (?, ?)', alias, identity)
       end
       set_meta('import', 'verified')
     end)
-    return true
   end
 
   -- cutover: the fence is at f1 (written now, or found after a crash). One SQL transaction: the
   -- late alias merges, the clock, done and the notices of the whole roster.
-  local function cutover(f1)
+  local function cutover()
+    local f = fence()
+    local f1 = f.value.state == 'cutover' and f.rev or write_fence('cutover', f.rev)
     db.transaction(function()
       env.refresh_participants()
       env.migrate_aliases()
@@ -600,43 +612,73 @@ return function(env)
     end)
   end
 
-  -- run brings SQL to done. It returns at once when SQL is done.
-  local function run()
+  -- The run: a state machine that step advances by one bounded unit of work (one transaction, or
+  -- one page of a check). Its in-memory part is a table field (the pcall rule, LazyRex
+  -- docs/rex-protocol.md); a crash loses it, and the next start decides again from meta and the
+  -- fence. phase: decide, import, check (tasks, then ok or reset), cutover, done.
+  local run = {phase = 'decide', attempts = 0, tasks = nil, ok = nil}
+
+  -- check runs tasks, one step at a time; ok is the next phase when all pass. A changed source
+  -- begins the import again: three changes in a row stop the start.
+  local function check(tasks, ok)
+    run.phase, run.tasks, run.ok = 'check', tasks, ok
+  end
+  local function restart_import()
+    run.attempts = run.attempts + 1
+    if run.attempts > 3 then conflict('The key-value store changed during the import, three times') end
+    begin(write_fence('importing', fence().rev))
+    run.phase = 'import'
+  end
+  local function verification()
+    return {sources_task(true), ops_task(true), threads_task(), audience_task(), unread_task()}
+  end
+
+  local phases = {}
+  function phases.decide()
     local s = meta('import')
-    if s == 'done' then return end
+    if s == 'done' then run.phase = 'done'; return end
     local f = fence()
     local fstate = type(f.value) == 'table' and f.value.state or nil
     if s == nil and f.rev == '0' then
       begin(write_fence('importing', '0'))
+      run.phase = 'import'
     elseif s == nil and fstate == 'importing' then
-      reset(f.rev) -- the orphan fence
+      begin(write_fence('importing', f.rev)) -- the orphan fence
+      run.phase = 'import'
     elseif s == 'importing' and fstate == 'importing' then
       load_state()
-      local ok = check_sources(false)
-      if ok then ok = check_ops(false) end
-      if not ok then reset(f.rev) end
-    elseif not (s == 'verified' and (fstate == 'importing' or fstate == 'cutover')) then
+      check({sources_task(false), ops_task(false)}, 'import')
+    elseif s == 'verified' and (fstate == 'importing' or fstate == 'cutover') then
+      -- The source check again, with the saved operations: an old release can have run.
+      load_state()
+      check({sources_task(true), ops_task(true)}, 'cutover')
+    else
       conflict('The SQL import state ' .. tostring(s) .. ' does not match the fence ' .. tostring(fstate))
     end
-    if meta('import') == 'verified' then
-      -- verified: the source check again, with the saved operations (an old release can have run).
-      load_state()
-      local ok = check_sources(true)
-      if ok then ok = check_ops(true) end
-      if not ok then reset(fence().rev) end
-    end
-    -- A source that changes during the import resets it; three changes in a row stop the start.
-    local attempts = 0
-    while meta('import') == 'importing' do
-      attempts = attempts + 1
-      if attempts > 3 then conflict('The key-value store changed during the import, three times') end
-      import_all()
-      if not verify() then reset(fence().rev) end
-    end
-    f = fence()
-    local f1 = f.value.state == 'cutover' and f.rev or write_fence('cutover', f.rev)
-    cutover(f1)
+  end
+  function phases.import()
+    if not import_step() then check(verification(), 'verified') end
+  end
+  function phases.check()
+    local ok, key = run.tasks[1].step()
+    if ok == nil then return end
+    if ok == false then restart_import(); return end
+    table.remove(run.tasks, 1)
+    if #run.tasks > 0 then return end
+    if run.ok == 'verified' then mark_verified(); run.phase = 'cutover'
+    else run.phase = run.ok end
+  end
+  function phases.cutover()
+    cutover()
+    run.phase = 'done'
   end
 
-  return {run = run}
+  -- step advances the import by one unit. It returns true while work remains, false when SQL is
+  -- done.
+  local function step()
+    if run.phase ~= 'done' then phases[run.phase]() end
+    return run.phase ~= 'done'
+  end
+
+  return {step = step}
 end

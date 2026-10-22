@@ -43,8 +43,11 @@ The first start on a hub with key-value records imports them into SQL (`import.l
 `unavailable`. A failed import keeps its error in the meta row `import_error` and in that
 `unavailable` message. The plugin keeps running, and the next start continues.
 
+- The import runs in steps: one transaction, or one page of a check. The start runs at most 100
+  steps at once, so an import that is done or small ends before the first call. A larger import
+  continues in timer steps, and the plugin answers calls between them.
 - The fence record `sql-import` and the meta rows `import*` hold the state: `importing`, `verified`,
-  `done`. Each step is one transaction, so a crash continues where it stopped.
+  `done`. A crash continues where it stopped; a check that a crash stops starts again.
 - The import maps every name through the hub's aliases at its start, and keeps the roster of its
   start. A source record or a saved operation that changes during the import starts it again.
   After three changes in a row, the start fails.

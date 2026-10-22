@@ -68,12 +68,12 @@ local function craft(meta_rows)
   for k, v in pairs(meta_rows) do write_sql('INSERT INTO meta (key, value) VALUES (?, ?)', {k, v}) end
 end
 local function meta(key) return (sql('SELECT value FROM meta WHERE key = ?', {key})[1] or {}).value end
-local function wait_done()
+local function wait_done(seconds)
   return wait('the import', function()
     if import_state() == 'done' then return true end
     local e = sql("SELECT value FROM meta WHERE key = 'import_error'")[1]
     if e then error('the import failed: ' .. e.value, 0) end
-  end)
+  end, seconds)
 end
 
 local revs = {}
@@ -284,4 +284,48 @@ test('an alias that appears after the verification merges at the cutover', funct
   wait_done()
   expect(sql('SELECT sender, thread_a, thread_b FROM messages WHERE id = ?', {'kv/a1'})[1]).to_equal({sender = alice_id, thread_a = 'bob', thread_b = alice_id})
   expect(sql("SELECT identity FROM aliases_applied WHERE alias = 'alice'")).to_equal({{identity = alice_id}})
+end)
+
+-- A key-value store with 3000 messages: its import takes many steps.
+local bulk = {}
+local function write_bulk()
+  if #bulk > 0 then return end
+  local ops = {}
+  for i = 1, 3000 do
+    local id = string.format('kv/n%04d', i)
+    bulk[i] = id
+    ops[#ops + 1] = {key = 'message/' .. id, value = {id = id, from = 'bob', to = 'user', body = 'bulk ' .. i, at = at}}
+    if #ops == 300 then write(ops); ops = {} end
+  end
+  chain('bob', 'user', bulk)
+end
+local function restart_empty()
+  for _, t in ipairs(TABLES) do write_sql('DELETE FROM ' .. t) end
+  write_sql("DELETE FROM meta WHERE key LIKE 'import%'")
+  write({{key = 'sql-import', delete = true}})
+  hub:restart()
+end
+
+test('a call during the import fails with unavailable at once', function()
+  write_bulk()
+  restart_empty()
+  expect(import_state(), 'the import still runs').to_be('importing')
+  -- The import gives way to calls between its steps; it does not hold them until its end.
+  expect_error(function() bob:call('messaging.read', {}) end, 'importing')
+  wait_done(300)
+  expect(#bob:call('messaging.history', {thread = 'user', limit = 1}).messages).to_be(1)
+end)
+
+test('an import that the hub kill stops in the middle of the messages continues', function()
+  write_bulk()
+  restart_empty()
+  wait('the import in the middle of the messages', function()
+    local p = rex.json.decode(meta('import_progress') or '{}')
+    return p.phase == 'families' and p.family == 3 and p.after ~= nil
+  end)
+  local f0 = meta('import_f0')
+  hub:restart({crash = true})
+  wait_done(300)
+  expect(meta('import_f0'), 'the import continued').to_be(f0)
+  expect(sql("SELECT count(*) AS n FROM messages WHERE id LIKE 'kv/n%'")[1].n).to_be(3000)
 end)

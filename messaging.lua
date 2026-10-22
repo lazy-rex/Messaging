@@ -1903,6 +1903,11 @@ local ui_user = 'user'
 local plain = {store = false, tx = false}
 -- imported is true once SQL holds Messaging's data (import.lua). Before, every call is refused.
 local imported = {done = false, error = nil}
+local function require_imported()
+  if not imported.done then
+    fail('unavailable', 'Messaging is importing its data' .. (imported.error and (': ' .. imported.error) or ''))
+  end
+end
 
 -- The refresh applies new aliases and declares the tabs, in a timer after the call that asks for
 -- it: an agents change (hub.changed) or a render that sees an alias not yet applied. The schedule
@@ -1953,9 +1958,7 @@ end
 
 local function handler(fn, declares, render)
   return function(ctx, args)
-    if not imported.done then
-      fail('unavailable', 'Messaging is importing its data' .. (imported.error and (': ' .. imported.error) or ''))
-    end
+    require_imported()
     if render then
       refresh_participants()
       render_aliases()
@@ -2020,10 +2023,10 @@ app.view('/panels/threads', {
 app.view('/forms/*', {render = render(form_view), ['view.action'] = view(view_action, true)}, plain)
 if gallery_tab then
   app.view(gallery_route, {
-    render = function() return render_gallery() end,
-    ['view.action'] = function(_, args) return gallery_action(args) end,
-    ['view.draft.save'] = function(_, args) return gallery_draft_save(args) end,
-    ['view.send'] = function(_, args) return gallery_send(args) end,
+    render = function() require_imported(); return render_gallery() end,
+    ['view.action'] = function(_, args) require_imported(); return gallery_action(args) end,
+    ['view.draft.save'] = function(_, args) require_imported(); return gallery_draft_save(args) end,
+    ['view.send'] = function(_, args) require_imported(); return gallery_send(args) end,
   }, {store = false})
 end
 
@@ -2042,9 +2045,12 @@ for _, command in ipairs({{id = 'new_thread', title = 'New Thread…', descripti
     {id = 'threads', title = 'Threads…', description = 'List all threads, with this session first', keywords = {'message', 'conversation'}, surface = 'panel', landing = true, route = '/panels/threads', user_only = 'navigation'}}) do app.command(command) end
 
 -- Spike 3 has one UI user. Each conversation has one tab.
--- The import runs first, at start (each step its own transaction); calls wait in the plugin's queue
--- until it ends. A failed import leaves every call refused with its error, and meta import_error
--- holds the error; the plugin keeps running, and the next start resumes.
+-- The import runs in steps: each step is one transaction or one page of a check (import.lua).
+-- The start runs at most start_steps of them at once, so a done or small import ends before the
+-- first call (calls wait in the plugin's queue for that bounded time). A larger import continues in
+-- timer steps; between them the plugin answers calls, and each fails with unavailable until the
+-- import is done. A failed import stops; every call then fails with its error, meta import_error
+-- holds the error, the plugin keeps running, and the next start continues.
 local import = require('import')({
   db = db, hub = hub, fail = fail, part = part, parts = parts, json = json, rows = rows,
   encoded_size = encoded_size, utf8_cut = utf8_cut, later = later, thread_pair = thread_pair,
@@ -2060,10 +2066,16 @@ local import = require('import')({
     notes.inside, notes.marked, notes.list = inside, {}, {}
   end,
 })
-app.start(function()
-  local ok, err = pcall(import.run)
+local import_timer = {}
+local start_steps = 100
+function import_timer.tick(steps)
+  local ok, more
+  for _ = 1, steps or 1 do
+    ok, more = pcall(import.step)
+    if not ok or not more then break end
+  end
   if not ok then
-    imported.error = type(err) == 'table' and tostring(err.code) .. ': ' .. tostring(err.message) or tostring(err)
+    imported.error = type(more) == 'table' and tostring(more.code) .. ': ' .. tostring(more.message) or tostring(more)
     print('messaging: the import failed: ' .. imported.error)
     pcall(db.transaction, function()
       db.exec([[INSERT INTO meta (key, value) VALUES ('import_error', ?)
@@ -2071,9 +2083,11 @@ app.start(function()
     end)
     return
   end
+  if more then app.after(0, import_timer.tick, {tx = false}); return end
   pcall(db.transaction, function() db.exec("DELETE FROM meta WHERE key = 'import_error'") end)
   imported.done = true
   refresh_participants()
   migrate_aliases()
   declare_tabs(ui_user)
-end, {tx = false})
+end
+app.start(function() import_timer.tick(start_steps) end, {tx = false})
