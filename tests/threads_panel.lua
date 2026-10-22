@@ -108,10 +108,11 @@ test('a thread on a later page opens; New thread opens its form', function()
 end)
 
 test('a thread whose ID alone is over a page shows as a row without an action', function()
-  -- A legacy group ID has no size limit. This one is 40000 characters.
-  local gid = 'g-x' .. string.rep('0', 39997)
-  write_sql("INSERT INTO groups (gid, name) VALUES (?, 'Long ID')", {gid})
-  write_sql("INSERT INTO group_members (gid, agent, pos, current) VALUES (?, 'user', 1, 1), (?, 'alice', 2, 1)", {gid, gid})
+  -- A legacy group ID has no size limit. This one is 50000 characters: alone it is over the view limit.
+  -- The fixture builds the ID in SQL: one request carries at most 64 KiB.
+  local gid = "'g-x' || printf('%049997d', 0)"
+  write_sql('INSERT INTO groups (gid, name) VALUES (' .. gid .. ", 'Long ID')")
+  write_sql('INSERT INTO group_members (gid, agent, pos, current) VALUES (' .. gid .. ", 'user', 1, 1), (" .. gid .. ", 'alice', 2, 1)")
   local tree = panel():render()
   expect(size(tree) < limit, 'the panel is ' .. size(tree) .. ' bytes').to_be(true)
   local items = H.node(tree, 'threads').items
