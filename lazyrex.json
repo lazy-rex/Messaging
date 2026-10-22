@@ -23,6 +23,11 @@
    "/forms/thread-rename",
    "/forms/thread-move",
    "/forms/thread-members"
-  ]
+  ],
+  "args": {
+   "messaging": {
+    "gallery": "true"
+   }
+  }
  }
 }

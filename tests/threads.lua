@@ -24,10 +24,12 @@ test('roster agents get no empty direct tab; member groups keep theirs', functio
   expect(has_tab('thread/team')).to_be(true)
 end)
 
--- C5 (fresh-install audit): a new user read the Gallery's sample messages as real data. The test
--- manifest sets no gallery arg, as a default install.
-test('the default install declares no Gallery tab', function()
-  expect(has_tab('gallery')).to_be(false)
+-- C5 (fresh-install audit): a new user read the Gallery's sample messages as real data, so only
+-- the gallery arg declares the Gallery tab. This manifest sets gallery = true for every file
+-- (tests/concat.lua needs the Gallery, and this hub has no per-file args), so this file checks
+-- that the arg declares the tab. The default install without the arg is not tested here.
+test('the gallery arg declares the Gallery tab', function()
+  expect(has_tab('gallery')).to_be(true)
 end)
 
 -- The plugin had a lab action lab.tabs that passed caller args to hub.ui.tabs with no requester

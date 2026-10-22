@@ -54,6 +54,15 @@ local function part(value)
   return tostring(#value) .. ':' .. value
 end
 
+-- join is table.concat for a list of any length. Rex Lua fails table.concat of more than 2559
+-- items with "registry overflow" (LazyRex docs/rex-protocol.md), so join concatenates blocks of
+-- 1000 items.
+local function join(list, sep)
+  local blocks = {}
+  for k = 1, #list, 1000 do blocks[#blocks + 1] = table.concat(list, sep, k, math.min(k + 999, #list)) end
+  return table.concat(blocks, sep)
+end
+
 -- The hub owns immutable aliases. The plugin owns the records that use those aliases.
 local aliases, participants = {}, {}
 local function canonical(id) return aliases[id] or id end
@@ -1471,7 +1480,7 @@ local function thread_create(agent, args, source_session)
   if direct then
     for _, member in ipairs(members) do if member ~= agent then id = member end end
   end
-  local name = title ~= '' and title or table.concat(names, ', ')
+  local name = title ~= '' and title or join(names, ', ')
   local result = {id = id, title = name, members = members, group = not direct}
   local selected_session
   for _ = 1, attempts do
@@ -1848,7 +1857,7 @@ local function gallery_action(args)
     local parts = {}
     for k, v in pairs(type(input.values) == 'table' and input.values or {}) do parts[#parts + 1] = k .. '=' .. tostring(v) end
     table.sort(parts)
-    gallery_note('submitted form: ' .. table.concat(parts, ', '))
+    gallery_note('submitted form: ' .. join(parts, ', '))
     return {}
   end
   fail('invalid_input', 'Unknown gallery action')

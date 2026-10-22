@@ -83,6 +83,7 @@ lazyrex-hub test -file send.lua
 | migration_scan.lua | M1: the alias migration reads only the records it can change: archive values, the canonical mailbox, and the request evidence (needs hub.test.calls). |
 | tab_reads.lua | The tab declaration reads: the number of gets does not grow with the number of peers; the scans still grow with their pages (needs hub.test.calls). |
 | tab_coalesce.lua | A burst of `hub.changed agents` gives one or two tab declarations, and the declaration still has the threads (needs hub.test.calls). |
+| concat.lua | Joins of lists that a caller controls do not overflow table.concat (the Gallery form with 2600 fields). lazyrex.json test.args sets gallery = true for every file. |
 
 `lazyrex.json` is the test manifest. `tests/parity_fixture.lua` renders the thread menu forms for
 the parity sweep.
