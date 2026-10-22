@@ -89,7 +89,7 @@ lazyrex-hub test -file send.lua
 | observer.lua | Read-only observation, the group join, long history in pages. |
 | threads_panel.lua | The Threads panel at three times the live thread count: under the view limit, names only, agent-only and archived threads as a count, every thread reachable through More pages. |
 | agents_render.lua | Read tracking: a new agent appears in an open view without a SQL write (the hub renders again on hub.changed agents). |
-| thread_menu.lua | Rename, members and move as tools and as UI forms. |
+| thread_menu.lua | Rename, members and move as tools and as UI forms; Thread Settings… in the palette for the thread in view. |
 | readsize_send.lua | Size admission: encoded sizes as the hub encodes them (an agent-face reply), the body limit on both send paths, key and reply_to, replay before limits, a large unread backlog, the notice title. |
 | growth.lua | A thread of 2000 messages: every send commits, history to the oldest message, the view renders. |
 | tab_reads.lua | The SQL statements of a send and its tab declaration do not grow with the number of peers (needs hub.test.calls). |
