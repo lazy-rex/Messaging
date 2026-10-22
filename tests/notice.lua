@@ -1,5 +1,10 @@
 -- Notice v2 (hub contract; SDK app.notice once and app.notice_read): the notices that each commit
 -- of the plugin gives the hub, as the hub received them (hub.test.calls).
+
+-- Every call fails with unavailable until the import at start is done (import.lua). Under load,
+-- the start can end before it; the tests begin after it.
+wait('the import at start', function() return (sql("SELECT value FROM meta WHERE key = 'import'")[1] or {}).value == 'done' end)
+
 local alice, bob = agent('alice'), agent('bob')
 
 -- notices runs fn and returns the notices of the plugin's commits during it, in order.

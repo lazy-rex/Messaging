@@ -2,6 +2,10 @@
 -- audience fixed at send, history pages, a send after a membership change, direct expansion, the
 -- team refusal, and the replay of a creation that an older plugin version saved.
 
+-- Every call fails with unavailable until the import at start is done (import.lua). Under load,
+-- the start can end before it; the tests begin after it.
+wait('the import at start', function() return (sql("SELECT value FROM meta WHERE key = 'import'")[1] or {}).value == 'done' end)
+
 local function part(s) return #s .. ':' .. s end
 local function members_of(gid)
   local out = {}

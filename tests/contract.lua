@@ -2,6 +2,10 @@
 -- face; only the hub may forward a call or call view.*; the agent face refuses an action that the
 -- plugin does not export; a forwarded call keeps the agent's identity.
 
+-- Every call fails with unavailable until the import at start is done (import.lua). Under load,
+-- the start can end before it; the tests begin after it.
+wait('the import at start', function() return (sql("SELECT value FROM meta WHERE key = 'import'")[1] or {}).value == 'done' end)
+
 local exports = {'messaging.send', 'messaging.read', 'messaging.ack', 'messaging.thread_list', 'messaging.thread_create',
   'messaging.history', 'messaging.thread_archive', 'messaging.thread_rename', 'messaging.thread_members', 'messaging.thread_move'}
 

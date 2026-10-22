@@ -2,6 +2,10 @@
 -- (the MCP path) unless a test says otherwise. Storage is SQL: each handler is one transaction, so
 -- the hub.store races of the key-value version cannot happen; the commit faults replace them.
 
+-- Every call fails with unavailable until the import at start is done (import.lua). Under load,
+-- the start can end before it; the tests begin after it.
+wait('the import at start', function() return (sql("SELECT value FROM meta WHERE key = 'import'")[1] or {}).value == 'done' end)
+
 local function part(s) return #s .. ':' .. s end
 -- unread returns the unread message IDs of an agent, sorted.
 local function unread(name)

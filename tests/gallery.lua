@@ -1,6 +1,10 @@
 -- The Gallery is one SDK view. lazyrex.json test.files gives this file the plugin arg
 -- gallery = true; the other files run as a default install (threads.lua checks that).
 
+-- Every call fails with unavailable until the import at start is done (import.lua). Under load,
+-- the start can end before it; the tests begin after it.
+wait('the import at start', function() return (sql("SELECT value FROM meta WHERE key = 'import'")[1] or {}).value == 'done' end)
+
 local function gallery(key) return rex.json.decode(sql('SELECT value FROM gallery WHERE key = ?', {key})[1].value) end
 
 test('the Gallery tab is declared with the gallery arg', function()

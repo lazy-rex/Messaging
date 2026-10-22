@@ -2,6 +2,10 @@
 -- atomic group join by the first message, unread isolation, and the full history of a long
 -- thread in pages under the 64 KiB control-message limit.
 
+-- Every call fails with unavailable until the import at start is done (import.lua). Under load,
+-- the start can end before it; the tests begin after it.
+wait('the import at start', function() return (sql("SELECT value FROM meta WHERE key = 'import'")[1] or {}).value == 'done' end)
+
 local function part(s) return #s .. ':' .. s end
 local function hex(s) return (s:gsub('.', function(c) return string.format('%02x', c:byte()) end)) end
 local function find(list, id)

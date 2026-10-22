@@ -4,6 +4,10 @@
 -- the agent face. A file of its own: it crashes the hub. One sequence: each test uses the state
 -- of the tests before it.
 
+-- Every call fails with unavailable until the import at start is done (import.lua). Under load,
+-- the start can end before it; the tests begin after it.
+wait('the import at start', function() return (sql("SELECT value FROM meta WHERE key = 'import'")[1] or {}).value == 'done' end)
+
 local function ids(list)
   local out = {}
   for _, m in ipairs(list.messages) do out[#out + 1] = m.id end

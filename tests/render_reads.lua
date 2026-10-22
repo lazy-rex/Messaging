@@ -2,6 +2,10 @@
 -- show yet waits for the refresh timer: the render shows the rows as they are, and the timer
 -- merges them and declares the tabs again.
 
+-- Every call fails with unavailable until the import at start is done (import.lua). Under load,
+-- the start can end before it; the tests begin after it.
+wait('the import at start', function() return (sql("SELECT value FROM meta WHERE key = 'import'")[1] or {}).value == 'done' end)
+
 local alice_id = 'claude:conversation-render'
 local alice = agent('alice')
 

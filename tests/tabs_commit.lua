@@ -2,6 +2,10 @@
 -- commit fails declares nothing of it: a failed send, move or archive leaves the tabs as they were.
 -- (Review of 92d5f7c: the declaration ran inside the transaction, before the commit.)
 
+-- Every call fails with unavailable until the import at start is done (import.lua). Under load,
+-- the start can end before it; the tests begin after it.
+wait('the import at start', function() return (sql("SELECT value FROM meta WHERE key = 'import'")[1] or {}).value == 'done' end)
+
 local alice = agent('alice')
 local elsewhere = session('Elsewhere')
 

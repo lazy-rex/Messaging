@@ -4,6 +4,10 @@
 -- thread menu form. A file of its own: it restarts the hub. Navigation focuses the view's pane
 -- (session.focus_block), so focus is the session's active window.
 
+-- Every call fails with unavailable until the import at start is done (import.lua). Under load,
+-- the start can end before it; the tests begin after it.
+wait('the import at start', function() return (sql("SELECT value FROM meta WHERE key = 'import'")[1] or {}).value == 'done' end)
+
 local function active(s) return rex.call('session.view', {session_id = s}).active_window_id end
 -- open_views returns the open views of a tab.
 local function open_views(t)
