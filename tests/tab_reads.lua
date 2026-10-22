@@ -24,14 +24,21 @@ end
 
 local alice = agent('alice')
 
--- statements counts the plugin's hub.sql.query and hub.sql.exec calls during fn.
+-- statements counts the plugin's hub.sql.query and hub.sql.exec calls during fn, up to its tab
+-- declaration (hub.ui.tabs). The declaration reads before it calls hub.ui.tabs; the hub then
+-- opens and renders the views of new tabs, and those renders are not part of the send.
 local function statements(fn)
   local base = select(2, H.calls('none')).next
   fn()
-  local queries, q = H.calls('hub.sql.query', {after = base})
-  local execs, e = H.calls('hub.sql.exec', {after = base})
-  expect(q.dropped or e.dropped, 'no call record dropped').to_be(false)
-  return #queries + #execs
+  local tabs = H.calls('hub.ui.tabs', {after = base})
+  expect(#tabs > 0, 'the send declares the tabs').to_be(true)
+  local n = 0
+  for _, action in ipairs({'hub.sql.query', 'hub.sql.exec'}) do
+    local list, out = H.calls(action, {after = base})
+    expect(out.dropped, 'no call record dropped').to_be(false)
+    for _, c in ipairs(list) do if c.seq < tabs[1].seq then n = n + 1 end end
+  end
+  return n
 end
 
 -- groups adds groups g-reads-<from>..g-reads-<to>, each with alice and the user.
