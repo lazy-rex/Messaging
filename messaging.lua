@@ -165,10 +165,8 @@ end
 -- Notice v2 (hub contract, SDK app.notice once and app.notice_read): a pending notice has once, so
 -- the hub nudges an agent one time until it reads. A read marks its agent read: the agent gets
 -- {read} while mail stays unread (pending does not change), or pending = false. {read} does not
--- set pending, so it is only for an agent that nothing else in the commit marked. The alias merges
--- commit before a handler (handler), so a read normally has its own commit. An alias that appears
--- between that merge and the handler merges in the handler's commit: then the agent gets pending
--- with once, and the read is not recorded.
+-- set pending, so it is only for an agent that nothing else in the commit marked. An alias merge
+-- never shares a commit with a handler (handler), so a read has a commit without merges.
 -- marked[agent]: 'read' when only a read marked it, else 'changed'.
 local notes = {marked = {}, list = {}, inside = false}
 local function mark(agent, how)
@@ -329,7 +327,8 @@ local function migrate_aliases()
   end
   for _, x in ipairs(names) do
     if not applied[x] then
-      -- In a handler, the handler's end flushes the notices; else this merge's own transaction does.
+      -- In the import cutover, the cutover gives the notices; else this merge's own transaction does.
+      -- A handler never merges: it runs after this, in a commit of its own.
       db.transaction(function() merge_alias(x, aliases[x]); if not notes.inside then flush() end end)
     elseif applied[x] ~= aliases[x] then fail('internal', 'An identity alias changed') end
   end
@@ -1989,14 +1988,13 @@ local function handler(fn, declares, render)
     end
     -- The alias merges commit first, each in its own transaction with its own notices. The handler
     -- then commits alone: one notice for an agent cannot hold both pending and read (notice v2).
-    -- The merge inside the handler runs only for an alias that appears in between.
+    -- The handler uses this snapshot of the participants and aliases. It never merges: an alias
+    -- that appears after the snapshot merges at the next call or refresh, in its own commit.
     refresh_participants()
     migrate_aliases()
     local result = db.transaction(function()
       notes.marked, notes.list, notes.inside = {}, {}, true
       local ok, out = pcall(function()
-        refresh_participants()
-        migrate_aliases()
         local r = fn(ctx, args)
         flush()
         return r

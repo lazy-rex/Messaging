@@ -65,7 +65,15 @@ end)
 test('migration moves mailboxes, groups, drafts, archives and homes to the identities', function()
   alice:report({kind = 'claude', conversation_id = 'conversation-a'})
   bob:report({kind = 'codex', conversation_id = 'conversation-b'})
+  local _, base = calls('none')
   local migrated = bob:call('messaging.read', {})
+  -- The merges commit before the read, each alone; the read has a commit of its own (notice v2).
+  local read_commit
+  for _, c in ipairs(calls('hub.sql.commit', {after = base.next})) do
+    local n = c.args.notices or {}
+    if #n == 1 and n[1].agent == bob_id and n[1].read == true then read_commit = n end
+  end
+  expect(read_commit, 'a commit with only the read of bob_id').to_equal({{agent = bob_id, read = true}})
   local m = find(migrated.messages, retry_result.id)
   expect(m.from).to_be(alice_id)
   expect(m.to).to_be(bob_id)
