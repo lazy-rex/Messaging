@@ -380,6 +380,36 @@ test('an imported operation key replays only the same content, also under an ali
   expect_error(function() alice:call('messaging.send', {to = 'bob', body = 'other content', key = 'kv-key'}) end, 'different content')
 end)
 
+test('imported Gallery operations replay only the same content through the Gallery view', function()
+  -- The key-value release saved gallery-draft/ and gallery-send/ operations. Each hub key here
+  -- is new, so the hub passes the call to the plugin, and the plugin compares the fingerprint.
+  local function saved(prefix, key, fingerprint, result)
+    put_operation({key = prefix .. part(key), fingerprint = fingerprint, result = result})
+  end
+  saved('gallery-draft/', 'kv-gd', 'g/' .. part('7') .. part('kv saved'), {draft_revision = '9', text = 'kv saved'})
+  saved('gallery-draft/', 'kv-gd-changed', 'g/' .. part('7') .. part('kv saved'), {draft_revision = '9', text = 'kv saved'})
+  local sent = {message_id = 'gallery-send/' .. part('kv-gs'), cleared_draft_revision = '9', draft_revision = '10'}
+  saved('gallery-send/', 'kv-gs', 'gs/' .. part('9') .. part('kv sent'), sent)
+  saved('gallery-send/', 'kv-gs-changed', 'gs/' .. part('9') .. part('kv sent'), sent)
+  reimport()
+  local v = user:open('gallery')
+  v:render()
+  local op = v:draft('composer', 'kv saved', '7', 'kv-gd')
+  expect(op.status).to_be('succeeded')
+  expect(op.result).to_equal({draft_revision = '9', text = 'kv saved'})
+  op = v:draft('composer', 'other text', '7', 'kv-gd-changed')
+  expect(op.status).to_be('failed')
+  expect(op.error.message).to_match('different content')
+  op = v:send('composer', 'kv sent', '9', 'kv-gs')
+  expect(op.status).to_be('succeeded')
+  expect(op.result).to_equal(sent)
+  op = v:send('composer', 'other text', '9', 'kv-gs-changed')
+  expect(op.status).to_be('failed')
+  expect(op.error.message).to_match('different content')
+  -- No replay and no refusal wrote the Gallery.
+  expect(sql("SELECT key FROM gallery WHERE key IN ('draft', 'history')")).to_equal({})
+end)
+
 test('a late alias whose merge has a draft conflict keeps the import verified until the conflict goes', function()
   local bob_id = 'claude:conversation-bob'
   -- A crash after verified, with two different drafts of the user: one for bob, one for the

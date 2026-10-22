@@ -1402,21 +1402,29 @@ end
 
 local function gallery_draft_save(args)
   local key = 'gallery-draft/' .. part(args.operation_key)
+  local fingerprint = 'g/' .. part(args.base_revision) .. part(args.text)
   local saved = saved_operation({key})
-  if saved.found then return saved.result end
+  if saved.found then
+    if saved.fingerprint ~= fingerprint then fail('operation_conflict', 'Save key already has different content') end
+    return saved.result
+  end
   local _, _, _, draft_rev = gallery_state()
   if draft_rev ~= args.base_revision then fail('draft_conflict', 'The draft changed in another view') end
   gallery_put('draft', {text = args.text})
   local _, _, _, rev = gallery_state()
   local result = {draft_revision = rev, text = args.text}
-  save_operation(key, 'user', 'g/' .. part(args.base_revision) .. part(args.text), result)
+  save_operation(key, 'user', fingerprint, result)
   return result
 end
 
 local function gallery_send(args)
   local key = 'gallery-send/' .. part(args.operation_key)
+  local fingerprint = 'gs/' .. part(args.draft_revision) .. part(args.text)
   local saved = saved_operation({key})
-  if saved.found then return saved.result end
+  if saved.found then
+    if saved.fingerprint ~= fingerprint then fail('operation_conflict', 'Send key already has different content') end
+    return saved.result
+  end
   local _, history, text, draft_rev = gallery_state()
   if draft_rev ~= args.draft_revision or text ~= args.text then fail('draft_conflict', 'The saved draft differs from the text to send') end
   history[#history + 1] = {id = key, author = 'User', own = true, text = args.text, at = os.date('!%Y-%m-%dT%H:%M:%SZ')}
@@ -1426,7 +1434,7 @@ local function gallery_send(args)
   gallery_put('draft', {text = ''})
   local _, _, _, rev = gallery_state()
   local result = {message_id = key, cleared_draft_revision = args.draft_revision, draft_revision = rev}
-  save_operation(key, 'user', 'gs/' .. part(args.draft_revision) .. part(args.text), result)
+  save_operation(key, 'user', fingerprint, result)
   return result
 end
 local function form_context(args)
