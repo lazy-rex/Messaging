@@ -81,6 +81,10 @@ test('migration moves mailboxes, groups, drafts, archives and homes to the ident
   expect(one('SELECT 1 AS x FROM thread_archived WHERE viewer = ? AND peer = ?', {'user', alice_id})).to_be_truthy()
   expect(notice('bob').pending, 'the legacy notice is cleared').to_be(false)
   expect(notice(bob_id).pending).to_be(true)
+  -- The read is recorded too (the reviewer's case): new mail after it nudges again.
+  local intent_before = notice(bob_id).intent_rev
+  alice:call('messaging.send', {to = bob_id, body = 'new mail after the migration read', key = 'after-migration-read'})
+  expect(notice(bob_id).intent_rev ~= intent_before, 'new mail after a read needs a new notice revision').to_be(true)
   bob:call('messaging.ack', {ids = {retry_result.id}})
   expect(has_id(bob:call('messaging.read', {}).messages, retry_result.id)).to_be(false)
 end)

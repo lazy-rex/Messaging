@@ -165,8 +165,10 @@ end
 -- Notice v2 (hub contract, SDK app.notice once and app.notice_read): a pending notice has once, so
 -- the hub nudges an agent one time until it reads. A read marks its agent read: the agent gets
 -- {read} while mail stays unread (pending does not change), or pending = false. {read} does not
--- set pending, so it is only for an agent that nothing else in the commit marked: an identity
--- migration in the same commit can move unread mail to an agent that the hub has no notice for.
+-- set pending, so it is only for an agent that nothing else in the commit marked. The alias merges
+-- commit before a handler (handler), so a read normally has its own commit. An alias that appears
+-- between that merge and the handler merges in the handler's commit: then the agent gets pending
+-- with once, and the read is not recorded.
 -- marked[agent]: 'read' when only a read marked it, else 'changed'.
 local notes = {marked = {}, list = {}, inside = false}
 local function mark(agent, how)
@@ -1985,6 +1987,11 @@ local function handler(fn, declares, render)
       render_aliases()
       return fn(ctx, args)
     end
+    -- The alias merges commit first, each in its own transaction with its own notices. The handler
+    -- then commits alone: one notice for an agent cannot hold both pending and read (notice v2).
+    -- The merge inside the handler runs only for an alias that appears in between.
+    refresh_participants()
+    migrate_aliases()
     local result = db.transaction(function()
       notes.marked, notes.list, notes.inside = {}, {}, true
       local ok, out = pcall(function()
