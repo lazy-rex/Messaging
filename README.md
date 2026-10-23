@@ -21,7 +21,7 @@ Plugin args (hub config `plugins[].args`):
 ## Storage
 
 Each action and each view action is one SQL transaction (`app.db`). The schema is one base step at version 2
-(`db.migrate {base = 2, ...}` in `messaging.lua`) and step 3, which drops the old `aliases_applied` table. The SDK refuses a database at version 1 that has
+(`db.migrate {base = 2, ...}` in `messaging.lua`) and step 3, which drops the old `aliases_applied` table and adds `spawns_ended`. The SDK refuses a database at version 1 that has
 tables: run Messaging b7f07bf on it once first, or start from an empty database. The main tables:
 
 - `messages`: one row for each message, with its thread (`thread_a`, `thread_b`). A direct thread is
@@ -35,7 +35,7 @@ tables: run Messaging b7f07bf on it once first, or start from an empty database.
 - A spawn address `spawn:<id>` stays in the rows until the hub binds the spawn to an identity
   (`hub.agents.resolve`). At each agents change and at its start, Messaging moves the rows of a
   bound spawn to its identity. A spawn that ended unbound (`not_delivered`) loses its waiting
-  deliveries.
+  deliveries and goes to `spawns_ended`; its other rows stay as history.
 
 A send writes one message row and one delivery row for each recipient. No request depends on the
 size of a mailbox, a thread or a group. The hub admits one notice for each agent in a commit.

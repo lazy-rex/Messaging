@@ -11,7 +11,7 @@ test('a new database is at version 3 with the current tables, without the import
   local have = {}
   for _, r in ipairs(sql("SELECT name FROM sqlite_master WHERE type = 'table'")) do have[r.name] = true end
   for _, name in ipairs({'clock', 'deliveries', 'drafts', 'gallery', 'group_members', 'groups',
-      'messages', 'operations', 'thread_archived', 'thread_homes', 'thread_opened', 'thread_titles'}) do
+      'messages', 'operations', 'spawns_ended', 'thread_archived', 'thread_homes', 'thread_opened', 'thread_titles'}) do
     expect(have[name], name).to_be(true)
   end
   for _, name in ipairs({'aliases_applied', 'meta', 'import_source', 'import_ops', 'import_body'}) do

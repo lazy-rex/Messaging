@@ -118,8 +118,10 @@ db.migrate {base = 2, function()
     'CREATE TABLE gallery (key TEXT PRIMARY KEY, value TEXT NOT NULL, rev INTEGER NOT NULL)',
   }) do db.exec(sql) end
 end, function()
-  -- Step 3: the hub binds spawns, not aliases (hub identity (d)).
+  -- Step 3: the hub binds spawns, not aliases (hub identity (d)). spawns_ended holds the spawn
+  -- addresses that ended unbound (rebind_spawns).
   db.exec('DROP TABLE aliases_applied')
+  db.exec('CREATE TABLE spawns_ended (id TEXT PRIMARY KEY) WITHOUT ROWID')
 end}
 
 -- rows returns every row of a query. One hub.sql reply holds about 1 MB of rows; db.each reads
@@ -303,26 +305,28 @@ local function rebind(x, y)
 end
 
 -- waiting_spawns returns the spawn addresses that rows still use. An observed thread d-<hex> of a
--- spawn always has a message or a delivery to it, so the message columns find it.
+-- spawn always has a message or a delivery to it, so the message columns find it. A spawn in
+-- spawns_ended (it ended unbound) does not wait: its rows stay as history.
 local function waiting_spawns()
   local out = {}
-  for _, r in ipairs(rows([[SELECT recipient AS id FROM messages WHERE recipient LIKE 'spawn:%'
+  for _, r in ipairs(rows([[SELECT id FROM (SELECT recipient AS id FROM messages WHERE recipient LIKE 'spawn:%'
       UNION SELECT agent FROM deliveries WHERE agent LIKE 'spawn:%'
       UNION SELECT agent FROM group_members WHERE agent LIKE 'spawn:%'
       UNION SELECT peer FROM thread_opened WHERE peer LIKE 'spawn:%'
       UNION SELECT peer FROM thread_titles WHERE peer LIKE 'spawn:%'
       UNION SELECT peer FROM drafts WHERE peer LIKE 'spawn:%'
       UNION SELECT thread_a FROM thread_homes WHERE thread_a LIKE 'spawn:%'
-      UNION SELECT thread_b FROM thread_homes WHERE thread_b LIKE 'spawn:%' ORDER BY 1]])) do
+      UNION SELECT thread_b FROM thread_homes WHERE thread_b LIKE 'spawn:%')
+      WHERE id NOT IN (SELECT id FROM spawns_ended) ORDER BY 1]])) do
     out[#out + 1] = r.id
   end
   return out
 end
 
 -- rebind_spawns resolves each waiting spawn address (lead-d-r1, lead-d-r2): an identity gets the
--- rows; a spawn that ended before it reported (not_delivered) loses its waiting deliveries (the
--- messages stay in the sender's history); a spawn still starting, or any other error, waits for
--- the next run. It runs at start and on hub.changed agents, each bind in its own transaction.
+-- rows; a spawn that ended before it reported (not_delivered) loses its waiting deliveries and
+-- goes to spawns_ended (the messages stay in the sender's history); a spawn still starting, or
+-- any other error, waits for the next run. It runs at start and on hub.changed agents, each bind in its own transaction.
 local function rebind_spawns()
   for _, x in ipairs(waiting_spawns()) do
     local ok, r = pcall(hub, 'hub.agents.resolve', {to = x})
@@ -337,6 +341,7 @@ local function rebind_spawns()
     elseif code == 'not_delivered' then
       db.transaction(function()
         db.exec('DELETE FROM deliveries WHERE agent = ?', x)
+        db.exec('INSERT INTO spawns_ended (id) VALUES (?) ON CONFLICT DO NOTHING', x)
         print('messaging: ' .. x .. ' ended before it reported; its waiting messages are not delivered')
       end)
     end
