@@ -997,6 +997,9 @@ local function thread_create(agent, args, source_session)
     if result.group == false then remember_thread_open(agent, result.id) end
     return result
   end
+  -- The group ID holds the key, so the key limit bounds every new ID (with the hub's identity ID
+  -- limit, under 1 KB). A stored result replays above, whatever its key size.
+  if #args.key > 200 then fail('invalid_input', 'key is ' .. #args.key .. ' bytes; the limit is 200') end
   local op_key = 'thread-create/' .. part(agent) .. part(args.key)
   -- Encode the complete scoped key. Do not truncate or discard punctuation.
   local id = 'g-' .. op_key:gsub('.', function(c) return string.format('%02x', string.byte(c)) end)
@@ -1141,8 +1144,8 @@ end
 -- a 134 KB render, which the hub refused (too_large). The panel shows the user's own threads by
 -- name. Agent-only and archived threads are a count that opens a section page
 -- (/forms/threads/<list>/<from>). A list over list_budget bytes ends with a More item that opens
--- the next page. A label is cut to label_bytes. A thread whose ID alone is over a page (a legacy ID
--- has no size limit) shows as a row without an action.
+-- the next page. A label is cut to label_bytes. A thread ID is under 1 KB (thread_create's key
+-- limit; no live ID is over a page, coordinator check Q3, 2026-10-22).
 local list_budget = 36000
 local label_bytes = 200
 local sections = {threads = 'Conversations', observed_threads = 'Agent-only threads', archived_threads = 'Archived'}
@@ -1178,8 +1181,7 @@ local function home_lists(user, context)
 end
 
 -- list_page returns the items from index from on that fit in list_budget bytes, then a More item
--- (ID more:<next index>) when items remain. An item over a page by itself becomes a row without
--- an action (ID long:<index>), so every page holds at least one item.
+-- (ID more:<next index>) when items remain. Every page holds at least one item.
 local function list_page(items, from)
   local function more(next)
     return {id = 'more:' .. next, label = 'More…', detail = (#items - next + 1) .. ' more',
@@ -1188,13 +1190,9 @@ local function list_page(items, from)
   local reserve = encoded_size(more(#items)) + 16
   local out, size = {}, 0
   for i = from, #items do
-    local cost = encoded_size(items[i]) + 1
     local item = items[i]
-    if cost + reserve > list_budget then
-      item = {id = 'long:' .. i, label = 'A thread whose ID is too long to show'}
-      cost = encoded_size(item) + 1
-    end
-    if size + cost + reserve > list_budget then
+    local cost = encoded_size(item) + 1
+    if #out > 0 and size + cost + reserve > list_budget then
       out[#out + 1] = more(i)
       return out
     end
@@ -1910,7 +1908,7 @@ local actions = {
     description = 'List your direct and group threads with unread counts. Set include_archived=true to include archived threads.',
     args = {type = 'object', properties = {include_archived = {type = 'boolean'}}, additionalProperties = false}},
   {name = 'messaging.thread_create', fn = thread_create, declares = true, title = 'Create a thread',
-    description = 'Create a thread with yourself and selected roster members. The home defaults to your current session. Set session_id for an open session or new_session for a new name. An existing direct thread keeps its home. Retry with the same key and content.',
+    description = 'Create a thread with yourself and selected roster members. The home defaults to your current session. Set session_id for an open session or new_session for a new name. An existing direct thread keeps its home. The key is at most 200 bytes. Retry with the same key and content.',
     args = {type = 'object', properties = {members = {type = 'array', items = {type = 'string', minLength = 1}}, title = {type = 'string'}, session_id = {type = 'string', minLength = 1}, new_session = {type = 'string', minLength = 1}, key = {type = 'string', minLength = 1}},
       required = {'members', 'key'}, additionalProperties = false}},
   {name = 'messaging.history', fn = history, title = 'Read thread history',

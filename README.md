@@ -87,7 +87,7 @@ lazyrex-hub test -file send.lua
 | identity_mail.lua | Mail between identities: a send and its replay, /clear and resume, a hub crash. |
 | schema_step2.lua | Migration 2: a database at version 1 loses the import tables, `meta` and the old-format operations; every current operation stays and replays. |
 | observer.lua | Read-only observation, the group join, long history in pages. |
-| threads_panel.lua | The Threads panel at three times the live thread count: under the view limit, names only, agent-only and archived threads as a count, every thread reachable through More pages. |
+| threads_panel.lua | The Threads panel at three times the live thread count: under the view limit, names only, agent-only and archived threads as a count, every thread reachable through More pages; the 200-byte thread_create key limit that bounds every new group ID. |
 | agents_render.lua | Read tracking: a new agent appears in an open view without a SQL write (the hub renders again on hub.changed agents). |
 | thread_menu.lua | Rename, members and move as tools and as UI forms; Thread Settings… in the palette for the thread in view. |
 | readsize_send.lua | Size admission: encoded sizes as the hub encodes them (an agent-face reply), the body limit on both send paths, key and reply_to, replay before limits, a large unread backlog, the notice title. |

@@ -108,21 +108,12 @@ test('a thread on a later page opens; New thread opens its form', function()
   expect(op.status).to_be('failed')
 end)
 
-test('a thread whose ID alone is over a page shows as a row without an action', function()
-  -- A legacy group ID has no size limit. This one is 50000 characters: alone it is over the view limit.
-  -- The fixture builds the ID in SQL: one request carries at most 64 KiB.
-  local gid = "'g-x' || printf('%049997d', 0)"
-  write_sql('INSERT INTO groups (gid, name) VALUES (' .. gid .. ", 'Long ID')")
-  write_sql('INSERT INTO group_members (gid, agent, pos, current) VALUES (' .. gid .. ", 'user', 1, 1), (" .. gid .. ", ?, 2, 1)", {alice.id})
+test('thread_create refuses a key over 200 bytes, so every new group ID is bounded', function()
+  expect_error(function()
+    alice:call('messaging.thread_create', {key = string.rep('k', 201), title = 'Too long', members = {'user'}})
+  end, 'the limit is 200')
+  local g = alice:call('messaging.thread_create', {key = string.rep('k', 200), title = 'Bounded', members = {'user'}})
+  expect(#g.id < 1000, 'the group ID is ' .. #g.id .. ' bytes').to_be(true)
   local tree = panel():render()
   expect(size(tree) < limit, 'the panel is ' .. size(tree) .. ' bytes').to_be(true)
-  local items = H.node(tree, 'threads').items
-  local ids = walk('threads', panel(), 'more', {item_id = items[#items].id})
-  for _, item in ipairs(items) do ids[#ids + 1] = item.id end
-  local long = 0
-  for _, id in ipairs(ids) do
-    if id:match('^long:') then long = long + 1 end
-    expect(#id < 1000, 'no page carries the long ID').to_be(true)
-  end
-  expect(long).to_be(1)
 end)
