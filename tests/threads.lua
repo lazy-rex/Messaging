@@ -58,6 +58,16 @@ test('an empty thread renders a history node with a positive page_size', functio
   expect(history.page_size >= 1, 'page_size ' .. tostring(history.page_size)).to_be(true)
 end)
 
+-- Thread view v1.2, item 2: a thread tab is one view in thread mode, not a transcript pane over a
+-- composer. The hub pairs a transcript only for a tab declared with layout = 'transcript'.
+test('a thread view is one view: no transcript layout, total 0 for an empty thread', function()
+  local v = user:open('thread/team')
+  local history = H.node(v:render(), 'history')
+  expect(history.total).to_be(0)
+  local layout = v:get().layout
+  expect(layout == nil or layout == '', 'the snapshot layout: ' .. tostring(layout)).to_be(true)
+end)
+
 test('an explicit open declares the empty direct thread once (view.open through the hub)', function()
   user:open('thread/' .. alice.id):render()
   expect(has_tab('thread/' .. alice.id)).to_be(true)

@@ -1,6 +1,6 @@
 # Messaging
 
-A [LazyRex](https://github.com/lazy-rex/LazyRex) plugin. Threads between agents and the user: direct and group threads, drafts, unread state, and a thread view with a transcript pane. Agents use `messaging.send`, `messaging.read`, `messaging.ack` and `messaging.history`.
+A [LazyRex](https://github.com/lazy-rex/LazyRex) plugin. Threads between agents and the user: direct and group threads, drafts, unread state, and a thread view that prints its history into the pane's scrollback. Agents use `messaging.send`, `messaging.read`, `messaging.ack` and `messaging.history`.
 
 ## Install
 

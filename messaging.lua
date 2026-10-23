@@ -762,8 +762,8 @@ end
 
 -- Views for the user's renderer (spike 3 "Renderer contract"). Only the hub calls these; it
 -- passes the user. The landing panel lists threads; "/thread/<agent>" shows one conversation.
--- The gallery's history holds at most page_size messages. A thread view sends its whole history:
--- the transcript pane prints it once into native scrollback (the maintainer, 2026-10-18).
+-- The gallery's history holds at most page_size messages. A thread view is in thread mode: the
+-- renderer prints its history once into native scrollback (thread view v1.2).
 local page_size = 200
 
 local function display_name(a)
@@ -1219,8 +1219,8 @@ local function render_home(user, context)
   return {title = 'Messages', nodes = nodes}
 end
 -- Rex limits one control message to 64 KiB (rex-protocol.md), for requests and replies. A view
--- tree and a history page therefore carry a bounded part of a thread. The transcript pane fetches
--- the older pages (view.history) and prints the whole thread.
+-- tree and a history page therefore carry a bounded part of a thread. The renderer fetches the older
+-- pages (view.history) and prints the newest 500 messages, or every message in full mode.
 local page_budget = 40000
 
 
@@ -1296,7 +1296,7 @@ local function render_thread(user, route)
     back = nil, -- the Rex sidebar lists the threads; no Back control
     nodes = {
       {id = 'thread_menu', type = 'menu', label = 'Thread…', action = {name = 'open', enabled = true, user_only = 'navigation'}},
-      -- has_more: older messages exist. The transcript pane fetches them with view.history.
+      -- has_more: older messages exist. The renderer fetches them with view.history.
       -- The renderer refuses a page_size below 1, so an empty thread sends 1.
       {id = 'history', type = 'history', messages = messages, has_more = has_more, page_size = math.max(1, #messages),
         -- total: the whole thread. The renderer prints the newest messages and counts the rest.
@@ -1638,12 +1638,11 @@ local function tab_list(user)
     if not s.archived[a.id] then
       local last = last_message(user, a.id, s)
       if (not a.observer and (a.group or last)) or opened_thread(user, a.id, s) then
-        -- A thread with a composer opens as a transcript pane over the composer when the hub enables
-        -- it (spikes/04-scrollback). A read-only direct thread has no composer: it keeps one view.
+        -- A thread tab is one view: the renderer shows it in thread mode (no layout; thread view v1.2).
         local n = a.observer and 0 or (s.counts[a.id] or 0)
         tabs[#tabs + 1] = {key = 'thread/' .. a.id, title = title(thread_title(user, a, s), n), route = '/thread/' .. a.id,
           session_id = thread_home(user, a.id, s), revision = a.observer and '' or (last or ''),
-          status = not a.observer and unread_status(n) or nil, layout = not a.readonly and 'transcript' or nil}
+          status = not a.observer and unread_status(n) or nil}
       end
     end
   end
@@ -2027,7 +2026,7 @@ app.view('/thread/*', {
     remember_thread_open(args.user, peer.id)
     return {}
   end, true),
-  -- A page of messages older than args.before, for the transcript pane.
+  -- A page of messages older than args.before, for the renderer's history fetch.
   ['view.history'] = view(function(args)
     if type(args.before) ~= 'string' or args.before == '' then fail('invalid_input', 'before is required') end
     local messages, has_more = history_page(args.user, thread_peer(args.route, args.user), args.before, page_budget)

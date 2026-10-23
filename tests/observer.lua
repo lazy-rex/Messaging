@@ -130,7 +130,7 @@ test('a long thread: the view holds the newest messages; history pages reach the
   local history = H.node(direct_view:render(), 'history')
   expect(history.has_more).to_be(true)
   expect(#history.messages > 0).to_be(true)
-  expect(history.load_action, 'no load action: the transcript pages').to_be(nil)
+  expect(history.load_action, 'no load action: the renderer fetches pages').to_be(nil)
   expect(#rex.json.encode(history) < 45000, 'the tail fits in one control message').to_be(true)
   local ids, seen = {}, {}
   for _, m in ipairs(history.messages) do ids[#ids + 1] = m.id end

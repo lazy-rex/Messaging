@@ -26,6 +26,7 @@
    "/forms/thread-rename",
    "/forms/thread-move",
    "/forms/thread-members"
-  ]
+  ],
+  "transcript": true
  }
 }
