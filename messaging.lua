@@ -2146,14 +2146,16 @@ app.on('peer.receive', function(args)
   end
   local to = r.id
   local id = received_id(from_hub, env.id)
-  local m = {id = id, from = env.from .. '@' .. from_hub, to = to, body = env.body, at = env.at,
-    reply_expected = env.reply_expected == false and false or nil}
+  local m = {id = id, from = env.from .. '@' .. from_hub, to = to, body = env.body, at = env.at}
+  if env.reply_expected == false then m.reply_expected = false end
+  -- reply_to names a message of this hub; one that is not here is left out. A message is never
+  -- deleted, so this read stays true in the transaction below.
+  if type(env.reply_to) == 'string' and db.first('SELECT 1 AS x FROM messages WHERE id = ?', env.reply_to) then m.reply_to = env.reply_to end
+  -- admit measures the message as it is stored and read.
   local fits = pcall(admit, m)
   if not fits then return refused('too_large', 'The message does not fit one read page here') end
   local stored = db.transaction(function()
     if db.first('SELECT 1 AS x FROM messages WHERE id = ?', id) then return false end
-    -- reply_to names a message of this hub; one that is not here is left out.
-    if type(env.reply_to) == 'string' and db.first('SELECT 1 AS x FROM messages WHERE id = ?', env.reply_to) then m.reply_to = env.reply_to end
     notes.marked, notes.list = {}, {}
     insert_message(m, {to})
     flush()
