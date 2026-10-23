@@ -30,28 +30,16 @@ test('the group list reads every group when the groups are larger than one reply
   expect(found, 'the last group is listed').to_be(true)
 end)
 
-test('alias migration moves every draft before it marks the alias applied', function()
-  for i = 1, 60 do
-    write_sql('INSERT INTO drafts (viewer, peer, text, rev) VALUES (?, ?, ?, ?)', {'alice', 'paging-peer-' .. i, string.rep('d', 20000), 2000 + i})
-  end
-  alice:report({kind = 'claude', conversation_id = 'paging-alias'})
-  alice:call('messaging.read', {})
-  expect(sql("SELECT count(*) AS n FROM drafts WHERE viewer = 'alice'")[1].n, 'no source row stays').to_be(0)
-  expect(sql("SELECT count(*) AS n FROM drafts WHERE viewer = 'claude:paging-alias'")[1].n, 'every draft moved').to_be(60)
-  local sizes = sql("SELECT DISTINCT length(text) AS n FROM drafts WHERE viewer = 'claude:paging-alias'")
-  expect(sizes, 'the texts are complete').to_equal({{n = 20000}})
-end)
-
 test('history continues after a partial result of large messages', function()
   local base = tonumber(sql('SELECT CAST(n AS TEXT) AS n FROM clock')[1].n)
   -- 24 bodies of 16000 bytes (inside the send limit): 384 KB of rows, over one hub.sql reply.
   for i = 1, 24 do
     write_sql([[INSERT INTO messages (seq, id, sender, recipient, thread_a, thread_b, body, at)
-      VALUES (?, ?, 'bob', 'claude:paging-alias', 'bob', 'claude:paging-alias', ?, '2026-10-22T00:00:00Z')]],
+      VALUES (?, ?, 'bob', 'alice', 'alice', 'bob', ?, '2026-10-22T00:00:00Z')]],
       {base + i, 'paging/large/' .. i, string.rep('b', 16000)})
   end
   write_sql('UPDATE clock SET n = ?', {base + 24})
-  local page = bob:call('messaging.history', {thread = 'claude:paging-alias', limit = 50})
+  local page = bob:call('messaging.history', {thread = 'alice', limit = 50})
   expect(#page.messages > 0 and #page.messages < 24, 'the page stops before all rows').to_be(true)
   expect(page.next_before ~= nil, 'the page reports older messages').to_be(true)
   -- Every message arrives in full, across pages.
@@ -64,7 +52,7 @@ test('history continues after a partial result of large messages', function()
       end
     end
     if not page.next_before then break end
-    page = bob:call('messaging.history', {thread = 'claude:paging-alias', limit = 50, before = page.next_before})
+    page = bob:call('messaging.history', {thread = 'alice', limit = 50, before = page.next_before})
   end
   expect(seen).to_be(24)
 end)

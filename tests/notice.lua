@@ -35,14 +35,13 @@ test('a reply names its sender once: the ack of the answered message and the new
   expect(got).to_equal({{agent = 'alice', pending = true, once = true}, {agent = 'bob', pending = false}})
 end)
 
-test('a failed read leaves no notice for a later alias merge to flush', function()
-  -- The reviewer's case: the read fails after it marked its agent; the merge that follows (alice
-  -- gets an identity) must not give bob's read in its own commit.
+test('a failed read leaves no read notice for a later commit', function()
+  -- The reviewer's case: the read fails after it marked its agent; the next commit (a send of
+  -- alice) must not give bob's read.
   alice:call('messaging.send', {to = 'bob', body = 'unread mail', key = 'rollback-notice'})
   local _, base = calls('none')
   expect_error(function() bob:call('messaging.read', {thread = 'g-missing'}) end, 'Unknown thread')
-  alice:report({kind = 'claude', conversation_id = 'rollback-notice-alice'})
-  wait('the alias merge', function() return sql("SELECT identity FROM aliases_applied WHERE alias = 'alice'")[1] end)
+  alice:call('messaging.send', {to = 'user', body = 'a later commit', key = 'rollback-notice-later'})
   local reads = 0
   for _, c in ipairs(calls('hub.sql.commit', {after = base.next})) do
     for _, n in ipairs(c.args.notices or {}) do
@@ -50,31 +49,4 @@ test('a failed read leaves no notice for a later alias merge to flush', function
     end
   end
   expect(reads, 'a failed read records no read in another commit').to_be(0)
-end)
-
-test('an alias that appears during reads merges in a commit of its own; the read keeps its own notice', function()
-  -- The report lands at a time that the test does not control: before, during or after a read.
-  -- The handler never merges, so wherever it lands, a commit with a read notice has no other
-  -- notice, and the merge commit gives the identity pending.
-  local charlie, identity = agent('charlie'), 'claude:conversation-race'
-  local _, base = calls('none')
-  alice:call('messaging.send', {to = 'charlie', body = 'before the identity', key = 'race-1'})
-  charlie:report_async('race', {kind = 'claude', conversation_id = 'conversation-race'}, 20)
-  for _ = 1, 20 do charlie:call('messaging.read', {}) end
-  expect(charlie:report_result('race').error).to_be(nil)
-  charlie:call('messaging.read', {})
-  local merged = false
-  for _, c in ipairs(calls('hub.sql.commit', {after = base.next})) do
-    local n = c.args.notices or {}
-    for _, x in ipairs(n) do
-      if x.read then expect(#n, 'a read notice shares no commit').to_be(1) end
-      if x.agent == identity and x.pending then merged = true end
-    end
-  end
-  expect(merged, 'the merge gives the identity pending').to_be(true)
-  expect(sql("SELECT identity FROM aliases_applied WHERE alias = 'charlie'")).to_equal({{identity = identity}})
-  -- The last read is recorded: new mail nudges again.
-  local before = notice(identity).intent_rev
-  alice:call('messaging.send', {to = identity, body = 'after the read', key = 'race-2'})
-  expect(notice(identity).intent_rev ~= before, 'new mail after the read needs a new notice revision').to_be(true)
 end)

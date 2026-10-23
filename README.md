@@ -83,8 +83,8 @@ lazyrex-hub test -file send.lua
 | members.lua | Membership changes, delivery snapshots, history pages, direct expansion. |
 | homes.lua | Thread homes, reopen tokens, panel order, redirects, sessions, moves. |
 | home_views.lua | The open view of a homed thread: focus, a user close, a closed tab across a hub restart, reopens by a message and by Threads…, the draft across a menu form. |
-| migration.lua, migration_order.lua | Identity migration, old retries, renames, short names. |
-| identity_mail.lua | Mail across identity reports: migration with the same cursor, an identity that never joined, /clear and resume, a hub crash. |
+| thread_forms.lua | The New Thread form, the thread menu overview, renames (the form and a Rex tab rename), short identity names. |
+| identity_mail.lua | Mail between identities: a send and its replay, /clear and resume, a hub crash. |
 | observer.lua | Read-only observation, the group join, long history in pages. |
 | threads_panel.lua | The Threads panel at three times the live thread count: under the view limit, names only, agent-only and archived threads as a count, every thread reachable through More pages. |
 | agents_render.lua | Read tracking: a new agent appears in an open view without a SQL write (the hub renders again on hub.changed agents). |
@@ -93,7 +93,7 @@ lazyrex-hub test -file send.lua
 | growth.lua | A thread of 2000 messages: every send commits, history to the oldest message, the view renders. |
 | tab_reads.lua | The SQL statements of a send and its tab declaration do not grow with the number of peers (needs hub.test.calls). |
 | tabs_commit.lua | The tabs come from committed state: a failed send, move or archive leaves the tabs as they were. |
-| sql_paging.lua | Results over one hub.sql reply: the group list, the alias migration of large drafts (values stay in SQL), history after a partial result. |
+| sql_paging.lua | Results over one hub.sql reply: the group list, history after a partial result. |
 | max_sequence.lua | A message at the largest sequence (9223372036854775807) appears in history and in the thread view. |
 | concat.lua | Joins of lists that a caller controls do not overflow table.concat (the Gallery form with 2600 fields; lazyrex.json test.files sets gallery = true). |
 | gallery.lua | The Gallery view with the plugin arg gallery = true (lazyrex.json test.files): render, actions, draft and send. |
