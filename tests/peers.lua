@@ -94,6 +94,7 @@ test('an envelope with a body at the limit is stored; one byte more is refused',
   expect(deliver(envelope({id = 'm10', body = string.rep('x', 16384), reply_to = got_id}))).to_equal({})
   local m = sql("SELECT reply_to FROM messages WHERE id = ?", {'peer/4:away3:m10'})
   expect(#m).to_be(1)
+  expect(m[1].reply_to, 'the reply_to of this hub is kept').to_be(got_id)
   expect(deliver(envelope({id = 'm11', body = string.rep('x', 16385)})).refused).to_be('too_large')
   expect(count("SELECT 1 AS x FROM messages WHERE id = 'peer/4:away3:m11'")).to_be(0)
 end)
