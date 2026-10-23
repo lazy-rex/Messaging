@@ -124,7 +124,9 @@ test('the team has no members form', function()
   expect(op.error.message).to_match('Unknown thread menu action')
 end)
 
-test('a creation saved by an older plugin version replays without adding a home', function()
+test('a creation key saved in a format from before 4.2 conflicts', function()
+  -- Keys are retry guards. The older formats are removed (coordinator ruling, 2026-10-22): a
+  -- retry of a days-old key gets a conflict, not its old result.
   local key = 'thread-create/' .. part('user') .. part('old-create-no-home')
   sql_write('INSERT INTO operations (key, owner, fingerprint, result) VALUES (?, ?, ?, ?)', {key, 'user',
     'thread-create-v1/' .. part('') .. part('charlie') .. part('user'),
@@ -133,7 +135,7 @@ test('a creation saved by an older plugin version replays without adding a home'
   local f = user:view('/forms/new-thread')
   f:render()
   local op = f:action('new_thread', 'submit', {values = {member_charlie = true}}, 'old-create-no-home')
-  expect(op.status).to_be('succeeded')
-  expect(tab('thread/charlie').session_id or '', 'an old operation replay does not add a home').to_be('')
+  expect(op.status).to_be('failed')
+  expect(op.error.code).to_be('operation_conflict')
   expect(#sql("SELECT 1 AS x FROM thread_homes WHERE thread_a = 'charlie' AND thread_b = 'user'")).to_be(0)
 end)

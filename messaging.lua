@@ -13,6 +13,7 @@ local function part(value)
   return tostring(#value) .. ':' .. value
 end
 
+
 -- The hub owns immutable aliases. The plugin owns the rows that use those aliases.
 local aliases, participants = {}, {}
 local function canonical(id) return aliases[id] or id end
@@ -336,15 +337,14 @@ local function normalized_fingerprint(fp)
     if not p and suffix:sub(-4) == '/fyi' then fyi = true; p = parts(suffix:sub(1, -5)) end
     if not p or #p ~= 3 then return fp end
     return prefix .. '/' .. part(canonical(p[1])) .. part(p[2]) .. part(p[3]) .. (fyi and '/fyi' or '')
-  elseif prefix == 'thread-create-v1' or prefix == 'thread-create-home-v1' or prefix == 'thread-create-session-v1' then
+  elseif prefix == 'thread-create-session-v1' then
     local p = parts(suffix)
-    if not p or #p < 2 then return fp end
+    if not p or #p < 3 then return fp end
     local members, seen = {}, {}
-    local start = prefix == 'thread-create-session-v1' and 4 or (prefix == 'thread-create-home-v1' and 3 or 2)
-    for i = start, #p do local id = canonical(p[i]); if not seen[id] then seen[id] = true; members[#members + 1] = id end end
+    for i = 4, #p do local id = canonical(p[i]); if not seen[id] then seen[id] = true; members[#members + 1] = id end end
     table.sort(members)
     local result = prefix .. '/' .. part(p[1])
-    for i = 2, start - 1 do result = result .. part(p[i]) end
+    for i = 2, 3 do result = result .. part(p[i]) end
     for _, id in ipairs(members) do result = result .. part(id) end
     return result
   elseif prefix == 'thread-members-v1' then
@@ -370,10 +370,6 @@ local function normalized_fingerprint(fp)
     local p = parts(suffix:sub(1, -#ending - 1))
     if not p or #p ~= 1 then return fp end
     return prefix .. '/' .. part(canonical_thread_id(p[1])) .. ending
-  elseif prefix == 'history-load-v1' then
-    local p = parts(suffix)
-    if not p or #p ~= 1 then return fp end
-    return prefix .. '/' .. part(canonical_thread_id(p[1]))
   end
   return fp
 end
@@ -977,21 +973,7 @@ local function thread_create(agent, args, source_session)
   end
   local saved = prior_operation('thread-create/', agent, args.key)
   if saved.found then
-    -- A saved operation from before home sessions keeps its original result and placement.
-    local expected = fingerprint
-    if session_kind == 'default' then
-      local prefix, suffix = saved.fingerprint:match('^([^/]+)/(.+)$')
-      if prefix == 'thread-create-v1' or prefix == 'thread-create-home-v1' then
-        expected = prefix .. '/' .. part(title)
-        if prefix == 'thread-create-home-v1' then
-          local old = parts(suffix)
-          if not old or not old[2] then fail('internal', 'Invalid saved thread operation') end
-          expected = expected .. part(old[2])
-        end
-        for _, id in ipairs(members) do expected = expected .. part(id) end
-      end
-    end
-    local result = operation_result(saved, expected)
+    local result = operation_result(saved, fingerprint)
     if result.group == false then remember_thread_open(agent, result.id) end
     return result
   end
