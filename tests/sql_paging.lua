@@ -44,13 +44,27 @@ end)
 
 test('history continues after a partial result of large messages', function()
   local base = tonumber(sql('SELECT CAST(n AS TEXT) AS n FROM clock')[1].n)
+  -- 24 bodies of 16000 bytes (inside the send limit): 384 KB of rows, over one hub.sql reply.
   for i = 1, 24 do
-    write_sql([[INSERT INTO messages (seq, id, sender, recipient, thread_a, thread_b, body, reply_to, at)
-      VALUES (?, ?, 'bob', 'claude:paging-alias', 'bob', 'claude:paging-alias', 'x', ?, '2026-10-22T00:00:00Z')]],
-      {base + i, 'paging/meta/' .. i, string.rep('r', 50000)})
+    write_sql([[INSERT INTO messages (seq, id, sender, recipient, thread_a, thread_b, body, at)
+      VALUES (?, ?, 'bob', 'claude:paging-alias', 'bob', 'claude:paging-alias', ?, '2026-10-22T00:00:00Z')]],
+      {base + i, 'paging/large/' .. i, string.rep('b', 16000)})
   end
   write_sql('UPDATE clock SET n = ?', {base + 24})
   local page = bob:call('messaging.history', {thread = 'claude:paging-alias', limit = 50})
   expect(#page.messages > 0 and #page.messages < 24, 'the page stops before all rows').to_be(true)
   expect(page.next_before ~= nil, 'the page reports older messages').to_be(true)
+  -- Every message arrives in full, across pages.
+  local seen = 0
+  while true do
+    for _, m in ipairs(page.messages) do
+      if m.id:match('^paging/large/') then
+        expect(#m.body, m.id .. ' in full').to_be(16000)
+        seen = seen + 1
+      end
+    end
+    if not page.next_before then break end
+    page = bob:call('messaging.history', {thread = 'claude:paging-alias', limit = 50, before = page.next_before})
+  end
+  expect(seen).to_be(24)
 end)

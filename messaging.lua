@@ -416,12 +416,6 @@ local function utf8_cut(s, n)
   return s:sub(1, cut)
 end
 
--- preview names a long value in an error: a UTF-8-safe prefix of at most 64 bytes and its size.
-local function preview(v)
-  if #v <= 64 then return v end
-  return utf8_cut(v, 64) .. '... (' .. #v .. ' bytes)'
-end
-
 -- Groups: a group is a recipient with members. A message to a group gets a delivery for every
 -- other member and goes into the group's thread. The built-in group "team" has the whole roster
 -- as members. The user and agents create other groups; their IDs start with "g-", so they never
@@ -524,9 +518,12 @@ local function insert_message(m, audience)
   return seq
 end
 
--- message_columns reads a message for a page: a body longer than cut bytes is cut in SQL to at
--- most cut bytes, at a UTF-8 boundary, so it stays TEXT; body_bytes is its full size. Not a BLOB
--- prefix: the SDK decodes a BLOB in Lua, and a 49 KB one fails with "registry overflow".
+-- message_fields are the columns of a message row in a read or history page.
+local message_fields = 'CAST(m.seq AS TEXT) AS seq, m.id, m.sender, m.recipient, m.reply_to, m.reply_expected, m.at, m.body'
+
+-- message_columns reads a message for the thread view: a body longer than cut bytes is cut in SQL
+-- to at most cut bytes, at a UTF-8 boundary, so it stays TEXT; body_bytes is its full size. Not a
+-- BLOB prefix: the SDK decodes a BLOB in Lua, and a 49 KB one fails with "registry overflow".
 local function message_columns(cut)
   -- k continuation bytes (0x80..0xBF) start at byte cut + 1 - k: the cut moves back k bytes.
   local function cont(at) return 'substr(CAST(m.body AS BLOB), ' .. at .. ", 1) BETWEEN x'80' AND x'BF'" end
@@ -544,20 +541,11 @@ end
 -- Pages. A read or history page holds at most reply_budget encoded bytes. A page is measured with
 -- the largest value of its continuation fields (cursor_max), so the final page is not larger.
 local cursor_max = string.rep('9', 20)
-local count_max = 9999999999
 
 -- read_item is the item of message m in a read or history page.
 local function read_item(m, cursor)
   return {id = m.id, from = m.from, to = m.to, body = m.body, reply_to = m.reply_to,
     reply_expected = m.reply_expected, at = m.at, cursor = cursor}
-end
-
--- min_marker is the smallest item a page can hold for a message: a marker with an empty ID prefix.
-local min_marker = {cursor = cursor_max, id_prefix = '', id_bytes = count_max, metadata_too_large = true, bytes = count_max}
-
--- history_fits reports whether a history page of thread peer can hold one message at all.
-local function history_fits(peer)
-  return encoded_size({thread = peer, messages = {min_marker}, next_before = cursor_max}) <= reply_budget
 end
 
 -- page_bytes is the size of the largest page that holds message m alone: a read page, and a
@@ -587,60 +575,18 @@ local function admit(m)
   end
 end
 
--- full_body holds the full byte size of a body that a query read as a prefix (message_columns).
--- Such an item never fits a page; shrink reports its full sizes.
-local full_body = setmetatable({}, {__mode = 'k'})
-
--- shrink makes the only item of page fit (a stored message from before admit). In order:
---   1. the body is cut to a UTF-8-safe prefix: truncated = true, body_bytes = its full size;
---   2. the metadata does not fit either: a marker {cursor, id, metadata_too_large, bytes};
---   3. the ID does not fit either: id_prefix (at most 256 bytes, can be empty) and id_bytes.
--- bytes is the encoded size of the full item (for a prefix-read body: without the escapes of the
--- part not read). The caller checked that min_marker fits.
-local function shrink(page, item)
-  local body = item.body or ''
-  local body_bytes = full_body[item] or #body
-  local full = encoded_size(item) + body_bytes - #body
-  item.truncated, item.body_bytes, item.body = true, body_bytes, ''
-  page.messages = {item}
-  local over = encoded_size(page) - reply_budget
-  if over <= 0 then
-    local cut = utf8_cut(body, -over)
-    item.body = cut
-    over = encoded_size(page) - reply_budget
-    while over > 0 do
-      cut = utf8_cut(cut, #cut - over)
-      item.body = cut
-      over = encoded_size(page) - reply_budget
-    end
-    return
-  end
-  local marker = {cursor = item.cursor, id = item.id, metadata_too_large = true, bytes = full}
-  page.messages = {marker}
-  if encoded_size(page) <= reply_budget then return end
-  marker.id, marker.id_bytes = nil, #item.id
-  local prefix = utf8_cut(item.id, 256)
-  marker.id_prefix = prefix
-  over = encoded_size(page) - reply_budget
-  while over > 0 and prefix ~= '' do
-    prefix = utf8_cut(prefix, #prefix - over)
-    marker.id_prefix = prefix
-    over = encoded_size(page) - reply_budget
-  end
-  if over > 0 then fail('internal', 'A message marker does not fit one page') end
-end
-
 -- fit_page adds items to page.messages while the page stays within reply_budget, and returns the
--- number added. A first item that does not fit alone is shrunk, so each page makes progress.
+-- number added. admit keeps each message within one page alone, so a first item always fits and
+-- each page makes progress. The stored messages from before admit fit too (checked on the live
+-- store, 2026-10-22: the largest body is 16247 bytes encoded).
 local function fit_page(page, items)
   page.messages = {}
   local size = encoded_size(page)
   for i, item in ipairs(items) do
     local cost = encoded_size(item) + (i > 1 and 1 or 0)
     if size + cost > reply_budget then
-      if i > 1 then return i - 1 end
-      shrink(page, item)
-      return 1
+      if i == 1 then fail('internal', 'A message does not fit one page') end
+      return i - 1
     end
     page.messages[i] = item
     size = size + cost
@@ -654,13 +600,8 @@ local function checked(page)
   return page
 end
 
--- read_page_item is the page item of a message row, with its cursor. A body read as a prefix
--- keeps its full size in full_body.
-local function page_item(r)
-  local item = read_item(as_message(r), r.seq)
-  if r.body_bytes > #r.body then full_body[item] = r.body_bytes end
-  return item
-end
+-- page_item is the page item of a message row, with its cursor.
+local function page_item(r) return read_item(as_message(r), r.seq) end
 
 local function saved_result(saved, fingerprint)
   if normalized_fingerprint(saved.fingerprint) ~= normalized_fingerprint(fingerprint) then fail('conflict', 'Send key already has different content') end
@@ -742,7 +683,7 @@ local function read(agent, args)
   -- One snapshot (the handler's transaction). high is the newest delivery of the agent in it, so
   -- it changes only with the agent's own mail; a later delivery gets a larger seq.
   local high = db.first('SELECT CAST(coalesce(max(seq), 0) AS TEXT) AS n FROM deliveries WHERE agent = ?', agent).n
-  local query = 'SELECT ' .. message_columns(reply_budget + 1) .. [[ FROM deliveries d JOIN messages m ON m.seq = d.seq
+  local query = 'SELECT ' .. message_fields .. [[ FROM deliveries d JOIN messages m ON m.seq = d.seq
     WHERE d.agent = ? AND d.acked = 0 AND d.seq > CAST(? AS INTEGER)]] .. filter .. ' ORDER BY d.seq LIMIT ' .. read_limit
   local selected
   if filter ~= '' then selected = rows(query, agent, since, ta, tb) else selected = rows(query, agent, since) end
@@ -767,15 +708,12 @@ local function history(agent, args)
   local g = group(peer)
   if g and not is_member(g, agent) then fail('refused', 'Only a current member can read this group history') end
   recipients(agent, peer)
-  if not history_fits(peer) then
-    fail('thread_id_too_large', 'Thread ID ' .. preview(peer) .. ' is too long for one history page (' .. encoded_size(peer) .. ' bytes encoded)')
-  end
   local limit = args.limit or 20
   if type(limit) ~= 'number' or limit % 1 ~= 0 or limit < 1 or limit > 50 then fail('invalid_input', 'limit must be an integer from 1 to 50') end
   local before = args.before
   if before ~= nil and (type(before) ~= 'string' or not before:match('^[1-9][0-9]*$')) then fail('invalid_input', 'before must be a positive revision cursor') end
   local ta, tb = thread_pair(agent, peer)
-  local query = 'SELECT ' .. message_columns(reply_budget + 1) .. ' FROM messages m WHERE m.thread_a = ? AND m.thread_b = ?'
+  local query = 'SELECT ' .. message_fields .. ' FROM messages m WHERE m.thread_a = ? AND m.thread_b = ?'
     .. (before and ' AND m.seq < CAST(? AS INTEGER)' or '') .. ' ORDER BY m.seq DESC LIMIT ' .. (limit + 1)
   local found
   if before then found = rows(query, ta, tb, before) else found = rows(query, ta, tb) end

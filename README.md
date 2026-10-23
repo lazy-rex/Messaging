@@ -60,12 +60,8 @@ The plugin keeps every reply and request inside that limit:
   fingerprint). `key` is at most 200 bytes and `reply_to` at most 512 bytes (raw). The whole
   message must also fit one read page and one history page. A stored operation replays before
   these limits.
-- **Stored messages from before these limits** (the import from the key-value store brings them):
-  a body that does not fit a page arrives as a UTF-8 safe prefix with `truncated` and
-  `body_bytes`. The query cuts the body in SQL, at a UTF-8 boundary, so it stays TEXT. Metadata
-  that does not fit gives a marker `{cursor, id, metadata_too_large, bytes}`, or `id_prefix` and
-  `id_bytes` when the ID does not fit either; such a message cannot be acknowledged. History of a
-  thread whose ID leaves no room for the smallest marker fails with `thread_id_too_large`.
+- Every stored message fits these limits too (checked on the live store, 2026-10-22). A read or
+  history page never cuts a message.
 - Open (deferred, F): bodies over 16 KiB would need a digest of the body in the fingerprint, from a
   hub digest action, not a Lua hash.
 
@@ -94,7 +90,6 @@ lazyrex-hub test -file send.lua
 | agents_render.lua | Read tracking: a new agent appears in an open view without a SQL write (the hub renders again on hub.changed agents). |
 | thread_menu.lua | Rename, members and move as tools and as UI forms. |
 | readsize_send.lua | Size admission: encoded sizes as the hub stores them, the body limit on both send paths, key and reply_to, replay before limits, a large unread backlog, the notice title. |
-| readsize_legacy.lua | Stored messages over the limits: body prefix, metadata markers, long IDs, `thread_id_too_large`, packed reads. |
 | growth.lua | A thread of 2000 messages: every send commits, history to the oldest message, the view renders. |
 | tab_reads.lua | The SQL statements of a send and its tab declaration do not grow with the number of peers (needs hub.test.calls). |
 | tabs_commit.lua | The tabs come from committed state: a failed send, move or archive leaves the tabs as they were. |
