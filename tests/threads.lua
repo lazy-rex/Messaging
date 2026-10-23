@@ -38,6 +38,7 @@ end)
 -- manifest sets no gallery arg, as a default install.
 test('the default install declares no Gallery tab', function()
   expect(has_tab('gallery')).to_be(false)
+  expect(has_tab('gallery/thread')).to_be(false)
 end)
 
 -- The plugin had a lab action lab.tabs that passed caller args to hub.ui.tabs with no requester

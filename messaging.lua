@@ -1314,10 +1314,13 @@ local function render_thread(user, route)
   return tree
 end
 
--- Gallery: a live preview of every control, on the route "/gallery". It runs through the real
--- renderer and hub, so hover, click, wheel and typing behave as in production. Its state lives
--- in the gallery table (state, history, draft) and never touches messages or threads.
+-- Gallery: a live preview of every control, in two views. It runs through the real renderer and
+-- hub, so hover, click, wheel and typing behave as in production. "/gallery" holds the list, the
+-- form and the widgets (alt mode). "/gallery/thread" holds the history and the composer (thread
+-- mode): a history node beside a list or form is a view defect (thread view v1.2, lead-tv-gallery).
+-- The state lives in the gallery table (state, history, draft) and never touches messages or threads.
 local gallery_route = '/gallery'
+local gallery_thread_route = '/gallery/thread'
 
 local function gallery_state()
   local r = {}
@@ -1340,15 +1343,11 @@ local gallery_samples = {
 }
 
 local function render_gallery()
-  local state, history, text, draft_rev = gallery_state()
-  local messages = {}
-  for _, m in ipairs(gallery_samples) do messages[#messages + 1] = m end
-  -- The history node holds at most page_size messages: the samples plus the newest saved sends.
-  for i = math.max(1, #history - (page_size - #gallery_samples) + 1), #history do messages[#messages + 1] = history[i] end
+  local state = gallery_state()
   return {
     title = 'Gallery', back = nil,
     nodes = {
-      {id = 'intro', type = 'widget', text = 'Live control gallery. Every control here runs the real renderer: hover, click, scroll and type. Nothing here changes your threads.',
+      {id = 'intro', type = 'widget', text = 'Live control gallery. Every control here runs the real renderer: hover, click, scroll and type. Nothing here changes your threads. The Gallery thread tab shows the history and the composer.',
         action = {name = 'open', label = 'Reset gallery', enabled = true, user_only = 'sample view'}},
       {id = 'last', type = 'widget', text = 'Last action: ' .. (state.last or 'none yet')},
       {id = 'sample_list', type = 'list', label = 'List', items = {
@@ -1364,8 +1363,21 @@ local function render_gallery()
         {id = 'size', label = 'Select', kind = 'select', value = 'medium', required = false, options = {
           {value = 'small', label = 'Small'}, {value = 'medium', label = 'Medium'}, {value = 'large', label = 'Large'}}},
       }, submit_action = {name = 'submit', label = 'Apply', enabled = true, user_only = 'sample view'}},
-      {id = 'history', type = 'history', messages = messages, has_more = false, page_size = page_size,
-        load_action = {name = 'load', label = 'Older messages', enabled = false}},
+    },
+  }
+end
+
+local function render_gallery_thread()
+  local _, history, text, draft_rev = gallery_state()
+  local messages = {}
+  for _, m in ipairs(gallery_samples) do messages[#messages + 1] = m end
+  -- The history node holds at most page_size messages: the samples plus the newest saved sends.
+  for i = math.max(1, #history - (page_size - #gallery_samples) + 1), #history do messages[#messages + 1] = history[i] end
+  return {
+    title = 'Gallery thread', back = nil,
+    nodes = {
+      {id = 'intro', type = 'widget', text = 'Live thread gallery: sample messages and a composer. Sends stay in the gallery; Reset gallery (Gallery tab) clears them.'},
+      {id = 'history', type = 'history', messages = messages, has_more = false, page_size = page_size, total = #messages},
       {id = 'composer', type = 'composer', label = 'Message', text = text, draft_revision = draft_rev,
         save_action = {name = 'save', label = 'Save', enabled = true, user_only = 'sample view'},
         send_action = {name = 'send', label = 'Send', enabled = true, user_only = 'sample view'}},
@@ -1646,7 +1658,10 @@ local function tab_list(user)
       end
     end
   end
-  if gallery_tab then tabs[#tabs + 1] = {key = 'gallery', title = 'Gallery', route = gallery_route} end
+  if gallery_tab then
+    tabs[#tabs + 1] = {key = 'gallery', title = 'Gallery', route = gallery_route}
+    tabs[#tabs + 1] = {key = 'gallery/thread', title = 'Gallery thread', route = gallery_thread_route}
+  end
   return tabs
 end
 
@@ -2047,6 +2062,9 @@ if gallery_tab then
   app.view(gallery_route, {
     render = render_gallery,
     ['view.action'] = function(_, args) return gallery_action(args) end,
+  }, {store = false})
+  app.view(gallery_thread_route, {
+    render = render_gallery_thread,
     ['view.draft.save'] = function(_, args) return gallery_draft_save(args) end,
     ['view.send'] = function(_, args) return gallery_send(args) end,
   }, {store = false})

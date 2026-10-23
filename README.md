@@ -16,7 +16,7 @@ Messaging runs on the LazyRex Plugin SDK v0. Its `lazyrex.json` has `"sdk": "0"`
 
 Plugin args (hub config `plugins[].args`):
 
-- `gallery` (default: absent): `"gallery": "true"` declares the Gallery tab and serves its view (`/gallery`). Without it, the route is unknown. The hub config holds arg values as strings; Rex gives the plugin the boolean `true` (observed in a lab check, 2026-10-21). The Gallery is a live preview of every control, with sample messages. It is for renderer work, not for users.
+- `gallery` (default: absent): `"gallery": "true"` declares the Gallery tabs and serves their views: `/gallery` (list, form and widgets) and `/gallery/thread` (history and composer, in thread mode). Without it, the routes are unknown. The hub config holds arg values as strings; Rex gives the plugin the boolean `true` (observed in a lab check, 2026-10-21). The Gallery is a live preview of every control, with sample messages. It is for renderer work, not for users.
 
 ## Storage
 
@@ -97,7 +97,7 @@ lazyrex-hub test -file send.lua
 | sql_paging.lua | Results over one hub.sql reply: the group list, history after a partial result. |
 | max_sequence.lua | A message at the largest sequence (9223372036854775807) appears in history and in the thread view. |
 | concat.lua | Joins of lists that a caller controls do not overflow table.concat (the Gallery form with 2600 fields; lazyrex.json test.files sets gallery = true). |
-| gallery.lua | The Gallery view with the plugin arg gallery = true (lazyrex.json test.files): render, actions, draft and send. |
+| gallery.lua | The Gallery views with the plugin arg gallery = true (lazyrex.json test.files): /gallery renders list and form with actions; /gallery/thread renders history and composer with draft and send. |
 | tab_coalesce.lua | A burst of `hub.changed agents` gives one or two tab declarations, and the declaration still has the threads (needs hub.test.calls). |
 | notice.lua | The notice forms of each commit (notice v2): `once` for new mail, `read` for a read, `pending = false` without unread mail (needs hub.test.calls). |
 
