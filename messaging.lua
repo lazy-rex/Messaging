@@ -1563,6 +1563,9 @@ local function render_form(args)
     local actions = {
       {id = 'rename', label = 'Rename…', icon = '✎', action = {name = 'rename', enabled = true, user_only = 'navigation'}},
       {id = 'move', label = 'Move to session…', icon = '⇄', action = {name = 'move', enabled = true, user_only = 'navigation'}},
+      -- Show full history reopens the thread view in full mode: the renderer prints every message, not
+      -- only the newest. Only a form can ask for a reopen (the hub refuses it from a tab view).
+      {id = 'full_history', label = 'Show full history', icon = '↑', action = {name = 'full_history', enabled = true, user_only = 'navigation'}},
       {id = 'archive', label = 'Archive', icon = '▤', action = {name = 'archive', enabled = true, tool = 'messaging.thread_archive'}},
     }
     -- The team and observed threads have no member list to change, so they show no Members… row.
@@ -1766,6 +1769,9 @@ local function view_action(args)
     if args.action == 'move' then return {form = '/forms/thread-move'} end
     if args.action == 'rename' then return {form = '/forms/thread-rename'} end
     if args.action == 'members' and not peer.observer and not builtin[peer.id] then return {form = '/forms/thread-members'} end
+    -- The hub replaces the source thread view with a new view that has open args {full = true}. The
+    -- renderer reads them; Messaging renders the same tree for both views.
+    if args.action == 'full_history' then return {reopen = {args = {full = true}}} end
     if args.action == 'archive' then
       thread_archive(args.user, {thread = peer.id, key = args.operation_key})
       return {panel = {command = 'threads'}}

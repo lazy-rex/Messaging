@@ -148,3 +148,25 @@ test('Thread Settings… outside a thread view shows a note, not an error', func
   local tree = user:view('/forms/thread-menu'):render()
   expect(H.node(tree, 'no_thread').text).to_be('Open a thread, then choose Thread Settings… again.')
 end)
+
+-- Show full history (thread view v1.2, item 3): the thread menu form asks the hub to reopen the
+-- thread view with open args {full = true}, and the hub replaces the view.
+test('Show full history in the thread menu reopens the thread view with open args full = true', function()
+  local g = the_group()
+  local v = user:open('thread/' .. g.id)
+  v:render()
+  expect(v:action('thread_menu', 'open', {}).effects).to_be('done')
+  local menu = user:view('/forms/thread-menu')
+  local items = {}
+  for _, item in ipairs(H.node(menu:render(), 'thread_menu').items) do items[#items + 1] = item.id end
+  expect(items).to_contain('full_history')
+  local op = menu:action('thread_menu', 'full_history', {item_id = 'full_history'})
+  expect(op.status).to_be('succeeded')
+  expect(op.result.reopen).to_equal({args = {full = true}})
+  -- The hub replaces the thread view: the new view has the open args and renders the same thread.
+  expect(op.effects, 'effects: ' .. rex.json.encode(op.effects_error or op.effects)).to_be('done')
+  local nv = user:view('thread/' .. g.id)
+  expect(nv:get().open).to_equal({full = true})
+  local n = sql('SELECT count(*) AS n FROM messages WHERE thread_a = ? AND thread_b = ?', {'', g.id})[1].n
+  expect(H.node(nv:render(), 'history').total).to_be(n)
+end)
