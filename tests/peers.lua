@@ -107,3 +107,12 @@ test('a failed commit is not processed, and the next delivery stores the message
   expect(deliver(envelope({id = 'm8', body = 'after a failure'}))).to_equal({})
   expect(count("SELECT 1 AS x FROM messages WHERE body = 'after a failure'")).to_be(1)
 end)
+
+test('a key conflict on hub.peer.send is final: the envelope leaves the outbox and the next one goes', function()
+  -- The first send's key with another body: hub.peer.send answers operation_conflict (lead-b3).
+  sql_write('INSERT INTO peer_outbox (seq, id, hub, envelope) VALUES (?, ?, ?, ?)', {0, first.id, 'away', '{"v":1,"changed":true}'})
+  local before = H.peer_status().peers[1].outbox
+  alice:call('messaging.send', {to = 'bob@away', body = 'after the conflict', key = 'peer-after-conflict'})
+  expect(count('SELECT 1 AS x FROM peer_outbox'), 'the conflict does not block the outbox').to_be(0)
+  expect(H.peer_status().peers[1].outbox, 'the next envelope went').to_be(before + 1)
+end)
