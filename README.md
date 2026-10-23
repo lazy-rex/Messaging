@@ -21,7 +21,7 @@ Plugin args (hub config `plugins[].args`):
 ## Storage
 
 Each action and each view action is one SQL transaction (`app.db`). The schema is one base step at version 2
-(`db.migrate {base = 2, ...}` in `messaging.lua`). The SDK refuses a database at version 1 that has
+(`db.migrate {base = 2, ...}` in `messaging.lua`) and step 3, which drops the old `aliases_applied` table. The SDK refuses a database at version 1 that has
 tables: run Messaging b7f07bf on it once first, or start from an empty database. The main tables:
 
 - `messages`: one row for each message, with its thread (`thread_a`, `thread_b`). A direct thread is
@@ -32,7 +32,10 @@ tables: run Messaging b7f07bf on it once first, or start from an empty database.
 - `thread_homes`, `thread_titles`, `thread_opened`, `thread_archived`, `drafts`: thread state for
   each viewer.
 - `operations`: saved results of keyed operations. An agent key replays forever.
-- `aliases_applied`: identity merges already done.
+- A spawn address `spawn:<id>` stays in the rows until the hub binds the spawn to an identity
+  (`hub.agents.resolve`). At each agents change and at its start, Messaging moves the rows of a
+  bound spawn to its identity. A spawn that ended unbound (`not_delivered`) loses its waiting
+  deliveries.
 
 A send writes one message row and one delivery row for each recipient. No request depends on the
 size of a mailbox, a thread or a group. The hub admits one notice for each agent in a commit.
@@ -79,7 +82,7 @@ lazyrex-hub test -file send.lua
 | home_views.lua | The open view of a homed thread: focus, a user close, a closed tab across a hub restart, reopens by a message and by Threads…, the draft across a menu form. |
 | thread_forms.lua | The New Thread form, the thread menu overview, renames (the form and a Rex tab rename), short identity names. |
 | identity_mail.lua | Mail between identities: a send and its replay, /clear and resume, a hub crash. |
-| schema.lua | A new database is at version 2 with the current tables only (no import tables, no `meta`). |
+| schema.lua | A new database is at version 3 with the current tables only (no import tables, no `meta`, no `aliases_applied`). |
 | observer.lua | Read-only observation, the group join, long history in pages. |
 | threads_panel.lua | The Threads panel at three times the live thread count: under the view limit, names only, agent-only and archived threads as a count, every thread reachable through More pages; the 200-byte thread_create key limit that bounds every new group ID. |
 | agents_render.lua | Read tracking: a new agent appears in an open view without a SQL write (the hub renders again on hub.changed agents). |

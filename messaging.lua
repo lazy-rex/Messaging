@@ -14,9 +14,8 @@ local function part(value)
 end
 
 
--- The hub owns immutable aliases. The plugin owns the rows that use those aliases.
-local aliases, participants = {}, {}
-local function canonical(id) return aliases[id] or id end
+-- participants: the hub's agents (hub.agents {all = true}), read at the start of each call.
+local participants = {}
 local function later(a, b) return #a > #b or (#a == #b and a > b) end
 
 local function parts(text)
@@ -33,7 +32,6 @@ local function parts(text)
 end
 
 local function observed_direct_id(a, b)
-  a, b = canonical(a), canonical(b)
   if b < a then local t = a; a = b; b = t end
   return 'd-' .. (part(a) .. part(b)):gsub('.', function(c) return string.format('%02x', string.byte(c)) end)
 end
@@ -43,7 +41,6 @@ local function observed_direct_parts(id)
   local raw = id:sub(3):gsub('%x%x', function(byte) return string.char(tonumber(byte, 16)) end)
   local pair = parts(raw)
   if not pair or #pair ~= 2 or pair[1] == '' or pair[2] == '' then return nil end
-  pair[1], pair[2] = canonical(pair[1]), canonical(pair[2])
   if pair[1] == 'user' or pair[2] == 'user' then return nil end
   if pair[2] < pair[1] then local t = pair[1]; pair[1] = pair[2]; pair[2] = t end
   return pair
@@ -51,22 +48,16 @@ end
 
 local function canonical_thread_id(id)
   local pair = observed_direct_parts(id)
-  return pair and observed_direct_id(pair[1], pair[2]) or canonical(id)
+  return pair and observed_direct_id(pair[1], pair[2]) or id
 end
 
--- pending: in a render, the aliases that the rows do not show yet (render_aliases). A render
--- treats them as plain agents. Each call starts with none.
-local pending = {names = {}}
 local function refresh_participants()
-  aliases, participants, pending.names = {}, hub('hub.agents', {all = true}).agents or {}, {}
-  for _, a in ipairs(participants) do
-    if a.alias_of then aliases[a.id] = a.alias_of end
-  end
+  participants = hub('hub.agents', {all = true}).agents or {}
 end
 
+-- resolve_recipient returns the stored ID of a recipient. A spawn that has not reported yet stays
+-- "spawn:<id>": its rows move to the identity later (rebind_spawns).
 local function resolve_recipient(id)
-  -- The hub resolves a pending alias to its identity already; the rows still use the alias.
-  if pending.names[id] then return id end
   if id == 'team' or (type(id) == 'string' and id:sub(1, 2) == 'g-') then return id end
   local ok, result = pcall(hub, 'hub.agents.resolve', {to = id})
   if ok then return result.id end
@@ -121,11 +112,14 @@ db.migrate {base = 2, function()
     [[CREATE TABLE drafts (viewer TEXT NOT NULL, peer TEXT NOT NULL, text TEXT NOT NULL, rev INTEGER NOT NULL,
       PRIMARY KEY (viewer, peer)) WITHOUT ROWID]],
     -- Saved operations: an agent key replays forever (store = false in the SDK). owner is the
-    -- agent part of the key, so a lookup finds the keys of an identity's aliases.
+    -- agent part of the key.
     'CREATE TABLE operations (key TEXT PRIMARY KEY, owner TEXT NOT NULL, fingerprint TEXT NOT NULL, result TEXT NOT NULL)',
     'CREATE TABLE aliases_applied (alias TEXT PRIMARY KEY, identity TEXT NOT NULL)',
     'CREATE TABLE gallery (key TEXT PRIMARY KEY, value TEXT NOT NULL, rev INTEGER NOT NULL)',
   }) do db.exec(sql) end
+end, function()
+  -- Step 3: the hub binds spawns, not aliases (hub identity (d)).
+  db.exec('DROP TABLE aliases_applied')
 end}
 
 -- rows returns every row of a query. One hub.sql reply holds about 1 MB of rows; db.each reads
@@ -155,8 +149,8 @@ end
 -- Notice v2 (hub contract, SDK app.notice once and app.notice_read): a pending notice has once, so
 -- the hub nudges an agent one time until it reads. A read marks its agent read: the agent gets
 -- {read} while mail stays unread (pending does not change), or pending = false. {read} does not
--- set pending, so it is only for an agent that nothing else in the commit marked. An alias merge
--- never shares a commit with a handler (handler), so a read has a commit without merges.
+-- set pending, so it is only for an agent that nothing else in the commit marked. A spawn bind
+-- never shares a commit with a handler (handler), so a read has a commit without binds.
 -- marked[agent]: 'read' when only a read marked it, else 'changed'.
 local notes = {marked = {}, list = {}}
 local function mark(agent, how)
@@ -178,26 +172,24 @@ local function flush()
 end
 
 
--- Saved operations. saved_operation looks up exact keys; prior_operation searches the keys of an
--- identity and of its aliases.
+-- Saved operations. saved_operation looks up exact keys; prior_operation looks up an agent's key.
 local function saved_operation(keys)
   local found = rows('SELECT fingerprint, result FROM operations WHERE key IN (SELECT value FROM json_each(?))', json(keys))
-  if #found > 1 then fail('operation_conflict', 'This key was used by more than one aliased agent') end
+  if #found > 1 then fail('operation_conflict', 'This key matches more than one saved operation') end
   if #found == 0 then return {found = false} end
   return {found = true, fingerprint = found[1].fingerprint, result = rex.json.decode(found[1].result)}
 end
 local function prior_operation(prefix, agent, key)
-  local keys = {prefix .. part(agent) .. part(key)}
-  for old, id in pairs(aliases) do if id == agent then keys[#keys + 1] = prefix .. part(old) .. part(key) end end
-  return saved_operation(keys)
+  return saved_operation({prefix .. part(agent) .. part(key)})
 end
 
 local function save_operation(key, owner, fingerprint, result)
   db.exec('INSERT INTO operations (key, owner, fingerprint, result) VALUES (?, ?, ?, ?)', key, owner, fingerprint, json(result))
 end
 
--- Identity aliases. The hub owns them; the plugin moves its rows to the identity once for each
--- alias, in one transaction, in sorted order. A message unread under either name stays unread.
+-- Spawn binds. A message to an agent spawn that has not reported yet is stored for "spawn:<id>".
+-- When the hub binds the spawn to its first identity (hub.agents.resolve), the plugin moves the
+-- rows to the identity in one transaction. A message unread under the spawn address stays unread.
 -- Viewer rows and homes: Lua reads only their keys and the columns of the winner rule; the values
 -- (a draft can be 16 KB) stay in SQL. settle gives the target row the winner's values and deletes
 -- the other rows of the group. A key column changes in place only when no row has the target key.
@@ -245,7 +237,13 @@ local function newest(list, c)
   return w
 end
 
-local function merge_alias(x, y)
+-- rebind moves every row of x (a spawn address) to y (its identity).
+local function rebind(x, y)
+  local function to(id) return id == x and y or id end
+  local function to_thread(id)
+    local pair = observed_direct_parts(id)
+    return pair and observed_direct_id(to(pair[1]), to(pair[2])) or to(id)
+  end
   db.exec('UPDATE messages SET sender = ? WHERE sender = ?', y, x)
   db.exec('UPDATE messages SET recipient = ? WHERE recipient = ?', y, x)
   db.exec([[UPDATE messages SET
@@ -263,7 +261,7 @@ local function merge_alias(x, y)
     local list = rows('SELECT viewer AS k1, peer AS k2' .. columns .. ' FROM ' .. name
       .. " WHERE viewer IN (?, ?) OR peer IN (?, ?) OR peer LIKE 'd-%' ORDER BY viewer, peer", x, y, x, y)
     merge({name = name, k1 = 'viewer', k2 = 'peer', values = values}, list,
-      function(r) return {canonical(r.k1), canonical_thread_id(r.k2)} end, pick)
+      function(r) return {to(r.k1), to_thread(r.k2)} end, pick)
   end
   -- The latest explicit rename wins.
   viewer_merge('thread_titles', 'title, set_rev', ', CAST(set_rev AS TEXT) AS set_rev', function(_, g) return newest(g, 'set_rev') end)
@@ -288,9 +286,9 @@ local function merge_alias(x, y)
   local list = rows([[SELECT thread_a AS k1, thread_b AS k2, moved, CAST(set_rev AS TEXT) AS set_rev FROM thread_homes
     WHERE thread_a IN (?, ?) OR thread_b IN (?, ?) OR thread_a LIKE 'd-%' ORDER BY thread_a, thread_b]], x, y, x, y)
   merge({name = 'thread_homes', k1 = 'thread_a', k2 = 'thread_b', values = 'home_session, moved, set_rev'}, list, function(r)
-    if r.k1:sub(1, 2) == 'd-' then return {canonical_thread_id(r.k1), r.k2} end
+    if r.k1:sub(1, 2) == 'd-' then return {to_thread(r.k1), r.k2} end
     if r.k1 == '' then return {r.k1, r.k2} end
-    local a, b = canonical(r.k1), canonical(r.k2)
+    local a, b = to(r.k1), to(r.k2)
     if b < a then return {b, a} end
     return {a, b}
   end, function(_, g)
@@ -301,32 +299,61 @@ local function merge_alias(x, y)
     end
     return moved or first
   end)
-  db.exec('INSERT INTO aliases_applied (alias, identity) VALUES (?, ?)', x, y)
-  notify(x)
   notify(y)
 end
 
-local function migrate_aliases()
-  local names = {}
-  for id in pairs(aliases) do names[#names + 1] = id end
-  if #names == 0 then return end
-  table.sort(names)
-  local applied = {}
-  for _, r in ipairs(rows('SELECT alias, identity FROM aliases_applied WHERE alias IN (SELECT value FROM json_each(?))', json(names))) do
-    applied[r.alias] = r.identity
+-- waiting_spawns returns the spawn addresses that rows still use. An observed thread d-<hex> of a
+-- spawn always has a message or a delivery to it, so the message columns find it.
+local function waiting_spawns()
+  local out = {}
+  for _, r in ipairs(rows([[SELECT recipient AS id FROM messages WHERE recipient LIKE 'spawn:%'
+      UNION SELECT agent FROM deliveries WHERE agent LIKE 'spawn:%'
+      UNION SELECT agent FROM group_members WHERE agent LIKE 'spawn:%'
+      UNION SELECT peer FROM thread_opened WHERE peer LIKE 'spawn:%'
+      UNION SELECT peer FROM thread_titles WHERE peer LIKE 'spawn:%'
+      UNION SELECT peer FROM drafts WHERE peer LIKE 'spawn:%'
+      UNION SELECT thread_a FROM thread_homes WHERE thread_a LIKE 'spawn:%'
+      UNION SELECT thread_b FROM thread_homes WHERE thread_b LIKE 'spawn:%' ORDER BY 1]])) do
+    out[#out + 1] = r.id
   end
-  for _, x in ipairs(names) do
-    if not applied[x] then
-      -- This merge's own transaction gives its notices. A handler never merges: it runs after
-      -- this, in a commit of its own.
+  return out
+end
+
+-- rebind_spawns resolves each waiting spawn address (lead-d-r1, lead-d-r2): an identity gets the
+-- rows; a spawn that ended before it reported (not_delivered) loses its waiting deliveries (the
+-- messages stay in the sender's history); a spawn still starting, or any other error, waits for
+-- the next run. It runs at start and on hub.changed agents, each bind in its own transaction.
+local function rebind_spawns()
+  for _, x in ipairs(waiting_spawns()) do
+    local ok, r = pcall(hub, 'hub.agents.resolve', {to = x})
+    local y = ok and type(r) == 'table' and r.id
+    local code = not ok and type(r) == 'table' and r.code
+    if type(y) == 'string' and y ~= x and y:sub(1, 6) ~= 'spawn:' then
       db.transaction(function()
-        -- The merge starts with no marks (a failed merge before it can leave some).
         notes.marked, notes.list = {}, {}
-        merge_alias(x, aliases[x])
+        rebind(x, y)
         flush()
       end)
-    elseif applied[x] ~= aliases[x] then fail('internal', 'An identity alias changed') end
+    elseif code == 'not_delivered' then
+      db.transaction(function()
+        db.exec('DELETE FROM deliveries WHERE agent = ?', x)
+        print('messaging: ' .. x .. ' ended before it reported; its waiting messages are not delivered')
+      end)
+    end
   end
+end
+
+-- current_id returns the identity of a bound spawn address, else the ID itself. A saved
+-- fingerprint can hold a spawn address that a retry now resolves to the identity.
+local function current_id(id)
+  if type(id) ~= 'string' or id:sub(1, 6) ~= 'spawn:' then return id end
+  local ok, r = pcall(hub, 'hub.agents.resolve', {to = id})
+  return ok and type(r) == 'table' and type(r.id) == 'string' and r.id or id
+end
+local function current_thread_id(id)
+  local pair = observed_direct_parts(id)
+  if pair then return observed_direct_id(current_id(pair[1]), current_id(pair[2])) end
+  return current_id(id)
 end
 
 local function normalized_fingerprint(fp)
@@ -335,12 +362,12 @@ local function normalized_fingerprint(fp)
     local p, fyi = parts(suffix), false
     if not p and suffix:sub(-4) == '/fyi' then fyi = true; p = parts(suffix:sub(1, -5)) end
     if not p or #p ~= 3 then return fp end
-    return prefix .. '/' .. part(canonical(p[1])) .. part(p[2]) .. part(p[3]) .. (fyi and '/fyi' or '')
+    return prefix .. '/' .. part(current_id(p[1])) .. part(p[2]) .. part(p[3]) .. (fyi and '/fyi' or '')
   elseif prefix == 'thread-create-session-v1' then
     local p = parts(suffix)
     if not p or #p < 3 then return fp end
     local members, seen = {}, {}
-    for i = 4, #p do local id = canonical(p[i]); if not seen[id] then seen[id] = true; members[#members + 1] = id end end
+    for i = 4, #p do local id = current_id(p[i]); if not seen[id] then seen[id] = true; members[#members + 1] = id end end
     table.sort(members)
     local result = prefix .. '/' .. part(p[1])
     for i = 2, 3 do result = result .. part(p[i]) end
@@ -350,25 +377,25 @@ local function normalized_fingerprint(fp)
     local p = parts(suffix)
     if not p or #p < 2 then return fp end
     local members, seen = {}, {}
-    for i = 2, #p do local id = canonical(p[i]); if not seen[id] then seen[id] = true; members[#members + 1] = id end end
+    for i = 2, #p do local id = current_id(p[i]); if not seen[id] then seen[id] = true; members[#members + 1] = id end end
     table.sort(members)
-    local result = prefix .. '/' .. part(canonical(p[1]))
+    local result = prefix .. '/' .. part(current_id(p[1]))
     for _, id in ipairs(members) do result = result .. part(id) end
     return result
   elseif prefix == 'thread-move-v1' then
     local p = parts(suffix)
     if not p or #p ~= 3 then return fp end
-    return prefix .. '/' .. part(canonical_thread_id(p[1])) .. part(p[2]) .. part(p[3])
+    return prefix .. '/' .. part(current_thread_id(p[1])) .. part(p[2]) .. part(p[3])
   elseif prefix == 'thread-rename-v1' then
     local p = parts(suffix)
     if not p or #p ~= 2 then return fp end
-    return prefix .. '/' .. part(canonical_thread_id(p[1])) .. part(p[2])
+    return prefix .. '/' .. part(current_thread_id(p[1])) .. part(p[2])
   elseif prefix == 'thread-archive-v1' then
     local ending = suffix:match('(true)$') or suffix:match('(false)$')
     if not ending then return fp end
     local p = parts(suffix:sub(1, -#ending - 1))
     if not p or #p ~= 1 then return fp end
-    return prefix .. '/' .. part(canonical_thread_id(p[1])) .. ending
+    return prefix .. '/' .. part(current_thread_id(p[1])) .. ending
   end
   return fp
 end
@@ -410,7 +437,7 @@ local builtin = {team = {name = 'Team'}}
 
 local function roster()
   local ids = {}
-  for _, a in ipairs(participants) do if not a.alias_of and a.state ~= 'superseded' then ids[#ids + 1] = a.id end end
+  for _, a in ipairs(participants) do if a.state ~= 'superseded' then ids[#ids + 1] = a.id end end
   return ids
 end
 
@@ -462,7 +489,7 @@ local function recipients(sender, to)
     return list
   end
   for _, a in ipairs(participants) do
-    if not a.alias_of and a.id == to then return {to} end
+    if a.id == to then return {to} end
   end
   fail('refused', 'Unknown recipient')
 end
@@ -829,7 +856,7 @@ local function observed_direct_peer(id, s)
   local pair = observed_direct_parts(id)
   if not pair or not last_message(pair[1], pair[2], s) then return nil end
   local names = {}
-  for _, a in ipairs(participants) do if not a.alias_of then names[a.id] = display_name(a) end end
+  for _, a in ipairs(participants) do names[a.id] = display_name(a) end
   return {id = observed_direct_id(pair[1], pair[2]), name = (names[pair[1]] or pair[1]) .. ' ↔ ' .. (names[pair[2]] or pair[2]),
     observer = true, readonly = true}
 end
@@ -839,7 +866,7 @@ end
 local function peers(user, s, direct_only)
   local list = {}
   for _, a in ipairs(participants) do
-    if a.id ~= user and not a.alias_of then list[#list + 1] = a end
+    if a.id ~= user then list[#list + 1] = a end
   end
   for gid, g in pairs(builtin) do list[#list + 1] = {id = gid, name = g.name, group = true} end
   local created = {}
@@ -955,7 +982,7 @@ local function thread_create(agent, args, source_session)
   local session_kind, session_value = session_intent(args)
   local title = (args.title or ''):match('^%s*(.-)%s*$')
   local known = {}
-  for _, a in ipairs(participants) do if not a.alias_of then known[a.id] = display_name(a) end end
+  for _, a in ipairs(participants) do known[a.id] = display_name(a) end
   local selected, count, maximum = {[agent] = true}, 0, 0
   for index, id in pairs(args.members) do
     if type(index) ~= 'number' or index < 1 or index % 1 ~= 0 or type(id) ~= 'string' then
@@ -1454,7 +1481,6 @@ local function thread_agents(user, peer)
   end
   local out, seen = {}, {[user] = true}
   for _, id in ipairs(ids) do
-    id = canonical(id)
     if not seen[id] then seen[id] = true; out[#out + 1] = id end
   end
   return out
@@ -1481,7 +1507,7 @@ local function participant_fields(user, session, selected)
   local fields = {{id = 'other_sessions', label = 'Show agents in other sessions', kind = 'boolean', value = false}}
   local seen = {[user] = true}
   for _, a in ipairs(participants) do
-    if a.id ~= user and not a.alias_of and (a.state ~= 'superseded' or selected[a.id]) then
+    if a.id ~= user and (a.state ~= 'superseded' or selected[a.id]) then
       seen[a.id] = true
       local field = {id = 'member_' .. a.id, label = display_name(a), kind = 'boolean', value = selected[a.id] == true}
       if a.session_id ~= session and not selected[a.id] then field.visible_when = {field = 'other_sessions', value = true} end
@@ -1528,7 +1554,7 @@ local function move_thread(user, peer, intent, operation_key, source_session)
   local session = resolve_session(kind, value, source_session, op_key)
   local result = {navigate = 'thread/' .. peer.id}
   local ha, hb = home_pair(user, peer.id)
-  -- moved: an explicit choice, which a later identity merge keeps (merge_alias).
+  -- moved: an explicit choice, which a later spawn bind keeps (rebind).
   db.exec([[INSERT INTO thread_homes (thread_a, thread_b, home_session, moved, set_rev) VALUES (?, ?, ?, 1, CAST(? AS INTEGER))
     ON CONFLICT (thread_a, thread_b) DO UPDATE SET home_session = excluded.home_session, moved = 1, set_rev = excluded.set_rev]],
     ha, hb, session, bump())
@@ -1921,16 +1947,16 @@ local actions = {
 
 -- Each action and view handler runs its writes in one SQL transaction (db.transaction; the SDK
 -- frame has tx = false). store = false: Messaging keeps its own operations table
--- (saved_operation). A call first reads the roster and applies new aliases. At its end it gives
+-- (saved_operation). A call first reads the hub agents. At its end it gives
 -- the notices of its writes, in the same commit. A call that can change a thread then declares the
 -- tabs, after the commit: a rolled-back call declares nothing. A failed declaration does not fail
 -- the committed call: it is logged, and the next change declares the tabs again.
 local ui_user = 'user'
 local plain = {store = false, tx = false}
 
--- The refresh applies new aliases and declares the tabs, in a timer after the call that asks for
--- it: an agents change (hub.changed) or a render that sees an alias not yet applied. The schedule
--- state is a table field, not a captured local (the pcall rule, LazyRex docs/rex-protocol.md).
+-- The refresh moves bound spawn rows and declares the tabs, in a timer after an agents change
+-- (hub.changed). The schedule state is a table field, not a captured local (the pcall rule,
+-- LazyRex docs/rex-protocol.md).
 local refresh_schedule = {pending = false}
 local refresh_delay = 0.25
 local function schedule_refresh()
@@ -1939,54 +1965,17 @@ local function schedule_refresh()
   app.after(refresh_delay, function()
     refresh_schedule.pending = false
     refresh_participants()
-    migrate_aliases()
+    rebind_spawns()
     declare_tabs(ui_user)
   end, {tx = false})
 end
 
--- A render reads only (the SDK refuses a write in a render). It shows the rows as they are: an
--- alias that the rows do not show yet is a plain agent in this render (the roster entry without
--- alias_of, and no alias). The render schedules the refresh, which merges the rows and declares
--- the tabs again.
-local function render_aliases()
-  local names = {}
-  for id in pairs(aliases) do names[#names + 1] = id end
-  if #names == 0 then return end
-  local applied = {}
-  for _, r in ipairs(rows('SELECT alias FROM aliases_applied WHERE alias IN (SELECT value FROM json_each(?))', json(names))) do
-    applied[r.alias] = true
-  end
-  for _, id in ipairs(names) do
-    if not applied[id] then aliases[id] = nil; pending.names[id] = true end
-  end
-  if next(pending.names) == nil then return end
-  local list = {}
-  for i, a in ipairs(participants) do
-    if pending.names[a.id] then
-      local copy = {}
-      for k, v in pairs(a) do copy[k] = v end
-      copy.alias_of = nil
-      a = copy
-    end
-    list[i] = a
-  end
-  participants = list
-  schedule_refresh()
-end
-
 local function handler(fn, declares, render)
   return function(ctx, args)
-    if render then
-      refresh_participants()
-      render_aliases()
-      return fn(ctx, args)
-    end
-    -- The alias merges commit first, each in its own transaction with its own notices. The handler
-    -- then commits alone: one notice for an agent cannot hold both pending and read (notice v2).
-    -- The handler uses this snapshot of the participants and aliases. It never merges: an alias
-    -- that appears after the snapshot merges at the next call or refresh, in its own commit.
     refresh_participants()
-    migrate_aliases()
+    if render then return fn(ctx, args) end
+    -- The handler commits alone: one notice for an agent cannot hold both pending and read
+    -- (notice v2). A spawn bind moves rows in the refresh, in its own commit, never here.
     local result = db.transaction(function()
       notes.marked, notes.list = {}, {}
       local ok, out = pcall(function()
@@ -2073,6 +2062,6 @@ for _, command in ipairs({{id = 'new_thread', title = 'New Thread…', descripti
 -- Spike 3 has one UI user. Each conversation has one tab.
 app.start(function()
   refresh_participants()
-  migrate_aliases()
+  rebind_spawns()
   declare_tabs(ui_user)
 end, {tx = false})
