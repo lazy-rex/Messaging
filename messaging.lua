@@ -69,6 +69,14 @@ local function resolve_recipient(id)
   error(result, 0)
 end
 
+-- Remote agents (federation v1, hub docs/hub.md "Peer hubs"). The hub resolves "<id>@<peer>" to
+-- itself and "<id>@<this hub>" to the local ID, so a stored ID with "@" is always a remote agent.
+-- remote_parts returns the agent's ID on its hub and the hub name, or nil.
+local function remote_parts(id)
+  if type(id) ~= 'string' then return nil end
+  return id:match('^(.+)@([a-z0-9][a-z0-9-]*)$')
+end
+
 
 -- Storage: the plugin's SQL database (hub.sql, docs/sql-storage.md). Each action and view handler
 -- runs in one transaction (the SDK), so a rule is a plain read and write: no revision guards and
@@ -122,6 +130,10 @@ end, function()
   -- addresses that ended unbound (rebind_spawns).
   db.exec('DROP TABLE aliases_applied')
   db.exec('CREATE TABLE spawns_ended (id TEXT PRIMARY KEY) WITHOUT ROWID')
+end, function()
+  -- Step 4: envelopes for peer hubs that hub.peer.send has not taken yet (send_outbox). seq is the
+  -- message's seq, so the outbox sends in message order.
+  db.exec('CREATE TABLE peer_outbox (seq INTEGER PRIMARY KEY, id TEXT NOT NULL, hub TEXT NOT NULL, envelope TEXT NOT NULL)')
 end}
 
 -- rows returns every row of a query. One hub.sql reply holds about 1 MB of rows; db.each reads
@@ -493,6 +505,8 @@ local function recipients(sender, to)
     end
     return list
   end
+  -- A remote agent has no delivery here: its hub delivers the envelope (queue_peer).
+  if remote_parts(to) then return {} end
   for _, a in ipairs(participants) do
     if a.id == to then return {to} end
   end
@@ -628,6 +642,49 @@ end
 -- page_item is the page item of a message row, with its cursor.
 local function page_item(r) return read_item(as_message(r), r.seq) end
 
+-- Peer messages (federation v1). A message from hub h with its ID x there is stored here as
+-- peer/<len:h><len:x>, so it never matches a local ID, and a reply can name x again.
+local function received_id(from_hub, id) return 'peer/' .. part(from_hub) .. part(id) end
+local function origin_id(id, peer)
+  local p = type(id) == 'string' and id:sub(1, 5) == 'peer/' and parts(id:sub(6))
+  if p and #p == 2 and p[1] == peer then return p[2] end
+end
+
+-- outbox.pending: this call queued an envelope, so the handler sends the outbox after its commit.
+local outbox = {pending = false}
+
+-- queue_peer stores the envelope of message m (to a remote agent) in the send transaction. The
+-- envelope is fixed now: a retry of hub.peer.send sends the same body with the same key (the
+-- message ID), and the hub returns the first seq.
+local function queue_peer(m, seq)
+  local to, peer = remote_parts(m.to)
+  local envelope = {v = 1, id = m.id, from = m.from, to = to, body = m.body, at = m.at,
+    reply_to = m.reply_to and origin_id(m.reply_to, peer), reply_expected = m.reply_expected}
+  db.exec('INSERT INTO peer_outbox (seq, id, hub, envelope) VALUES (CAST(? AS INTEGER), ?, ?, ?)', seq, m.id, peer, json(envelope))
+  outbox.pending = true
+end
+
+-- A final refusal of hub.peer.send: the envelope can never go, so it leaves the outbox. Any other
+-- error (the hub is busy or gone) keeps it for the next try.
+local peer_final = {key_conflict = true, too_large = true, unknown_hub = true, not_plugin = true, invalid_input = true}
+
+-- send_outbox gives each queued envelope to hub.peer.send, in message order, after the commit
+-- that queued it. It runs after a send, at the start and on a timer. It stops at the first
+-- passing error, so a later envelope never goes before an earlier one.
+local function send_outbox()
+  outbox.pending = false
+  for _, r in ipairs(rows('SELECT CAST(seq AS TEXT) AS seq, id, hub, envelope FROM peer_outbox ORDER BY seq')) do
+    local ok, err = pcall(hub, 'hub.peer.send', {hub = r.hub, key = r.id, body = r.envelope})
+    local code = not ok and type(err) == 'table' and err.code
+    if not ok and not peer_final[code] then
+      print('messaging: hub.peer.send of ' .. r.id .. ' to ' .. r.hub .. ' failed; it waits: ' .. tostring(type(err) == 'table' and err.message or err))
+      return
+    end
+    if not ok then print('messaging: ' .. r.id .. ' to ' .. r.hub .. ' cannot go (' .. tostring(code) .. '): ' .. tostring(err.message)) end
+    db.transaction(function() db.exec('DELETE FROM peer_outbox WHERE seq = CAST(? AS INTEGER)', r.seq) end)
+  end
+end
+
 local function saved_result(saved, fingerprint)
   if normalized_fingerprint(saved.fingerprint) ~= normalized_fingerprint(fingerprint) then fail('conflict', 'Send key already has different content') end
   if type(saved.result) ~= 'table' or type(saved.result.id) ~= 'string' then
@@ -669,7 +726,8 @@ local function send(agent, args)
   local message = {id = id, from = agent, to = args.to, body = args.body, reply_to = args.reply_to, at = os.date('!%Y-%m-%dT%H:%M:%SZ')}
   if args.reply_expected == false then message.reply_expected = false end
   admit(message)
-  insert_message(message, targets)
+  local seq = insert_message(message, targets)
+  if remote_parts(args.to) then queue_peer(message, seq) end
   if original then
     -- A reply acknowledges the message that it answers. An acked target is not an error.
     db.exec('UPDATE deliveries SET acked = 1 WHERE agent = ? AND seq = CAST(? AS INTEGER)', agent, original.seq)
@@ -1996,6 +2054,10 @@ local function handler(fn, declares, render)
       local ok, err = pcall(declare_tabs, ui_user)
       if not ok then print('messaging: the tab declaration failed: ' .. tostring(type(err) == 'table' and err.message or err)) end
     end
+    if outbox.pending then
+      local ok, err = pcall(send_outbox)
+      if not ok then print('messaging: the peer outbox failed: ' .. tostring(type(err) == 'table' and err.message or err)) end
+    end
     return result
   end
 end
@@ -2059,6 +2121,51 @@ app.on('hub.changed', function(args)
   if args.what == 'agents' then schedule_refresh() end
 end, {tx = false})
 
+-- peer.receive (lead-fed-sdk3): the hub gives an envelope from a peer hub {from_hub, key, body}.
+-- A result accepts it. {refused = code, message} drops it for good: only for an envelope that can
+-- never be stored (a bad envelope, an unknown or group recipient, a message too large). A raised
+-- error rolls back, and the hub gives the same envelope again later. The envelope ID makes a
+-- repeat a no-op.
+local function refused(code, message) return {refused = code, message = message} end
+app.on('peer.receive', function(args)
+  local from_hub = args.from_hub
+  if type(from_hub) ~= 'string' or not from_hub:match('^[a-z0-9][a-z0-9-]*$') then return refused('invalid_envelope', 'from_hub is not a hub name') end
+  local ok, env = pcall(rex.json.decode, type(args.body) == 'string' and args.body or '')
+  if not ok or type(env) ~= 'table' or env.v ~= 1 then return refused('invalid_envelope', 'The body is not a v1 envelope') end
+  for _, name in ipairs({'id', 'from', 'to', 'body', 'at'}) do
+    if type(env[name]) ~= 'string' or env[name] == '' then return refused('invalid_envelope', name .. ' must be a nonempty string') end
+  end
+  if args.key ~= env.id then return refused('invalid_envelope', 'The key is not the message ID') end
+  if is_group_id(env.to) or remote_parts(env.to) then return refused('unknown_recipient', 'v1 delivers direct messages to local agents only') end
+  local found, r = pcall(hub, 'hub.agents.resolve', {to = env.to})
+  if not found then
+    if type(r) == 'table' and (r.code == 'refused' or r.code == 'not_delivered' or r.code == 'invalid_target') then
+      return refused('unknown_recipient', 'No agent ' .. env.to .. ' on this hub')
+    end
+    error(r, 0)
+  end
+  local to = r.id
+  local id = received_id(from_hub, env.id)
+  local m = {id = id, from = env.from .. '@' .. from_hub, to = to, body = env.body, at = env.at,
+    reply_expected = env.reply_expected == false and false or nil}
+  local fits = pcall(admit, m)
+  if not fits then return refused('too_large', 'The message does not fit one read page here') end
+  local stored = db.transaction(function()
+    if db.first('SELECT 1 AS x FROM messages WHERE id = ?', id) then return false end
+    -- reply_to names a message of this hub; one that is not here is left out.
+    if type(env.reply_to) == 'string' and db.first('SELECT 1 AS x FROM messages WHERE id = ?', env.reply_to) then m.reply_to = env.reply_to end
+    notes.marked, notes.list = {}, {}
+    insert_message(m, {to})
+    flush()
+    return true
+  end)
+  if stored then
+    local done, err = pcall(declare_tabs, ui_user)
+    if not done then print('messaging: the tab declaration failed: ' .. tostring(type(err) == 'table' and err.message or err)) end
+  end
+  return {}
+end, {tx = false})
+
 for _, command in ipairs({{id = 'new_thread', title = 'New Thread…', description = 'Start a conversation with agents', keywords = {'message', 'conversation'}, route = '/forms/new-thread', action = 'messaging.thread_create'},
     {id = 'threads', title = 'Threads…', description = 'List all threads, with this session first', keywords = {'message', 'conversation'}, surface = 'panel', landing = true, route = '/panels/threads', user_only = 'navigation'},
     -- One entry for the settings of the thread in the source view (user decision 2026-10-22).
@@ -2069,4 +2176,10 @@ app.start(function()
   refresh_participants()
   rebind_spawns()
   declare_tabs(ui_user)
+  pcall(send_outbox)
+end, {tx = false})
+
+-- The outbox tries again every 30 s while it holds an envelope (a peer hub call failed).
+app.every(30, function()
+  if db.first('SELECT 1 AS x FROM peer_outbox LIMIT 1') then send_outbox() end
 end, {tx = false})

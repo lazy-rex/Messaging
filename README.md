@@ -21,7 +21,7 @@ Plugin args (hub config `plugins[].args`):
 ## Storage
 
 Each action and each view action is one SQL transaction (`app.db`). The schema is one base step at version 2
-(`db.migrate {base = 2, ...}` in `messaging.lua`) and step 3, which drops the old `aliases_applied` table and adds `spawns_ended`. The SDK refuses a database at version 1 that has
+(`db.migrate {base = 2, ...}` in `messaging.lua`) and step 3, which drops the old `aliases_applied` table and adds `spawns_ended`. Step 4 adds `peer_outbox`. The SDK refuses a database at version 1 that has
 tables: run Messaging b7f07bf on it once first, or start from an empty database. The main tables:
 
 - `messages`: one row for each message, with its thread (`thread_a`, `thread_b`). A direct thread is
@@ -36,11 +36,29 @@ tables: run Messaging b7f07bf on it once first, or start from an empty database.
   (`hub.agents.resolve`). At each agents change and at its start, Messaging moves the rows of a
   bound spawn to its identity. A spawn that ended unbound (`not_delivered`) loses its waiting
   deliveries and goes to `spawns_ended`; its other rows stay as history.
+- `peer_outbox`: envelopes for peer hubs that `hub.peer.send` has not taken yet (see "Peer hubs").
 
 A send writes one message row and one delivery row for each recipient. No request depends on the
 size of a mailbox, a thread or a group. The hub admits one notice for each agent in a commit.
 New mail gives a pending notice with `once`: the hub nudges the agent one time until it reads.
 `messaging.read` records the read (`read`), or gives `pending = false` when no mail is unread.
+
+## Peer hubs
+
+Federation v1 (hub `docs/hub.md`, "Peer hubs"). An agent sends to `<id>@<hub>`, where `<hub>` is a
+peer in the hub config. Only direct messages cross hubs: a group has no remote members.
+
+- Send: the message is stored here with the remote recipient and no delivery. The same commit
+  writes its envelope to `peer_outbox`: JSON `{v = 1, id, from, to, body, at, reply_to?, reply_expected?}`.
+  After the commit, Messaging gives each envelope to `hub.peer.send` with the message ID as the key,
+  in message order. A failed call leaves the envelope for the next try (at the start, and every 30 s).
+  A final refusal (`key_conflict`, `too_large`, `unknown_hub`, `not_plugin`) drops it with a log line.
+- Receive: the hub calls `peer.receive` `{from_hub, key, body}`. Messaging stores the message as
+  `peer/<len:hub><len:id>`, from `<from>@<from_hub>`, with one delivery to the local agent. A
+  repeat of an envelope changes nothing. Messaging refuses (for good) a bad envelope, a group or
+  unknown recipient, and a message too large for one read page. Any other error is retried by the hub.
+- Reply: a reply to a peer message names the message ID of its origin hub in `reply_to`.
+- Read state stays on each hub. The sender gets no bounce in v1.
 
 ## Size limits
 
@@ -82,7 +100,7 @@ lazyrex-hub test -file send.lua
 | home_views.lua | The open view of a homed thread: focus, a user close, a closed tab across a hub restart, reopens by a message and by Threads…, the draft across a menu form. |
 | thread_forms.lua | The New Thread form, the thread menu overview, renames (the form and a Rex tab rename), short identity names. |
 | identity_mail.lua | Mail between identities: a send and its replay, /clear and resume, a hub crash. |
-| schema.lua | A new database is at version 3 with the current tables only (no import tables, no `meta`, no `aliases_applied`). |
+| schema.lua | A new database is at version 4 with the current tables only (no import tables, no `meta`, no `aliases_applied`). |
 | observer.lua | Read-only observation, the group join, long history in pages. |
 | threads_panel.lua | The Threads panel at three times the live thread count: under the view limit, names only, agent-only and archived threads as a count, every thread reachable through More pages; the 200-byte thread_create key limit that bounds every new group ID. |
 | agents_render.lua | Read tracking: a new agent appears in an open view without a SQL write (the hub renders again on hub.changed agents). |
