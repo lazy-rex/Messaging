@@ -26,6 +26,8 @@
    "/forms/thread-rename",
    "/forms/thread-move",
    "/forms/thread-members"
-  ]
+  ],
+  "hub_name": "lab",
+  "peers": [{"name": "away", "server": "unix:///nonexistent/messaging/rex.sock"}]
  }
 }
