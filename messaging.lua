@@ -495,6 +495,13 @@ local function thread_pair(a, b)
 end
 local function pair_key(a, b) return part(a) .. part(b) end
 
+-- thread_count returns the number of messages in the thread of a and b (the index messages_thread
+-- covers it).
+local function thread_count(a, b)
+  local ta, tb = thread_pair(a, b)
+  return db.first('SELECT count(*) AS n FROM messages WHERE thread_a = ? AND thread_b = ?', ta, tb).n
+end
+
 -- home_pair returns the thread_homes key of a and b. The user's home of an observed thread is its
 -- own row, (d-<hex>, 'user').
 local function home_pair(a, b)
@@ -1291,7 +1298,9 @@ local function render_thread(user, route)
       {id = 'thread_menu', type = 'menu', label = 'Thread…', action = {name = 'open', enabled = true, user_only = 'navigation'}},
       -- has_more: older messages exist. The transcript pane fetches them with view.history.
       -- The renderer refuses a page_size below 1, so an empty thread sends 1.
-      {id = 'history', type = 'history', messages = messages, has_more = has_more, page_size = math.max(1, #messages)},
+      {id = 'history', type = 'history', messages = messages, has_more = has_more, page_size = math.max(1, #messages),
+        -- total: the whole thread. The renderer prints the newest messages and counts the rest.
+        total = thread_count(user, peer.id)},
       {id = 'composer', type = 'composer', label = 'Message', text = text, draft_revision = draft_rev,
         save_action = {name = 'save', label = 'Save', enabled = true, user_only = 'draft is UI state'},
         send_action = {name = 'send', label = 'Send', enabled = true, tool = 'messaging.send'}},
@@ -1548,8 +1557,7 @@ local function render_form(args)
   if args.route == '/forms/thread-menu' then
     -- The thread overview: who is in the thread, then what the user can do with it.
     local peer = form_peer(args)
-    local ta, tb = thread_pair(args.user, peer.id)
-    local count = db.first('SELECT count(*) AS n FROM messages WHERE thread_a = ? AND thread_b = ?', ta, tb).n
+    local count = thread_count(args.user, peer.id)
     local agents = agent_items(args.user, peer)
     local summary = (#agents == 1 and '1 agent' or #agents .. ' agents') .. ' · ' .. count .. (count == 1 and ' message' or ' messages')
     local actions = {

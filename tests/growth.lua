@@ -30,8 +30,11 @@ test('a thread grows to 2000 messages; every send commits; history walks back to
   until not before
   expect(pages).to_be(40)
   expect(oldest).to_be(sent[1])
-  -- The user observes the thread: the view renders the newest page of it.
+  -- The user observes the thread: the view renders the newest page of it, and total counts the
+  -- whole thread, for the renderer's count line.
   local observed = 'd-' .. (#alice.id .. ':' .. alice.id .. #bob.id .. ':' .. bob.id):gsub('.', function(c) return string.format('%02x', c:byte()) end)
   local tree = user:open('thread/' .. observed):render()
-  expect(tree).to_be_truthy()
+  local h = H.node(tree, 'history')
+  expect(h.total).to_be(2000)
+  expect(#h.messages < 2000 and h.has_more, 'one page, with older messages').to_be(true)
 end)
