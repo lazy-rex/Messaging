@@ -60,7 +60,7 @@ test('an empty thread renders a history node with a positive page_size', functio
 end)
 
 -- Thread view v1.2, item 2: a thread tab is one view in thread mode, not a transcript pane over a
--- composer. The hub pairs a transcript only for a tab declared with layout = 'transcript'.
+-- composer. Messaging declares no layout, so the snapshot has none.
 test('a thread view is one view: no transcript layout, total 0 for an empty thread', function()
   local v = user:open('thread/team')
   local history = H.node(v:render(), 'history')
