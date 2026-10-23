@@ -24,10 +24,30 @@ end
 
 local alice = agent('alice')
 
+local function render_attempts()
+  local n = 0
+  for _, r in ipairs(H.renders()) do n = n + r.attempts end
+  return n
+end
+-- settle returns when no view of the plugin started a render for one second. A render of an
+-- earlier tab runs SQL too, and the call record does not say which call a statement belongs to.
+local function settle()
+  local before = render_attempts()
+  for _ = 1, 20 do
+    rex.sleep(1)
+    local now = render_attempts()
+    if now == before then return end
+    before = now
+  end
+  error('the views did not stop rendering', 0)
+end
+
 -- statements counts the plugin's hub.sql.query and hub.sql.exec calls during fn, up to its tab
 -- declaration (hub.ui.tabs). The declaration reads before it calls hub.ui.tabs; the hub then
--- opens and renders the views of new tabs, and those renders are not part of the send.
+-- opens and renders the views of new tabs, and those renders are not part of the send. The
+-- renders of earlier tabs end first (settle).
 local function statements(fn)
+  settle()
   local base = select(2, H.calls('none')).next
   fn()
   local tabs = H.calls('hub.ui.tabs', {after = base})
