@@ -1,6 +1,6 @@
 -- Rex Lua fails table.concat of more than 2559 items with "registry overflow" (LazyRex
--- docs/rex-protocol.md, observed on Rex 0.0.1792158932-g88fd41). A join of a list that a caller
--- controls must not use one table.concat. (Review, 2026-10-22: the Gallery form join.)
+-- docs/rex-protocol.md, observed on Rex 0.0.1792158932-g88fd41). The SDK installs a table.concat
+-- with no limit, and Messaging uses it for lists that a caller controls (the Gallery form join).
 
 test('the Gallery form takes 2600 fields without a registry overflow', function()
   local v = user:open('gallery')
