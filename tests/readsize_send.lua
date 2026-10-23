@@ -21,7 +21,7 @@ local function write_sql(q, p)
   if out[2] ~= nil then error(out[2], 0) end
   return out[1]
 end
-local function put_operation(key, owner, fingerprint, result)
+local function save_operation(key, owner, fingerprint, result)
   write_sql('INSERT INTO operations (key, owner, fingerprint, result) VALUES (?, ?, ?, ?)', {key, owner, fingerprint, rex.json.encode(result)})
 end
 -- put_group writes a created group from before the size rules.
@@ -60,15 +60,22 @@ local function read_all(a)
   error('read did not finish')
 end
 
-test('each content class has the size that the hub stores (Go encoding)', function()
+test('each content class has the size that the hub encodes (Go encoding)', function()
+  -- The hub encodes the reply of an agent call; call_short gives its size in bytes. Two reads of
+  -- one message each differ only in the body: n units of the class against n ASCII bytes. The
+  -- keys have one length, and the clock starts at 1000 so that every cursor has four digits.
+  write_sql('UPDATE clock SET n = 1000')
+  local function read_bytes(body, key)
+    local sent = alice:call('messaging.send', {to = bob.id, body = body, key = key})
+    local out = bob:call_short('messaging.read', {})
+    bob:call('messaging.ack', {ids = {sent.id}})
+    return out.bytes
+  end
   for _, c in ipairs(classes) do
-    local n = math.floor(52000 / c[3])
-    local key = 'size/' .. c[1]
-    write({{key = key, value = {text = string.rep(c[2], n)}}})
-    local out = H.hub('hub.test.store', {plugin = 'messaging', keys = {key}})
-    local big = out.too_large and out.too_large[key]
-    expect(big, c[1] .. ' is reported by size').to_be_truthy()
-    expect(big.bytes, c[1]).to_be(#'{"text":""}' + n * c[3])
+    local n = math.floor(12000 / c[3])
+    local plain = read_bytes(string.rep('a', n), 'p-' .. c[1])
+    local coded = read_bytes(string.rep(c[2], n), 'c-' .. c[1])
+    expect(coded - plain, c[1]).to_be(n * (c[3] - 1))
   end
 end)
 
@@ -133,11 +140,11 @@ test('a stored operation replays before the new limits, on both paths', function
   local key = string.rep('x', 300)
   local body = string.rep('b', 20000)
   local id = 'send/' .. part(alice.id) .. part(key)
-  put_operation(id, alice.id, 'send-v2/' .. part(bob.id) .. part(body) .. part(''), {id = id, key = key})
+  save_operation(id, alice.id, 'send-v2/' .. part(bob.id) .. part(body) .. part(''), {id = id, key = key})
   expect(alice:call('messaging.send', {to = bob.id, body = body, key = key})).to_equal({id = id, key = key})
   local view_id = 'send/' .. part('user') .. part('view-replay')
   local result = {message_id = view_id, cleared_draft_revision = '7'}
-  put_operation(view_id, 'user', 'view-send-v1/' .. part('/thread/' .. bob.id) .. part('7') .. part(body), result)
+  save_operation(view_id, 'user', 'view-send-v1/' .. part('/thread/' .. bob.id) .. part('7') .. part(body), result)
   local v = user:open('thread/' .. bob.id)
   v:render()
   local op = v:send('composer', body, '7', 'view-replay')
