@@ -87,11 +87,14 @@ end
 -- A thread is a pair (thread_a, thread_b): a direct thread is the sorted pair of its agents; a
 -- group thread is ('', group ID). A peer is what a viewer sees in its thread list: an agent ID, a
 -- group ID, or the observed ID d-<hex> of an agent-to-agent thread (the user only).
-db.migrate {function()
+-- The schema starts at version 2 (base = 2): steps 1 and 2 are collapsed into one base step. A
+-- database at version 1 with tables is refused by the SDK; run Messaging b7f07bf once first (it
+-- takes the database to 2), or start from an empty database (user decision 2026-10-23: data loss
+-- is acceptable).
+db.migrate {base = 2, function()
   for _, sql in ipairs({
     'CREATE TABLE clock (one INTEGER PRIMARY KEY CHECK (one = 1), n INTEGER NOT NULL)',
     'INSERT INTO clock (one, n) VALUES (1, 0)',
-    'CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)',
     [[CREATE TABLE messages (seq INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE, sender TEXT NOT NULL,
       recipient TEXT NOT NULL, thread_a TEXT NOT NULL, thread_b TEXT NOT NULL, body TEXT NOT NULL,
       reply_to TEXT, reply_expected INTEGER, at TEXT NOT NULL)]],
@@ -122,23 +125,6 @@ db.migrate {function()
     'CREATE TABLE operations (key TEXT PRIMARY KEY, owner TEXT NOT NULL, fingerprint TEXT NOT NULL, result TEXT NOT NULL)',
     'CREATE TABLE aliases_applied (alias TEXT PRIMARY KEY, identity TEXT NOT NULL)',
     'CREATE TABLE gallery (key TEXT PRIMARY KEY, value TEXT NOT NULL, rev INTEGER NOT NULL)',
-    -- The tables of the removed key-value import: step 2 drops them, and meta.
-    'CREATE TABLE import_source (key TEXT PRIMARY KEY, rev TEXT NOT NULL, complete INTEGER NOT NULL)',
-    'CREATE TABLE import_ops (key TEXT PRIMARY KEY)',
-    'CREATE TABLE import_body (key TEXT PRIMARY KEY, body BLOB NOT NULL)',
-  }) do db.exec(sql) end
-end, function()
-  -- 2 (4.3): the key-value import is removed, so its tables and meta go. A saved operation in a
-  -- fingerprint format that no handler writes now only conflicts (operation_result), so it goes
-  -- too. The list names the prefix of every fingerprint that a handler writes.
-  for _, sql in ipairs({
-    'DROP TABLE import_source',
-    'DROP TABLE import_ops',
-    'DROP TABLE import_body',
-    'DROP TABLE meta',
-    [[DELETE FROM operations WHERE substr(fingerprint, 1, instr(fingerprint, '/') - 1) NOT IN
-      ('send-v2', 'view-send-v1', 'draft-v1', 'thread-create-session-v1', 'thread-members-v1',
-       'thread-archive-v1', 'thread-move-v1', 'thread-rename-v1', 'g', 'gs')]],
   }) do db.exec(sql) end
 end}
 
