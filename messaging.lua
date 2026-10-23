@@ -122,10 +122,23 @@ db.migrate {function()
     'CREATE TABLE operations (key TEXT PRIMARY KEY, owner TEXT NOT NULL, fingerprint TEXT NOT NULL, result TEXT NOT NULL)',
     'CREATE TABLE aliases_applied (alias TEXT PRIMARY KEY, identity TEXT NOT NULL)',
     'CREATE TABLE gallery (key TEXT PRIMARY KEY, value TEXT NOT NULL, rev INTEGER NOT NULL)',
-    -- The tables of the removed key-value import: a later numbered step drops them, and meta.
+    -- The tables of the removed key-value import: step 2 drops them, and meta.
     'CREATE TABLE import_source (key TEXT PRIMARY KEY, rev TEXT NOT NULL, complete INTEGER NOT NULL)',
     'CREATE TABLE import_ops (key TEXT PRIMARY KEY)',
     'CREATE TABLE import_body (key TEXT PRIMARY KEY, body BLOB NOT NULL)',
+  }) do db.exec(sql) end
+end, function()
+  -- 2 (4.3): the key-value import is removed, so its tables and meta go. A saved operation in a
+  -- fingerprint format that no handler writes now only conflicts (operation_result), so it goes
+  -- too. The list names the prefix of every fingerprint that a handler writes.
+  for _, sql in ipairs({
+    'DROP TABLE import_source',
+    'DROP TABLE import_ops',
+    'DROP TABLE import_body',
+    'DROP TABLE meta',
+    [[DELETE FROM operations WHERE substr(fingerprint, 1, instr(fingerprint, '/') - 1) NOT IN
+      ('send-v2', 'view-send-v1', 'draft-v1', 'thread-create-session-v1', 'thread-members-v1',
+       'thread-archive-v1', 'thread-move-v1', 'thread-rename-v1', 'g', 'gs')]],
   }) do db.exec(sql) end
 end}
 
