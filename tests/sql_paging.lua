@@ -3,10 +3,6 @@
 -- reports; none may drop the rest silently. (Review of 92d5f7c: rows() dropped the continuation
 -- flag.) The history test is coverage: it also passed before the fix.
 
--- Every call fails with unavailable until the import at start is done (import.lua). Under load,
--- the start can end before it; the tests begin after it.
-wait('the import at start', function() return (sql("SELECT value FROM meta WHERE key = 'import'")[1] or {}).value == 'done' end)
-
 local alice, bob = agent('alice'), agent('bob')
 
 -- write_sql runs sql_write; while the plugin holds a transaction, it waits.

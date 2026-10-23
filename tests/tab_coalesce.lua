@@ -6,10 +6,6 @@
 -- The count needs hub.test.calls (hub branch hub/test-calls). Without it, the file has one test
 -- named SKIP and measures nothing.
 
--- Every call fails with unavailable until the import at start is done (import.lua). Under load,
--- the start can end before it; the tests begin after it.
-wait('the import at start', function() return (sql("SELECT value FROM meta WHERE key = 'import'")[1] or {}).value == 'done' end)
-
 local function calls_missing()
   if not H.calls then return 'the harness has no H.calls' end
   local ok, err = pcall(H.calls, 'none')

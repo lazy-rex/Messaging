@@ -2,10 +2,6 @@
 -- unread status, cursors, and archive and restore. The human acts through the UI (forms, the
 -- thread menu, the threads panel); agents act as tools.
 
--- Every call fails with unavailable until the import at start is done (import.lua). Under load,
--- the start can end before it; the tests begin after it.
-wait('the import at start', function() return (sql("SELECT value FROM meta WHERE key = 'import'")[1] or {}).value == 'done' end)
-
 -- writes is the write state of the plugin: a write that gives out a revision moves the clock; an
 -- open mark or a saved operation adds a row.
 local function writes()

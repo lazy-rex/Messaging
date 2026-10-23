@@ -5,10 +5,6 @@
 --   stays selected in later migrations.
 -- Two direct threads: alice-bob has no move; bob-charlie gets a move between the migrations.
 
--- Every call fails with unavailable until the import at start is done (import.lua). Under load,
--- the start can end before it; the tests begin after it.
-wait('the import at start', function() return (sql("SELECT value FROM meta WHERE key = 'import'")[1] or {}).value == 'done' end)
-
 local a_id, b_id, c_id = 'claude:conversation-a', 'codex:conversation-b', 'claude:conversation-c'
 local alice, bob, charlie = agent('alice'), agent('bob'), agent('charlie')
 

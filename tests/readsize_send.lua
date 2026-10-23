@@ -4,10 +4,6 @@
 -- bytes. No request depends on mailbox, group or thread size. Sizes count encoded JSON as the
 -- hub's Go encoder writes it.
 
--- Every call fails with unavailable until the import at start is done (import.lua). Under load,
--- the start can end before it; the tests begin after it.
-wait('the import at start', function() return (sql("SELECT value FROM meta WHERE key = 'import'")[1] or {}).value == 'done' end)
-
 local function part(s) return #s .. ':' .. s end
 local function message(id) return sql('SELECT seq FROM messages WHERE id = ?', {id})[1] end
 local function draft_of(viewer, peer)

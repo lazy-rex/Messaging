@@ -3,10 +3,6 @@
 -- about 780 messages. In SQL, a send writes one message row and one delivery row for each
 -- recipient: no request depends on thread size. The recipient acknowledges as the thread grows.
 
--- Every call fails with unavailable until the import at start is done (import.lua). Under load,
--- the start can end before it; the tests begin after it.
-wait('the import at start', function() return (sql("SELECT value FROM meta WHERE key = 'import'")[1] or {}).value == 'done' end)
-
 local alice, bob = agent('alice'), agent('bob')
 
 test('a thread grows to 2000 messages; every send commits; history walks back to the first', function()

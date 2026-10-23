@@ -3,8 +3,6 @@
 -- seq < 9223372036854775807.) A file of its own: after it, the clock has no next revision.
 
 local bob = agent('bob')
--- The plugin imports at start (import.lua), in its own transactions: a direct SQL write waits for it.
-wait('the import at start', function() return (sql("SELECT value FROM meta WHERE key = 'import'")[1] or {}).value == 'done' end)
 
 test('the last supported sequence appears in history and in the thread view', function()
   sql_write('UPDATE clock SET n = 9223372036854775806')

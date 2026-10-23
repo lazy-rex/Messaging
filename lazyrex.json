@@ -26,13 +26,6 @@
      }
     }
    },
-   "import.lua": {
-    "args": {
-     "messaging": {
-      "gallery": "true"
-     }
-    }
-   },
    "gallery.lua": {
     "args": {
      "messaging": {

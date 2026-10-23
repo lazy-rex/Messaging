@@ -130,8 +130,7 @@ db.migrate {function()
     'CREATE TABLE operations (key TEXT PRIMARY KEY, owner TEXT NOT NULL, fingerprint TEXT NOT NULL, result TEXT NOT NULL)',
     'CREATE TABLE aliases_applied (alias TEXT PRIMARY KEY, identity TEXT NOT NULL)',
     'CREATE TABLE gallery (key TEXT PRIMARY KEY, value TEXT NOT NULL, rev INTEGER NOT NULL)',
-    -- The import from the key-value store (import.lua): the source records with their revisions,
-    -- the saved operations, and large bodies in parts.
+    -- The tables of the removed key-value import: a later numbered step drops them, and meta.
     'CREATE TABLE import_source (key TEXT PRIMARY KEY, rev TEXT NOT NULL, complete INTEGER NOT NULL)',
     'CREATE TABLE import_ops (key TEXT PRIMARY KEY)',
     'CREATE TABLE import_body (key TEXT PRIMARY KEY, body BLOB NOT NULL)',
@@ -161,14 +160,14 @@ end
 
 -- Notices. A handler marks each agent whose unread state it may change; at its end, flush gives
 -- the hub one notice for each agent (the hub admits one for each agent in a commit), with
--- pending queried after the writes, so it is exact. inside: a handler runs, and its end flushes.
+-- pending queried after the writes, so it is exact.
 -- Notice v2 (hub contract, SDK app.notice once and app.notice_read): a pending notice has once, so
 -- the hub nudges an agent one time until it reads. A read marks its agent read: the agent gets
 -- {read} while mail stays unread (pending does not change), or pending = false. {read} does not
 -- set pending, so it is only for an agent that nothing else in the commit marked. An alias merge
 -- never shares a commit with a handler (handler), so a read has a commit without merges.
 -- marked[agent]: 'read' when only a read marked it, else 'changed'.
-local notes = {marked = {}, list = {}, inside = false}
+local notes = {marked = {}, list = {}}
 local function mark(agent, how)
   if not notes.marked[agent] then notes.list[#notes.list + 1] = agent end
   if notes.marked[agent] ~= 'changed' then notes.marked[agent] = how end
@@ -327,13 +326,13 @@ local function migrate_aliases()
   end
   for _, x in ipairs(names) do
     if not applied[x] then
-      -- In the import cutover, the cutover gives the notices; else this merge's own transaction does.
-      -- A handler never merges: it runs after this, in a commit of its own.
+      -- This merge's own transaction gives its notices. A handler never merges: it runs after
+      -- this, in a commit of its own.
       db.transaction(function()
-        -- Outside the cutover, this merge starts with no marks (a failed merge before it can leave some).
-        if not notes.inside then notes.marked, notes.list = {}, {} end
+        -- The merge starts with no marks (a failed merge before it can leave some).
+        notes.marked, notes.list = {}, {}
         merge_alias(x, aliases[x])
-        if not notes.inside then flush() end
+        flush()
       end)
     elseif applied[x] ~= aliases[x] then fail('internal', 'An identity alias changed') end
   end
@@ -1991,13 +1990,6 @@ local actions = {
 -- the committed call: it is logged, and the next change declares the tabs again.
 local ui_user = 'user'
 local plain = {store = false, tx = false}
--- imported is true once SQL holds Messaging's data (import.lua). Before, every call is refused.
-local imported = {done = false, error = nil}
-local function require_imported()
-  if not imported.done then
-    fail('unavailable', 'Messaging is importing its data' .. (imported.error and (': ' .. imported.error) or ''))
-  end
-end
 
 -- The refresh applies new aliases and declares the tabs, in a timer after the call that asks for
 -- it: an agents change (hub.changed) or a render that sees an alias not yet applied. The schedule
@@ -2009,7 +2001,6 @@ local function schedule_refresh()
   refresh_schedule.pending = true
   app.after(refresh_delay, function()
     refresh_schedule.pending = false
-    if not imported.done then return end
     refresh_participants()
     migrate_aliases()
     declare_tabs(ui_user)
@@ -2048,7 +2039,6 @@ end
 
 local function handler(fn, declares, render)
   return function(ctx, args)
-    require_imported()
     if render then
       refresh_participants()
       render_aliases()
@@ -2061,13 +2051,12 @@ local function handler(fn, declares, render)
     refresh_participants()
     migrate_aliases()
     local result = db.transaction(function()
-      notes.marked, notes.list, notes.inside = {}, {}, true
+      notes.marked, notes.list = {}, {}
       local ok, out = pcall(function()
         local r = fn(ctx, args)
         flush()
         return r
       end)
-      notes.inside = false
       -- A failed handler gives no notices: clear its marks, so a later merge cannot flush them.
       if not ok then notes.marked, notes.list = {}, {}; error(out, 0) end
       return out
@@ -2118,10 +2107,10 @@ app.view('/panels/threads', {
 app.view('/forms/*', {render = render(form_view), ['view.action'] = view(view_action, true)}, plain)
 if gallery_tab then
   app.view(gallery_route, {
-    render = function() require_imported(); return render_gallery() end,
-    ['view.action'] = function(_, args) require_imported(); return gallery_action(args) end,
-    ['view.draft.save'] = function(_, args) require_imported(); return gallery_draft_save(args) end,
-    ['view.send'] = function(_, args) require_imported(); return gallery_send(args) end,
+    render = render_gallery,
+    ['view.action'] = function(_, args) return gallery_action(args) end,
+    ['view.draft.save'] = function(_, args) return gallery_draft_save(args) end,
+    ['view.send'] = function(_, args) return gallery_send(args) end,
   }, {store = false})
 end
 
@@ -2140,50 +2129,8 @@ for _, command in ipairs({{id = 'new_thread', title = 'New Thread…', descripti
     {id = 'threads', title = 'Threads…', description = 'List all threads, with this session first', keywords = {'message', 'conversation'}, surface = 'panel', landing = true, route = '/panels/threads', user_only = 'navigation'}}) do app.command(command) end
 
 -- Spike 3 has one UI user. Each conversation has one tab.
--- The import runs in steps: each step is one transaction or one page of a check (import.lua).
--- The start runs steps until start_seconds have passed (os.clock: wall time since start in
--- gopher-lua), so a done or small import ends before the first call. The time is checked between
--- steps, so the start can take one step longer; calls wait in the plugin's queue for that time. A larger import continues in
--- timer steps; between them the plugin answers calls, and each fails with unavailable until the
--- import is done. A failed import stops; every call then fails with its error, meta import_error
--- holds the error, the plugin keeps running, and the next start continues.
-local import = require('import')({
-  db = db, hub = hub, fail = fail, part = part, parts = parts, json = json, rows = rows,
-  encoded_size = encoded_size, utf8_cut = utf8_cut, later = later, thread_pair = thread_pair,
-  c = function(id) return canonical(id) end, c_thread = function(id) return canonical_thread_id(id) end,
-  use_aliases = function(map) aliases = map end,
-  refresh_participants = refresh_participants, participants = function() return participants end,
-  notice = app.notice,
-  -- The cutover gives the notices of the whole roster itself: the merges give none.
-  migrate_aliases = function()
-    local inside = notes.inside
-    notes.inside = true
-    migrate_aliases()
-    notes.inside, notes.marked, notes.list = inside, {}, {}
-  end,
-})
-local import_timer = {}
-local start_seconds = 0.5
-function import_timer.tick(seconds)
-  local ok, more
-  local stop = os.clock() + (seconds or 0)
-  repeat
-    ok, more = pcall(import.step)
-  until not ok or not more or os.clock() >= stop
-  if not ok then
-    imported.error = type(more) == 'table' and tostring(more.code) .. ': ' .. tostring(more.message) or tostring(more)
-    print('messaging: the import failed: ' .. imported.error)
-    pcall(db.transaction, function()
-      db.exec([[INSERT INTO meta (key, value) VALUES ('import_error', ?)
-        ON CONFLICT (key) DO UPDATE SET value = excluded.value]], imported.error)
-    end)
-    return
-  end
-  if more then app.after(0, import_timer.tick, {tx = false}); return end
-  pcall(db.transaction, function() db.exec("DELETE FROM meta WHERE key = 'import_error'") end)
-  imported.done = true
+app.start(function()
   refresh_participants()
   migrate_aliases()
   declare_tabs(ui_user)
-end
-app.start(function() import_timer.tick(start_seconds) end, {tx = false})
+end, {tx = false})

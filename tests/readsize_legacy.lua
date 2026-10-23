@@ -2,10 +2,6 @@
 -- key-value store brings such messages) must still read: a page never exceeds 49152 encoded
 -- bytes, never skips a message, and always makes progress.
 
--- Every call fails with unavailable until the import at start is done (import.lua). Under load,
--- the start can end before it; the tests begin after it.
-wait('the import at start', function() return (sql("SELECT value FROM meta WHERE key = 'import'")[1] or {}).value == 'done' end)
-
 local alice, bob, charlie = agent('alice'), agent('bob'), agent('charlie')
 local budget = 49152
 local at = '2026-10-19T00:00:00Z'

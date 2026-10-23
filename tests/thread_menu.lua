@@ -1,10 +1,6 @@
 -- The thread menu actions on both paths: the agent tool (messaging.thread_rename, _members, _move,
 -- through the agent face) and the UI form submit (the hub view path). Both call one handler.
 
--- Every call fails with unavailable until the import at start is done (import.lua). Under load,
--- the start can end before it; the tests begin after it.
-wait('the import at start', function() return (sql("SELECT value FROM meta WHERE key = 'import'")[1] or {}).value == 'done' end)
-
 local function thread_of(list, id)
   for _, t in ipairs(list.threads) do if t.id == id then return t end end
 end

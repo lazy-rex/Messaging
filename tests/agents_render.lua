@@ -4,8 +4,6 @@
 -- (markChanged), so an open New thread form gets the new participant from a render for the change,
 -- not for a commit, and without an app.refresh in Messaging.
 
-wait('the import at start', function() return (sql("SELECT value FROM meta WHERE key = 'import'")[1] or {}).value == 'done' end)
-
 -- has_text is true when the snapshot holds the string s anywhere.
 local function has_text(v, s)
   if type(v) == 'string' then return v:find(s, 1, true) ~= nil end

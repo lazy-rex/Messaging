@@ -3,10 +3,6 @@
 -- (the form and a Rex tab rename), short identity names, and a draft conflict during migration.
 -- The hub makes the identities from real reports in the agent panes (hub.identity.report).
 
--- Every call fails with unavailable until the import at start is done (import.lua). Under load,
--- the start can end before it; the tests begin after it.
-wait('the import at start', function() return (sql("SELECT value FROM meta WHERE key = 'import'")[1] or {}).value == 'done' end)
-
 local function one(q, p) return sql(q, p)[1] end
 local function unread(name) return one('SELECT count(*) AS n FROM deliveries WHERE agent = ? AND acked = 0', {name}).n end
 local function message(id) return one('SELECT * FROM messages WHERE id = ?', {id}) end

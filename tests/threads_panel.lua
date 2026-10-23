@@ -4,8 +4,6 @@
 -- 600 threads of the user and 220 agent-only threads, each with a 170-character group ID like the
 -- live ones, and archives 60 of the user's threads. Every thread stays reachable through More.
 
-wait('the import at start', function() return (sql("SELECT value FROM meta WHERE key = 'import'")[1] or {}).value == 'done' end)
-
 local alice, bob = agent('alice'), agent('bob')
 local limit = 49152
 
