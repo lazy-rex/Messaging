@@ -76,12 +76,12 @@ local sent = {}
 test('agent send: a body of exactly 16384 encoded bytes is accepted; one byte more is refused', function()
   for _, c in ipairs(classes) do
     local body = body_of(c[2], c[3], limit)
-    local r = alice:call('messaging.send', {to = 'bob', body = body, key = 'body-' .. c[1]})
+    local r = alice:call('messaging.send', {to = bob.id, body = body, key = 'body-' .. c[1]})
     sent[r.id] = body
     local over = 'over-' .. c[1]
-    expect_error(function() alice:call('messaging.send', {to = 'bob', body = body .. 'a', key = over}) end,
+    expect_error(function() alice:call('messaging.send', {to = bob.id, body = body .. 'a', key = over}) end,
       'body is 16385 bytes encoded; the limit is 16384')
-    expect(message('send/' .. part('alice') .. part(over)), 'a refused send writes nothing').to_be(nil)
+    expect(message('send/' .. part(alice.id) .. part(over)), 'a refused send writes nothing').to_be(nil)
   end
 end)
 
@@ -98,7 +98,7 @@ test('the accepted bodies read back in full', function()
 end)
 
 test('view send: the same limit, counted the same way, for every class', function()
-  local v = user:open('thread/bob')
+  local v = user:open('thread/' .. bob.id)
   v:render()
   local rev = '0'
   for _, c in ipairs(classes) do
@@ -109,22 +109,22 @@ test('view send: the same limit, counted the same way, for every class', functio
     expect(op.status, c[1] .. ' at the limit').to_be('succeeded')
     local over = body .. 'a'
     saved = v:draft('composer', over, op.result.draft_revision, 'draft-over-' .. c[1])
-    local draft_before = draft_of('user', 'bob')
+    local draft_before = draft_of('user', bob.id)
     op = v:send('composer', over, saved.result.draft_revision, 'view-over-' .. c[1])
     expect(op.status, c[1] .. ' over the limit').to_be('failed')
     expect(op.error.code).to_be('invalid_input')
     expect(op.error.message).to_match('body is 16385 bytes encoded; the limit is 16384')
-    expect(draft_of('user', 'bob'), 'a refused send keeps the draft').to_equal(draft_before)
+    expect(draft_of('user', bob.id), 'a refused send keeps the draft').to_equal(draft_before)
     rev = saved.result.draft_revision
   end
 end)
 
 test('key and reply_to limits are raw bytes', function()
-  alice:call('messaging.send', {to = 'bob', body = 'k', key = string.rep('k', 200)})
-  expect_error(function() alice:call('messaging.send', {to = 'bob', body = 'k', key = string.rep('k', 201)}) end, 'key is 201 bytes; the limit is 200')
-  expect_error(function() alice:call('messaging.send', {to = 'bob', body = 'r', key = 'reply-513', reply_to = string.rep('r', 513)}) end,
+  alice:call('messaging.send', {to = bob.id, body = 'k', key = string.rep('k', 200)})
+  expect_error(function() alice:call('messaging.send', {to = bob.id, body = 'k', key = string.rep('k', 201)}) end, 'key is 201 bytes; the limit is 200')
+  expect_error(function() alice:call('messaging.send', {to = bob.id, body = 'r', key = 'reply-513', reply_to = string.rep('r', 513)}) end,
     'reply_to is 513 bytes; the limit is 512')
-  local ok, e = pcall(alice.call, alice, 'messaging.send', {to = 'bob', body = 'r', key = 'reply-512', reply_to = string.rep('r', 512)})
+  local ok, e = pcall(alice.call, alice, 'messaging.send', {to = bob.id, body = 'r', key = 'reply-512', reply_to = string.rep('r', 512)})
   expect(ok).to_be(false)
   expect(tostring(e.message or e):find('limit is 512', 1, true), 'a 512-byte reply_to passes the size check').to_be(nil)
 end)
@@ -132,13 +132,13 @@ end)
 test('a stored operation replays before the new limits, on both paths', function()
   local key = string.rep('x', 300)
   local body = string.rep('b', 20000)
-  local id = 'send/' .. part('alice') .. part(key)
-  put_operation(id, 'alice', 'send-v2/' .. part('bob') .. part(body) .. part(''), {id = id, key = key})
-  expect(alice:call('messaging.send', {to = 'bob', body = body, key = key})).to_equal({id = id, key = key})
+  local id = 'send/' .. part(alice.id) .. part(key)
+  put_operation(id, alice.id, 'send-v2/' .. part(bob.id) .. part(body) .. part(''), {id = id, key = key})
+  expect(alice:call('messaging.send', {to = bob.id, body = body, key = key})).to_equal({id = id, key = key})
   local view_id = 'send/' .. part('user') .. part('view-replay')
   local result = {message_id = view_id, cleared_draft_revision = '7'}
-  put_operation(view_id, 'user', 'view-send-v1/' .. part('/thread/bob') .. part('7') .. part(body), result)
-  local v = user:open('thread/bob')
+  put_operation(view_id, 'user', 'view-send-v1/' .. part('/thread/' .. bob.id) .. part('7') .. part(body), result)
+  local v = user:open('thread/' .. bob.id)
   v:render()
   local op = v:send('composer', body, '7', 'view-replay')
   expect(op.status).to_be('succeeded')
@@ -151,30 +151,30 @@ test('a large unread backlog does not block a send, on both paths', function()
   local before = tonumber(revision())
   write_sql([[INSERT INTO messages (seq, id, sender, recipient, thread_a, thread_b, body, at)
     WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 600)
-    SELECT (SELECT c.n FROM clock c) + i, 'legacy/' || i || '/' || ?, 'alice', 'bob', 'alice', 'bob', 'old', '2026-01-01T00:00:00Z' FROM n]],
-    {string.rep('u', 80)})
+    SELECT (SELECT c.n FROM clock c) + i, 'legacy/' || i || '/' || ?, ?, ?, ?, ?, 'old', '2026-01-01T00:00:00Z' FROM n]],
+    {string.rep('u', 80), alice.id, bob.id, alice.id, bob.id})
   write_sql('UPDATE clock SET n = n + 600')
-  write_sql([[INSERT INTO deliveries (agent, seq, acked) SELECT 'bob', seq, 0 FROM messages WHERE id LIKE 'legacy/%']])
+  write_sql([[INSERT INTO deliveries (agent, seq, acked) SELECT ?, seq, 0 FROM messages WHERE id LIKE 'legacy/%']], {bob.id})
   expect(tonumber(revision())).to_be(before + 600)
   local body = string.rep('h', 3000)
-  local sent = alice:call('messaging.send', {to = 'bob', body = body, key = 'big-mailbox'})
+  local sent = alice:call('messaging.send', {to = bob.id, body = body, key = 'big-mailbox'})
   expect(message(sent.id), 'the send committed').to_be_truthy()
-  local v = user:open('thread/bob')
+  local v = user:open('thread/' .. bob.id)
   v:render()
-  local current = draft_of('user', 'bob')
+  local current = draft_of('user', bob.id)
   local saved = v:draft('composer', body, current and current.rev or '0', 'draft-big-mailbox')
   local op = v:send('composer', body, saved.result.draft_revision, 'view-big-mailbox')
   expect(op.status).to_be('succeeded')
   expect(message('send/' .. part('user') .. part('view-big-mailbox'))).to_be_truthy()
-  write_sql([[UPDATE deliveries SET acked = 1 WHERE agent = 'bob' AND seq IN (SELECT seq FROM messages WHERE id LIKE 'legacy/%')]])
+  write_sql([[UPDATE deliveries SET acked = 1 WHERE agent = ? AND seq IN (SELECT seq FROM messages WHERE id LIKE 'legacy/%')]], {bob.id})
 end)
 
 local charlie = agent('charlie')
 test('a membership notice cuts a long thread title to fit, and the new member reads it in full', function()
-  local gid = alice:call('messaging.thread_create', {members = {'bob', 'user'}, key = 'notice-title'}).id
+  local gid = alice:call('messaging.thread_create', {members = {bob.id, 'user'}, key = 'notice-title'}).id
   expect(gid:sub(1, 2)).to_be('g-')
-  write_sql('INSERT INTO thread_titles (viewer, peer, title, set_rev) VALUES (?, ?, ?, (SELECT n FROM clock))', {'alice', gid, string.rep('T', 60000)})
-  alice:call('messaging.thread_members', {thread = gid, members = {'bob', 'charlie', 'user'}, key = 'add-charlie'})
+  write_sql('INSERT INTO thread_titles (viewer, peer, title, set_rev) VALUES (?, ?, ?, (SELECT n FROM clock))', {alice.id, gid, string.rep('T', 60000)})
+  alice:call('messaging.thread_members', {thread = gid, members = {bob.id, charlie.id, 'user'}, key = 'add-charlie'})
   local page = charlie:call('messaging.read', {thread = gid})
   expect(#rex.json.encode(page) <= budget).to_be(true)
   local notice = page.messages[1]
@@ -188,28 +188,28 @@ end)
 
 test('a membership change whose notice cannot fit is refused, and nothing is written', function()
   local gid = 'g-' .. string.rep('n', 25000)
-  put_group(gid, 'Long legacy group', {'alice', 'bob'})
+  put_group(gid, 'Long legacy group', {alice.id, bob.id})
   local members = 'SELECT agent, pos, current FROM group_members WHERE gid = ? ORDER BY agent'
   local before = sql(members, {gid})
-  local mail = "SELECT count(*) AS n FROM deliveries WHERE agent = 'charlie'"
-  local box_before = sql(mail)[1].n
-  local ok, e = pcall(alice.call, alice, 'messaging.thread_members', {thread = gid, members = {'bob', 'charlie'}, key = 'add-to-long'})
+  local mail = "SELECT count(*) AS n FROM deliveries WHERE agent = ?"
+  local box_before = sql(mail, {charlie.id})[1].n
+  local ok, e = pcall(alice.call, alice, 'messaging.thread_members', {thread = gid, members = {bob.id, charlie.id}, key = 'add-to-long'})
   expect(ok).to_be(false)
   expect(e.code).to_be('invalid_input')
   expect(sql(members, {gid}), 'membership is unchanged').to_equal(before)
-  expect(sql(mail)[1].n, 'no notice was delivered').to_be(box_before)
+  expect(sql(mail, {charlie.id})[1].n, 'no notice was delivered').to_be(box_before)
 end)
 
 test('a send to a legacy group with a long ID is refused by the page rule, before any write', function()
   -- admit runs before the writes: the read and history pages of this message would hold the
   -- group ID twice (to, and the history thread), over 49152 bytes even with a one-byte body.
   local gid = 'g-' .. string.rep('p', 25000)
-  put_group(gid, 'Long legacy group', {'alice', 'bob'})
+  put_group(gid, 'Long legacy group', {alice.id, bob.id})
   local before = revision()
   local ok, e = pcall(alice.call, alice, 'messaging.send', {to = gid, body = 'x', key = 'page-rule'})
   expect(ok).to_be(false)
   expect(e.code).to_be('invalid_input')
   expect(e.message).to_match('The message does not fit one read page: %d+ bytes encoded, limit 49152')
   expect(revision(), 'nothing was written').to_be(before)
-  expect(message('send/' .. part('alice') .. part('page-rule'))).to_be(nil)
+  expect(message('send/' .. part(alice.id) .. part('page-rule'))).to_be(nil)
 end)

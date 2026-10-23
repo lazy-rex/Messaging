@@ -28,10 +28,10 @@ local function section(id)
 end
 
 test('agent-only threads appear as observed, with no tab and no unread', function()
-  group = alice:call('messaging.thread_create', {key = 'observer-group', title = 'Agent discussion', members = {'bob'}})
+  group = alice:call('messaging.thread_create', {key = 'observer-group', title = 'Agent discussion', members = {bob.id}})
   old = alice:call('messaging.send', {to = group.id, key = 'observer-old', body = 'Before the user joined'})
-  alice:call('messaging.send', {to = 'bob', key = 'observer-direct', body = 'A direct note'})
-  direct_id = 'd-' .. hex(part('alice') .. part('bob'))
+  alice:call('messaging.send', {to = bob.id, key = 'observer-direct', body = 'A direct note'})
+  direct_id = 'd-' .. hex(part(alice.id) .. part(bob.id))
   expect(tab('thread/' .. group.id), 'an observed group is not opened automatically').to_be(nil)
   expect(tab('thread/' .. direct_id), 'an observed direct needs an explicit open').to_be(nil)
   local tree = panel():render()
@@ -126,7 +126,7 @@ end)
 
 test('a long thread: the view holds the newest messages; history pages reach the first one', function()
   -- About 67 KB of messages: more than one view (the plugin measures the exact encoded size).
-  for i = 0, 204 do alice:call('messaging.send', {to = 'bob', key = 'observer-page-' .. i, body = 'Older message ' .. i .. ' ' .. string.rep('x', 200)}) end
+  for i = 0, 204 do alice:call('messaging.send', {to = bob.id, key = 'observer-page-' .. i, body = 'Older message ' .. i .. ' ' .. string.rep('x', 200)}) end
   local history = H.node(direct_view:render(), 'history')
   expect(history.has_more).to_be(true)
   expect(#history.messages > 0).to_be(true)
@@ -151,7 +151,7 @@ test('a long thread: the view holds the newest messages; history pages reach the
 end)
 
 test('a long message arrives whole within one control message', function()
-  alice:call('messaging.send', {to = 'bob', key = 'observer-huge', body = string.rep('y', 15000)})
+  alice:call('messaging.send', {to = bob.id, key = 'observer-huge', body = string.rep('y', 15000)})
   local tail = H.node(direct_view:render(), 'history')
   expect(#tail.messages[#tail.messages].text).to_be(15000)
   expect(#rex.json.encode(tail) < 60000).to_be(true)

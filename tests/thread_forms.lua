@@ -13,14 +13,14 @@ local bob_home = session('Bob home')
 local alice = agent('alice', {title = 'alice tab'})
 local bob = agent('bob', {title = 'bob tab', session = bob_home})
 -- An identity with no roster name: the hub names it after its tab label.
-local nameless = agent('nameless', {join = false, title = 'nameless tab'})
+local nameless = agent('nameless', {report = false, title = 'nameless tab'})
 local nameless_id = 'codex:conversation-b'
 nameless:report({kind = 'codex', conversation_id = 'conversation-b'})
 alice:call('messaging.send', {to = 'user', body = 'hello user', key = 'to-user'})
 
 local thread_view, menu
 test('New Thread form: source session, a new session choice, other-session members, cancel', function()
-  thread_view = user:open('thread/alice')
+  thread_view = user:open('thread/' .. alice.id)
   thread_view:render()
   user:command('new_thread', thread_view) -- the palette in the thread pane: its source view
   local form = user:view('/forms/new-thread')
@@ -33,7 +33,7 @@ test('New Thread form: source session, a new session choice, other-session membe
   for _, o in ipairs(s.options or {}) do if o.value == '@new' then new_choice = true end end
   expect(new_choice, 'a new session is a choice').to_be(true)
   expect(find(fields, 'other_sessions').kind).to_be('boolean')
-  expect(find(fields, 'member_bob').visible_when.field, 'a member in another session hides behind other_sessions').to_be('other_sessions')
+  expect(find(fields, 'member_' .. bob.id).visible_when.field, 'a member in another session hides behind other_sessions').to_be('other_sessions')
   expect(H.node(tree, 'cancel').action.name).to_be('$cancel')
   form:action('cancel', '$cancel', {})
 end)
@@ -47,14 +47,14 @@ test('the thread menu is an overview: summary, agents, actions, Close', function
   expect(H.node(tree, 'summary').text).to_match('^1 agent · %d+ messages?')
   local rows = H.node(tree, 'agents').items
   expect(#rows).to_be(1)
-  expect(rows[1].id).to_be('alice')
+  expect(rows[1].id).to_be(alice.id)
   expect(rows[1].action.enabled and rows[1].status and rows[1].icon, 'an agent row opens its tab').to_be_truthy()
   expect(has_id(H.node(tree, 'thread_menu').items, 'older'), 'no older item').to_be(false)
   expect(tree.nodes[#tree.nodes].action.label).to_be('Close')
-  local op = menu:action('agents', 'agent', {item_id = 'bob'})
+  local op = menu:action('agents', 'agent', {item_id = bob.id})
   expect(op.status).to_be('failed')
   expect(op.error.message).to_match('not in this thread')
-  op = menu:action('agents', 'agent', {item_id = 'alice'})
+  op = menu:action('agents', 'agent', {item_id = alice.id})
   expect(op.status, 'hub.navigate.agent found the agent tab').to_be('succeeded')
   expect(op.result).to_equal({close_form = true})
 end)
@@ -79,9 +79,9 @@ test('rename from the menu form, then a Rex tab rename wins over an old form ret
     if t == 'Release notes' then return t end
   end)
   expect(title).to_be('Release notes')
-  expect(title_of('user', 'alice').title).to_be('Release notes')
+  expect(title_of('user', alice.id).title).to_be('Release notes')
   expect(operation('rename-form').status, 'the form operation is final').to_be('succeeded')
-  expect_error(function() user:plugin_view('rename', {route = '/thread/alice', user = 'user', title = 'Wrong caller'}) end, 'Only the hub')
+  expect_error(function() user:plugin_view('rename', {route = '/thread/' .. alice.id, user = 'user', title = 'Wrong caller'}) end, 'Only the hub')
 end)
 
 test('an unnamed identity shows a short ID; declared titles are never empty', function()

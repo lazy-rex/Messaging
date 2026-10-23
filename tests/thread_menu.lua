@@ -23,7 +23,7 @@ end
 local group
 local function the_group()
   if not group then
-    group = agent('alice'):call('messaging.thread_create', {key = 'menu-group', title = 'Menu group', members = {'bob', 'user'}})
+    group = agent('alice'):call('messaging.thread_create', {key = 'menu-group', title = 'Menu group', members = {agent('bob').id, 'user'}})
   end
   return group
 end
@@ -53,29 +53,30 @@ test('rename in the UI form uses the same record', function()
 end)
 
 test('members as a tool: a member adds a participant; others and the team are refused', function()
-  local alice, charlie = agent('alice'), agent('charlie')
+  local alice, bob, charlie = agent('alice'), agent('bob'), agent('charlie')
   local g = the_group()
-  local r = alice:call('messaging.thread_members', {thread = g.id, members = {'bob', 'user', 'charlie'}, key = 'm1'})
+  local r = alice:call('messaging.thread_members', {thread = g.id, members = {bob.id, 'user', charlie.id}, key = 'm1'})
   expect(r.id).to_be(g.id)
-  expect(r.members).to_equal({'alice', 'bob', 'charlie', 'user'})
+  expect(r.members).to_equal({alice.id, bob.id, charlie.id, 'user'})
   -- charlie got the member notice and can now read the thread.
   local mail = charlie:call('messaging.read', {thread = g.id})
   expect(mail.messages[1].body).to_match('You were added')
-  expect_error(function() alice:call('messaging.thread_members', {thread = 'team', members = {'bob'}, key = 'm2'}) end, 'dynamic membership')
+  expect_error(function() alice:call('messaging.thread_members', {thread = 'team', members = {bob.id}, key = 'm2'}) end, 'dynamic membership')
   local outsider = agent('bob')
-  local other = alice:call('messaging.thread_create', {key = 'menu-private', title = 'Private', members = {'charlie', 'user'}})
-  expect_error(function() outsider:call('messaging.thread_members', {thread = other.id, members = {'alice', 'charlie'}, key = 'm3'}) end, 'Unknown thread')
+  local other = alice:call('messaging.thread_create', {key = 'menu-private', title = 'Private', members = {charlie.id, 'user'}})
+  expect_error(function() outsider:call('messaging.thread_members', {thread = other.id, members = {alice.id, charlie.id}, key = 'm3'}) end, 'Unknown thread')
   expect_error(function() outsider:call('messaging.thread_rename', {thread = other.id, title = 'Mine', key = 'm4'}) end, 'Unknown thread')
   expect_error(function() outsider:call('messaging.thread_move', {thread = other.id, session_id = session('Outsider'), key = 'm5'}) end, 'Unknown thread')
 end)
 
 test('members in the UI form uses the same handler', function()
+  local alice, bob = agent('alice'), agent('bob')
   local g = the_group()
-  local op = form(g.id, 'members'):action('thread_members', 'submit', {values = {member_alice = true, member_bob = true}})
+  local op = form(g.id, 'members'):action('thread_members', 'submit', {values = {['member_' .. alice.id] = true, ['member_' .. bob.id] = true}})
   expect(op.status).to_be('succeeded')
   local members = {}
   for _, r in ipairs(sql('SELECT agent FROM group_members WHERE gid = ? AND current = 1 ORDER BY pos', {g.id})) do members[#members + 1] = r.agent end
-  expect(members).to_equal({'alice', 'bob', 'user'})
+  expect(members).to_equal({alice.id, bob.id, 'user'})
 end)
 
 test('move as a tool sets the thread home; the UI form does the same', function()

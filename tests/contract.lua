@@ -38,7 +38,7 @@ test('the agent face refuses an action that the plugin does not export', functio
 end)
 
 test('a forwarded call is the same as a direct call of the same agent', function()
-  alice:call('messaging.send', {to = 'bob', body = 'forward check', key = 'forward-check'})
+  alice:call('messaging.send', {to = agent('bob').id, body = 'forward check', key = 'forward-check'})
   local direct = alice:direct('messaging.thread_list', {})
   local forwarded = alice:call('messaging.thread_list', {})
   expect(forwarded).to_equal(direct)

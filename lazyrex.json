@@ -4,20 +4,6 @@
  "sdk": "0",
  "notice": "New message. Call messaging_read.",
  "test": {
-  "agents": [
-   {
-    "id": "alice",
-    "name": "Alice"
-   },
-   {
-    "id": "bob",
-    "name": "Bob"
-   },
-   {
-    "id": "charlie",
-    "name": "Charlie"
-   }
-  ],
   "files": {
    "concat.lua": {
     "args": {

@@ -22,9 +22,9 @@ test('the group list reads every group when the groups are larger than one reply
   -- come first; alice's group comes last.
   write_sql([[INSERT INTO groups (gid, name) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 60)
     SELECT 'g-others-' || i, ? FROM n]], {string.rep('o', 20000)})
-  write_sql([[INSERT INTO group_members (gid, agent, pos, current) SELECT gid, 'bob', 1, 1 FROM groups WHERE gid LIKE 'g-others-%']])
+  write_sql([[INSERT INTO group_members (gid, agent, pos, current) SELECT gid, ?, 1, 1 FROM groups WHERE gid LIKE 'g-others-%']], {bob.id})
   write_sql("INSERT INTO groups (gid, name) VALUES ('g-zz-alice', 'Alice group')")
-  write_sql([[INSERT INTO group_members (gid, agent, pos, current) VALUES ('g-zz-alice', 'alice', 1, 1), ('g-zz-alice', 'bob', 2, 1)]])
+  write_sql([[INSERT INTO group_members (gid, agent, pos, current) VALUES ('g-zz-alice', ?, 1, 1), ('g-zz-alice', ?, 2, 1)]], {alice.id, bob.id})
   local found = false
   for _, t in ipairs(alice:call('messaging.thread_list', {}).threads) do found = found or t.id == 'g-zz-alice' end
   expect(found, 'the last group is listed').to_be(true)
@@ -35,11 +35,11 @@ test('history continues after a partial result of large messages', function()
   -- 24 bodies of 16000 bytes (inside the send limit): 384 KB of rows, over one hub.sql reply.
   for i = 1, 24 do
     write_sql([[INSERT INTO messages (seq, id, sender, recipient, thread_a, thread_b, body, at)
-      VALUES (?, ?, 'bob', 'alice', 'alice', 'bob', ?, '2026-10-22T00:00:00Z')]],
-      {base + i, 'paging/large/' .. i, string.rep('b', 16000)})
+      VALUES (?, ?, ?, ?, ?, ?, ?, '2026-10-22T00:00:00Z')]],
+      {base + i, 'paging/large/' .. i, bob.id, alice.id, alice.id, bob.id, string.rep('b', 16000)})
   end
   write_sql('UPDATE clock SET n = ?', {base + 24})
-  local page = bob:call('messaging.history', {thread = 'alice', limit = 50})
+  local page = bob:call('messaging.history', {thread = alice.id, limit = 50})
   expect(#page.messages > 0 and #page.messages < 24, 'the page stops before all rows').to_be(true)
   expect(page.next_before ~= nil, 'the page reports older messages').to_be(true)
   -- Every message arrives in full, across pages.
@@ -52,7 +52,7 @@ test('history continues after a partial result of large messages', function()
       end
     end
     if not page.next_before then break end
-    page = bob:call('messaging.history', {thread = 'alice', limit = 50, before = page.next_before})
+    page = bob:call('messaging.history', {thread = alice.id, limit = 50, before = page.next_before})
   end
   expect(seen).to_be(24)
 end)

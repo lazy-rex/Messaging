@@ -9,7 +9,7 @@ local function ids(list)
   return out
 end
 
-local a, b = agent('first', {join = false}), agent('second', {join = false})
+local a, b = agent('first', {report = false}), agent('second', {report = false})
 a:report({kind = 'codex', conversation_id = 'native-a'})
 b:report({kind = 'claude', conversation_id = 'native-b'})
 local a_id, b_id = 'codex:native-a', 'claude:native-b'

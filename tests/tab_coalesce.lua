@@ -20,7 +20,7 @@ if missing then
   return
 end
 
-local u = agent('burst', {join = false})
+local u = agent('burst', {report = false})
 
 test('a burst of agent changes gives one or two tab declarations', function()
   local _, base = H.calls('none')
@@ -45,5 +45,5 @@ test('the coalesced declaration has the tab of a new thread', function()
   end)
   local keys = {}
   for _, t in ipairs(tabs[#tabs].args.tabs) do keys[t.key] = true end
-  expect(keys['thread/alice'], 'the declared tabs have thread/alice').to_be(true)
+  expect(keys['thread/' .. alice.id], 'the declared tabs have thread/alice').to_be(true)
 end)

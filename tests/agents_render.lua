@@ -21,7 +21,7 @@ local function causes(v)
 end
 
 test('a new agent appears in an open New thread form without a commit', function()
-  local reporter = agent('reporter', {join = false})
+  local reporter = agent('reporter', {report = false})
   user:command('new_thread')
   local f = user:view('/forms/new-thread')
   f:render()

@@ -1,7 +1,7 @@
 -- Parity fixture (LazyRex docs/testing.md, "Agent parity"): renders the forms that open only
 -- from a thread view, so the parity sweep checks them.
 local alice = agent('alice')
-local g = alice:call('messaging.thread_create', {key = 'parity-fixture', title = 'Parity', members = {'user', 'bob'}})
+local g = alice:call('messaging.thread_create', {key = 'parity-fixture', title = 'Parity', members = {'user', agent('bob').id}})
 local thread = user:open('thread/' .. g.id)
 thread:render()
 

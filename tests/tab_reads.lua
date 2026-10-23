@@ -63,12 +63,10 @@ end
 
 -- groups adds groups g-reads-<from>..g-reads-<to>, each with alice and the user.
 local function groups(from, to)
-  for _, q in ipairs({
-    [[INSERT INTO groups (gid, name) WITH RECURSIVE n(i) AS (SELECT ? UNION ALL SELECT i + 1 FROM n WHERE i < ?)
-      SELECT 'g-reads-' || i, 'Reads ' || i FROM n]],
-    [[INSERT INTO group_members (gid, agent, pos, current) WITH RECURSIVE n(i) AS (SELECT ? UNION ALL SELECT i + 1 FROM n WHERE i < ?)
-      SELECT 'g-reads-' || i, a.agent, a.pos, 1 FROM n, (SELECT 'alice' AS agent, 1 AS pos UNION ALL SELECT 'user', 2) a]],
-  }) do sql_write(q, {from, to}) end
+  sql_write([[INSERT INTO groups (gid, name) WITH RECURSIVE n(i) AS (SELECT ? UNION ALL SELECT i + 1 FROM n WHERE i < ?)
+      SELECT 'g-reads-' || i, 'Reads ' || i FROM n]], {from, to})
+  sql_write([[INSERT INTO group_members (gid, agent, pos, current) WITH RECURSIVE n(i) AS (SELECT ? UNION ALL SELECT i + 1 FROM n WHERE i < ?)
+      SELECT 'g-reads-' || i, a.agent, a.pos, 1 FROM n, (SELECT ? AS agent, 1 AS pos UNION ALL SELECT 'user', 2) a]], {from, to, alice.id})
 end
 
 test('a send declares the tabs with a number of statements that does not grow with the peers', function()

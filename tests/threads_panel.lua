@@ -59,8 +59,8 @@ local function walk(id, from_view, action, input)
 end
 
 test('the panel stays under the limit at three times the live thread count', function()
-  groups('g-u', 600, {'user', 'alice'})
-  groups('g-a', 220, {'alice', 'bob'})
+  groups('g-u', 600, {'user', alice.id})
+  groups('g-a', 220, {alice.id, bob.id})
   write_sql([[WITH RECURSIVE n(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM n WHERE value < 60)
     INSERT INTO thread_archived (viewer, peer) SELECT 'user', 'g-u' || printf('%0167d', value) FROM n]])
   local tree = panel():render()
@@ -104,7 +104,7 @@ test('a thread on a later page opens; New thread opens its form', function()
   op = panel():action('new_thread', 'new', {})
   expect(op.result).to_equal({form = '/forms/new-thread'})
   -- The panel has no form: a submit to it is an unknown action.
-  op = panel():action('new_thread', 'submit', {values = {member_alice = true}})
+  op = panel():action('new_thread', 'submit', {values = {['member_' .. alice.id] = true}})
   expect(op.status).to_be('failed')
 end)
 
@@ -113,7 +113,7 @@ test('a thread whose ID alone is over a page shows as a row without an action', 
   -- The fixture builds the ID in SQL: one request carries at most 64 KiB.
   local gid = "'g-x' || printf('%049997d', 0)"
   write_sql('INSERT INTO groups (gid, name) VALUES (' .. gid .. ", 'Long ID')")
-  write_sql('INSERT INTO group_members (gid, agent, pos, current) VALUES (' .. gid .. ", 'user', 1, 1), (" .. gid .. ", 'alice', 2, 1)")
+  write_sql('INSERT INTO group_members (gid, agent, pos, current) VALUES (' .. gid .. ", 'user', 1, 1), (" .. gid .. ", ?, 2, 1)", {alice.id})
   local tree = panel():render()
   expect(size(tree) < limit, 'the panel is ' .. size(tree) .. ' bytes').to_be(true)
   local items = H.node(tree, 'threads').items
