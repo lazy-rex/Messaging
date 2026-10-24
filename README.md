@@ -52,7 +52,7 @@ peer in the hub config. Only direct messages cross hubs: a group has no remote m
   writes its envelope to `peer_outbox`: JSON `{v = 1, id, from, to, body, at, reply_to?, reply_expected?}`.
   After the commit, Messaging gives each envelope to `hub.peer.send` with the message ID as the key,
   in message order. A failed call leaves the envelope for the next try (at the start, and every 30 s).
-  A final refusal (`operation_conflict`, `too_large`, `unknown_hub`, `not_plugin`) drops it with a log line.
+  A final refusal (`operation_conflict`, `too_large`, `unknown_hub`, `not_plugin`, and `refused` for a bad key or body) drops it with a log line.
 - Receive: the hub calls `peer.receive` `{from_hub, key, body}`. Messaging stores the message as
   `peer/<len:hub><len:id>`, from `<from>@<from_hub>`, with one delivery to the local agent. A
   repeat of an envelope changes nothing. Messaging refuses (for good) a bad envelope, a group or

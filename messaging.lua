@@ -661,7 +661,7 @@ end
 
 -- A final refusal of hub.peer.send: the envelope can never go, so it leaves the outbox. Any other
 -- error (the hub is busy or gone) keeps it for the next try.
-local peer_final = {operation_conflict = true, too_large = true, unknown_hub = true, not_plugin = true, invalid_input = true}
+local peer_final = {operation_conflict = true, too_large = true, unknown_hub = true, not_plugin = true, refused = true}
 
 -- send_outbox gives each queued envelope to hub.peer.send, in message order, after the commit
 -- that queued it. It runs after a send, at the start and on a timer. It stops at the first
