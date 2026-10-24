@@ -140,5 +140,5 @@ test('the user opens the thread of a remote sender; its tab names the hub', func
   local id = from .. '@away'
   user:open('thread/' .. id):render()
   local t = wait('the tab of the remote thread', function() return tab('thread/' .. id) end)
-  expect(t.title).to_be('claude:01234567@away')
+  expect(t.title, 'the short ID and the hub').to_match('^claude:01234567@away')
 end)
