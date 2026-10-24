@@ -5,7 +5,7 @@ local app = require('lazyrex').plugin('messaging')
 local fail = app.fail
 local db = app.db
 
--- Hub calls (roster, tabs, sessions). A hub error keeps its code; only an unknown outcome is
+-- Hub calls (agents, tabs, sessions). A hub error keeps its code; only an unknown outcome is
 -- 'unavailable' (the SDK).
 local hub = app.hub
 
@@ -86,11 +86,10 @@ end
 -- A thread is a pair (thread_a, thread_b): a direct thread is the sorted pair of its agents; a
 -- group thread is ('', group ID). A peer is what a viewer sees in its thread list: an agent ID, a
 -- group ID, or the observed ID d-<hex> of an agent-to-agent thread (the user only).
--- The schema starts at version 2 (base = 2): steps 1 and 2 are collapsed into one base step. A
--- database at version 1 with tables is refused by the SDK; run Messaging b7f07bf once first (it
--- takes the database to 2), or start from an empty database (user decision 2026-10-23: data loss
--- is acceptable).
-db.migrate {base = 2, function()
+-- The schema starts at version 4 (base = 4): steps 1 to 4 are collapsed into one base step. The
+-- SDK refuses a database below version 4 that has tables; start it from an empty database (user
+-- decision 2026-10-23: data loss is acceptable). The live store was at version 4 at the collapse.
+db.migrate {base = 4, function()
   for _, sql in ipairs({
     'CREATE TABLE clock (one INTEGER PRIMARY KEY CHECK (one = 1), n INTEGER NOT NULL)',
     'INSERT INTO clock (one, n) VALUES (1, 0)',
@@ -104,7 +103,7 @@ db.migrate {base = 2, function()
     [[CREATE TABLE deliveries (agent TEXT NOT NULL, seq INTEGER NOT NULL REFERENCES messages (seq),
       acked INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (agent, seq)) WITHOUT ROWID]],
     'CREATE INDEX deliveries_unread ON deliveries (agent, seq) WHERE acked = 0',
-    -- Created groups. The team has no rows: its members are the live roster. pos keeps the member
+    -- Created groups. The team has no rows: its members are the hub's agents. pos keeps the member
     -- order; current = 0 is a past member.
     'CREATE TABLE groups (gid TEXT PRIMARY KEY, name TEXT NOT NULL)',
     [[CREATE TABLE group_members (gid TEXT NOT NULL REFERENCES groups (gid), agent TEXT NOT NULL,
@@ -122,18 +121,13 @@ db.migrate {base = 2, function()
     -- Saved operations: an agent key replays forever (store = false in the SDK). owner is the
     -- agent part of the key.
     'CREATE TABLE operations (key TEXT PRIMARY KEY, owner TEXT NOT NULL, fingerprint TEXT NOT NULL, result TEXT NOT NULL)',
-    'CREATE TABLE aliases_applied (alias TEXT PRIMARY KEY, identity TEXT NOT NULL)',
     'CREATE TABLE gallery (key TEXT PRIMARY KEY, value TEXT NOT NULL, rev INTEGER NOT NULL)',
+    -- Spawn addresses that ended unbound (rebind_spawns).
+    'CREATE TABLE spawns_ended (id TEXT PRIMARY KEY) WITHOUT ROWID',
+    -- Envelopes for peer hubs that hub.peer.send has not taken yet (send_outbox). seq is the
+    -- message's seq, so the outbox sends in message order.
+    'CREATE TABLE peer_outbox (seq INTEGER PRIMARY KEY, id TEXT NOT NULL, hub TEXT NOT NULL, envelope TEXT NOT NULL)',
   }) do db.exec(sql) end
-end, function()
-  -- Step 3: the hub binds spawns, not aliases (hub identity (d)). spawns_ended holds the spawn
-  -- addresses that ended unbound (rebind_spawns).
-  db.exec('DROP TABLE aliases_applied')
-  db.exec('CREATE TABLE spawns_ended (id TEXT PRIMARY KEY) WITHOUT ROWID')
-end, function()
-  -- Step 4: envelopes for peer hubs that hub.peer.send has not taken yet (send_outbox). seq is the
-  -- message's seq, so the outbox sends in message order.
-  db.exec('CREATE TABLE peer_outbox (seq INTEGER PRIMARY KEY, id TEXT NOT NULL, hub TEXT NOT NULL, envelope TEXT NOT NULL)')
 end}
 
 -- rows returns every row of a query. One hub.sql reply holds about 1 MB of rows; db.each reads
@@ -447,12 +441,13 @@ local function utf8_cut(s, n)
 end
 
 -- Groups: a group is a recipient with members. A message to a group gets a delivery for every
--- other member and goes into the group's thread. The built-in group "team" has the whole roster
+-- other member and goes into the group's thread. The built-in group "team" has all the hub's agents
 -- as members. The user and agents create other groups; their IDs start with "g-", so they never
 -- equal an agent ID.
 local builtin = {team = {name = 'Team'}}
 
-local function roster()
+-- team_members returns the IDs of the hub's agents that are not superseded: the members of "team".
+local function team_members()
   local ids = {}
   for _, a in ipairs(participants) do if a.state ~= 'superseded' then ids[#ids + 1] = a.id end end
   return ids
@@ -476,7 +471,7 @@ end
 
 -- group returns {name, members, past_members} for a group ID, or nil.
 local function group(id)
-  if builtin[id] then return {name = builtin[id].name, members = roster()} end
+  if builtin[id] then return {name = builtin[id].name, members = team_members()} end
   if not is_group_id(id) then return nil end
   local g = db.first('SELECT name FROM groups WHERE gid = ?', id)
   if not g then return nil end
@@ -892,7 +887,7 @@ local function last_message(a, b, s)
   return r and r.id or nil
 end
 
--- Only explicit user opens create a marker. Roster membership does not create a tab.
+-- Only explicit user opens create a marker. A known agent gets no tab of its own.
 local function opened_thread(user, peer, s)
   peer = canonical_thread_id(peer)
   if s then return s.opened[peer] == true end
@@ -1983,7 +1978,7 @@ local actions = {
     description = 'List your direct and group threads with unread counts. Set include_archived=true to include archived threads.',
     args = {type = 'object', properties = {include_archived = {type = 'boolean'}}, additionalProperties = false}},
   {name = 'messaging.thread_create', fn = thread_create, declares = true, title = 'Create a thread',
-    description = 'Create a thread with yourself and selected roster members. The home defaults to your current session. Set session_id for an open session or new_session for a new name. An existing direct thread keeps its home. The key is at most 200 bytes. Retry with the same key and content.',
+    description = 'Create a thread with yourself and selected agents. The home defaults to your current session. Set session_id for an open session or new_session for a new name. An existing direct thread keeps its home. The key is at most 200 bytes. Retry with the same key and content.',
     args = {type = 'object', properties = {members = {type = 'array', items = {type = 'string', minLength = 1}}, title = {type = 'string'}, session_id = {type = 'string', minLength = 1}, new_session = {type = 'string', minLength = 1}, key = {type = 'string', minLength = 1}},
       required = {'members', 'key'}, additionalProperties = false}},
   {name = 'messaging.history', fn = history, title = 'Read thread history',

@@ -29,7 +29,7 @@ end
 
 local alice, bob, charlie = agent('alice'), agent('bob'), agent('charlie')
 
-test('roster agents get no empty direct tab; member groups keep theirs', function()
+test('known agents get no empty direct tab; member groups keep theirs', function()
   for _, k in ipairs({'thread/' .. alice.id, 'thread/' .. bob.id, 'thread/' .. charlie.id}) do expect(has_tab(k), k).to_be(false) end
   expect(has_tab('thread/team')).to_be(true)
 end)

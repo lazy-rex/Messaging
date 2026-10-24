@@ -12,7 +12,7 @@ local function has_id(list, id) return find(list, id) ~= nil end
 local bob_home = session('Bob home')
 local alice = agent('alice', {title = 'alice tab'})
 local bob = agent('bob', {title = 'bob tab', session = bob_home})
--- An identity with no roster name: the hub names it after its tab label.
+-- An identity with no name of its own: the hub names it after its tab label.
 local nameless = agent('nameless', {report = false, title = 'nameless tab'})
 local nameless_id = 'codex:conversation-b'
 nameless:report({kind = 'codex', conversation_id = 'conversation-b'})

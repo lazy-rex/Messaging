@@ -1,5 +1,5 @@
--- The schema: one base step at version 2 (db.migrate {base = 2}) and steps 3 and 4. A new database gets
--- the current tables only: no tables of the removed key-value import, no meta and no
+-- The schema: one base step at version 4 (db.migrate {base = 4}). A new database gets the current
+-- tables only: no tables of the removed key-value import, no meta and no
 -- aliases_applied. The hub and SQLite can add their own tables, so the test checks the plugin's
 -- names only.
 

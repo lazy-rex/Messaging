@@ -20,15 +20,15 @@ Plugin args (hub config `plugins[].args`):
 
 ## Storage
 
-Each action and each view action is one SQL transaction (`app.db`). The schema is one base step at version 2
-(`db.migrate {base = 2, ...}` in `messaging.lua`) and step 3, which drops the old `aliases_applied` table and adds `spawns_ended`. Step 4 adds `peer_outbox`. The SDK refuses a database at version 1 that has
-tables: run Messaging b7f07bf on it once first, or start from an empty database. The main tables:
+Each action and each view action is one SQL transaction (`app.db`). The schema is one base step at version 4
+(`db.migrate {base = 4, ...}` in `messaging.lua`). The SDK refuses a database below version 4 that
+has tables: start it from an empty database. The main tables:
 
 - `messages`: one row for each message, with its thread (`thread_a`, `thread_b`). A direct thread is
   the sorted pair of its agents; a group thread is (`''`, group ID). `seq` comes from `clock`, and
   it is the message cursor.
 - `deliveries`: one row for each recipient of a message, fixed at send. `acked = 0` is unread.
-- `groups` and `group_members`: created groups. The team has no rows: its members are the roster.
+- `groups` and `group_members`: created groups. The team has no rows: its members are the hub's agents.
 - `thread_homes`, `thread_titles`, `thread_opened`, `thread_archived`, `drafts`: thread state for
   each viewer.
 - `operations`: saved results of keyed operations. An agent key replays forever.

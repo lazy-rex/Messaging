@@ -27,7 +27,7 @@ test('a new agent appears in an open New thread form without a commit', function
   f:render()
   expect(has_text(f:get(), 'render-new'), 'not there before').to_be(false)
   local before = causes(f)
-  -- An identity report adds an agent (claude:render-new) to the roster: hub.changed agents.
+  -- An identity report adds an agent (claude:render-new) to the hub's agents: hub.changed agents.
   reporter:report({kind = 'claude', conversation_id = 'render-new'})
   -- No explicit render: the renderer's snapshot changes by itself.
   wait('the new participant in the open form', function() return has_text(f:get(), 'render-new') end, 20)
