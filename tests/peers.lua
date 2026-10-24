@@ -211,3 +211,12 @@ end)
 test('a mirror cannot change its members here', function()
   expect_error(function() gina:call('messaging.thread_members', {thread = 'g-away1@away', members = {hal.id}, key = 'xg-members'}) end, 'home hub')
 end)
+
+test('a direct thread with a remote agent grows into a group with the remote member', function()
+  local r = alice:call('messaging.thread_members', {thread = 'bob@away', members = {'bob@away', hal.id}, key = 'xg-grow'})
+  expect(r.group).to_be(true)
+  local want = {alice.id, hal.id, 'bob@away'}
+  table.sort(want)
+  table.sort(r.members)
+  expect(r.members).to_equal(want)
+end)

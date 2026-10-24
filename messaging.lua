@@ -1182,7 +1182,7 @@ local function change_members(user, peer, input, operation_key, context)
   if peer.observer then fail('refused', 'Send a message to join this group before changing its members') end
   if type(operation_key) ~= 'string' or operation_key == '' then fail('invalid_input', 'An operation key is required') end
   if builtin[peer.id] then fail('refused', 'The team group has dynamic membership') end
-  if fed.split(peer.id) then fail('refused', 'Change the members of this group on its home hub') end
+  if peer.group and fed.split(peer.id) then fail('refused', 'Change the members of this group on its home hub') end
   local members = selected_members(user, input)
   if not peer.group then
     -- A direct thread stays intact. An expanded selection creates a separate group.
