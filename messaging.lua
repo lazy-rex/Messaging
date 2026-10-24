@@ -51,8 +51,24 @@ local function canonical_thread_id(id)
   return pair and observed_direct_id(pair[1], pair[2]) or id
 end
 
+-- remote: the agents of the peer hubs, from hub.peer.status peers[].agents (the hub's cache, up
+-- to 30 s old; null before its first read). list: current agents as {id = <id>@<hub>, name};
+-- names: the label of each listed ID, also of an agent that ended.
+local remote = {list = {}, names = {}}
 local function refresh_participants()
   participants = hub('hub.agents', {all = true}).agents or {}
+  local list, names = {}, {}
+  local ok, st = pcall(hub, 'hub.peer.status', {})
+  for _, p in ipairs(ok and type(st) == 'table' and st.peers or {}) do
+    local agents = type(p.agents) == 'table' and p.agents.list or {}
+    for _, a in ipairs(agents) do
+      local id = a.id .. '@' .. p.name
+      names[id] = a.name
+      if a.joined ~= false and a.state ~= 'superseded' then list[#list + 1] = {id = id, name = a.name} end
+    end
+  end
+  table.sort(list, function(x, y) return x.id < y.id end)
+  remote.list, remote.names = list, names
 end
 
 -- Remote agents (federation v1, hub docs/hub.md "Peer hubs"; the SDK's app.peer, docs/plugin-sdk.md
@@ -857,9 +873,9 @@ local page_size = 200
 
 local function display_name(a)
   if type(a.name) == 'string' and a.name ~= a.id and a.name:match('%S') then return a.name end
-  -- A remote agent keeps its hub: "<short ID>@<hub>".
-  local remote, at = fed.split(a.id)
-  if at then return display_name({id = remote}) .. '@' .. at end
+  -- A remote agent keeps its hub: "<label>@<hub>", or "<short ID>@<hub>" without a label.
+  local rid, at = fed.split(a.id)
+  if at then return display_name({id = rid, name = remote.names[a.id]}) .. '@' .. at end
   local kind, suffix = a.id:match('^([^:]+):(.+)$')
   if kind == 'claude' or kind == 'codex' then return kind .. ':' .. suffix:sub(1, 8) end
   return a.id
@@ -1617,6 +1633,13 @@ local function participant_fields(user, session, selected)
       local field = {id = 'member_' .. a.id, label = display_name(a), kind = 'boolean', value = selected[a.id] == true}
       if a.session_id ~= session and not selected[a.id] then field.visible_when = {field = 'other_sessions', value = true} end
       fields[#fields + 1] = field
+    end
+  end
+  -- The agents of the peer hubs: in no local session, so they show without the toggle.
+  for _, a in ipairs(remote.list) do
+    if not seen[a.id] then
+      seen[a.id] = true
+      fields[#fields + 1] = {id = 'member_' .. a.id, label = display_name({id = a.id}), kind = 'boolean', value = selected[a.id] == true}
     end
   end
   for id in pairs(selected) do
