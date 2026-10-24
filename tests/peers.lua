@@ -1,7 +1,8 @@
 -- Peer hubs (federation v1, hub docs/hub.md "Peer hubs") on one lab hub. The manifest sets
 -- test.hub_name "lab" and one peer "away" that cannot be reached: hub.peer.send queues there.
--- H.peer_deliver gives an envelope to Messaging through the hub's real delivery path. One
--- sequence: each test uses the state of the tests before it.
+-- H.peer_deliver gives an envelope to Messaging through the hub's real delivery path. The SDK
+-- (app.peer) keeps the outbox and sends after the reply, so a test waits for the hub to take an
+-- envelope. One sequence: each test uses the state of the tests before it.
 
 local alice = agent('alice')
 
@@ -23,6 +24,10 @@ local function queued()
   return out
 end
 local function count(sql_text, params) return #sql(sql_text, params) end
+-- taken waits until the hub holds n envelopes for "away".
+local function taken(n)
+  wait('the hub takes ' .. n .. ' envelopes', function() return H.peer_status().peers[1].outbox == n end)
+end
 
 local first, first_args
 test('a send to <id>@away stores the message with no delivery and queues one envelope', function()
@@ -30,8 +35,8 @@ test('a send to <id>@away stores the message with no delivery and queues one env
   first = alice:call('messaging.send', first_args)
   expect(sql('SELECT recipient FROM messages WHERE id = ?', {first.id})[1].recipient).to_be('bob@away')
   expect(count('SELECT 1 AS x FROM deliveries d JOIN messages m ON m.seq = d.seq WHERE m.id = ?', {first.id}), 'no local delivery').to_be(0)
-  expect(count('SELECT 1 AS x FROM peer_outbox'), 'the hub took the envelope').to_be(0)
-  expect(H.peer_status().peers[1].outbox).to_be(1)
+  taken(1)
+  expect(count("SELECT 1 AS x FROM sdk_peer_outbox WHERE state = 'sent'"), 'the SDK row is sent').to_be(1)
   local e = queued()[1]
   expect({e.v, e.id, e.from, e.to, e.body}).to_equal({1, first.id, alice.id, 'bob', 'hello, bob'})
 end)
@@ -60,6 +65,7 @@ end)
 
 test('a reply to a peer message names the origin ID in its envelope', function()
   local r = alice:call('messaging.send', {to = 'bob@away', body = 'got it', key = 'peer-reply', reply_to = got_id})
+  taken(2)
   local e = queued()
   expect(#e).to_be(2)
   expect(e[2].id).to_be(r.id)
@@ -106,22 +112,4 @@ test('a failed commit is not processed, and the next delivery stores the message
   expect(count("SELECT 1 AS x FROM messages WHERE body = 'after a failure'"), 'rolled back').to_be(0)
   expect(deliver(envelope({id = 'm8', body = 'after a failure'}))).to_equal({})
   expect(count("SELECT 1 AS x FROM messages WHERE body = 'after a failure'")).to_be(1)
-end)
-
-test('a key conflict on hub.peer.send is final: the envelope leaves the outbox and the next one goes', function()
-  -- The first send's key with another body: hub.peer.send answers operation_conflict (lead-b3).
-  sql_write('INSERT INTO peer_outbox (seq, id, hub, envelope) VALUES (?, ?, ?, ?)', {0, first.id, 'away', '{"v":1,"changed":true}'})
-  local before = H.peer_status().peers[1].outbox
-  alice:call('messaging.send', {to = 'bob@away', body = 'after the conflict', key = 'peer-after-conflict'})
-  expect(count('SELECT 1 AS x FROM peer_outbox'), 'the conflict does not block the outbox').to_be(0)
-  expect(H.peer_status().peers[1].outbox, 'the next envelope went').to_be(before + 1)
-end)
-
-test('a key that hub.peer.send refuses as invalid is final: it leaves the outbox and the next one goes', function()
-  -- A key over 512 bytes: the hub answers code refused ("invalid: key must be 1-512 bytes").
-  sql_write('INSERT INTO peer_outbox (seq, id, hub, envelope) VALUES (?, ?, ?, ?)', {1, string.rep('k', 600), 'away', '{"v":1}'})
-  local before = H.peer_status().peers[1].outbox
-  alice:call('messaging.send', {to = 'bob@away', body = 'after the invalid key', key = 'peer-after-invalid'})
-  expect(count('SELECT 1 AS x FROM peer_outbox'), 'the invalid key does not block the outbox').to_be(0)
-  expect(H.peer_status().peers[1].outbox, 'the next envelope went').to_be(before + 1)
 end)

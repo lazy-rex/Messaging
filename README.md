@@ -21,7 +21,7 @@ Plugin args (hub config `plugins[].args`):
 ## Storage
 
 Each action and each view action is one SQL transaction (`app.db`). The schema is one base step at version 4
-(`db.migrate {base = 4, ...}` in `messaging.lua`). The SDK refuses a database below version 4 that
+and step 5 (`db.migrate {base = 4, ...}` in `messaging.lua`). Step 5 drops the old `peer_outbox`. The SDK refuses a database below version 4 that
 has tables: start it from an empty database. The main tables:
 
 - `messages`: one row for each message, with its thread (`thread_a`, `thread_b`). A direct thread is
@@ -36,7 +36,7 @@ has tables: start it from an empty database. The main tables:
   (`hub.agents.resolve`). At each agents change and at its start, Messaging moves the rows of a
   bound spawn to its identity. A spawn that ended unbound (`not_delivered`) loses its waiting
   deliveries and goes to `spawns_ended`; its other rows stay as history.
-- `peer_outbox`: envelopes for peer hubs that `hub.peer.send` has not taken yet (see "Peer hubs").
+- `sdk_peer_outbox` and `sdk_peer_seen`: the SDK's federation tables (see "Peer hubs").
 
 A send writes one message row and one delivery row for each recipient. No request depends on the
 size of a mailbox, a thread or a group. The hub admits one notice for each agent in a commit.
@@ -48,15 +48,18 @@ New mail gives a pending notice with `once`: the hub nudges the agent one time u
 Federation v1 (hub `docs/hub.md`, "Peer hubs"). An agent sends to `<id>@<hub>`, where `<hub>` is a
 peer in the hub config. Only direct messages cross hubs: a group has no remote members.
 
+- Federation uses the SDK's `app.peer` (hub `docs/plugin-sdk.md`, "Federation"). The SDK keeps
+  the outbox, the retries, the order per peer and the receive dedupe.
 - Send: the message is stored here with the remote recipient and no delivery. The same commit
-  writes its envelope to `peer_outbox`: JSON `{v = 1, id, from, to, body, at, reply_to?, reply_expected?}`.
-  After the commit, Messaging gives each envelope to `hub.peer.send` with the message ID as the key,
-  in message order. A failed call leaves the envelope for the next try (at the start, and every 30 s).
-  A final refusal (`operation_conflict`, `too_large`, `unknown_hub`, `not_plugin`, and `refused` for a bad key or body) drops it with a log line.
-- Receive: the hub calls `peer.receive` `{from_hub, key, body}`. Messaging stores the message as
-  `peer/<len:hub><len:id>`, from `<from>@<from_hub>`, with one delivery to the local agent. A
-  repeat of an envelope changes nothing. Messaging refuses (for good) a bad envelope, a group or
-  unknown recipient, and a message too large for one read page. Any other error is retried by the hub.
+  stages its envelope with `peer.send`, with the message ID as the key: JSON
+  `{v = 1, id, from, to, body, at, reply_to?, reply_expected?}`. After the reply, the SDK gives it
+  to `hub.peer.send`, in send order per peer. A send whose envelope the hub would refuse as too
+  large fails at the call (`too_large`). The body limit of 16384 bytes keeps an envelope far below
+  that. A final refusal of the hub marks the SDK row failed with a log line.
+- Receive: the SDK gives Messaging each envelope `{from_hub, key, body}` once. Messaging stores the
+  message as `peer/<len:hub><len:id>`, from `<from>@<from_hub>`, with one delivery to the local
+  agent. Messaging refuses (for good) a bad envelope, a group or unknown recipient, and a message
+  too large for one read page. Any other error is retried by the hub.
 - Reply: a reply to a peer message names the message ID of its origin hub in `reply_to`.
 - Read state stays on each hub. The sender gets no bounce in v1.
 
