@@ -24,9 +24,12 @@ local function queued()
   return out
 end
 local function count(sql_text, params) return #sql(sql_text, params) end
--- taken waits until the hub holds n envelopes for "away".
+-- taken waits until the hub holds n envelopes for "away" and the SDK marks n rows sent (a later
+-- transaction than the hub's insert).
 local function taken(n)
-  wait('the hub takes ' .. n .. ' envelopes', function() return H.peer_status().peers[1].outbox == n end)
+  wait('the hub takes ' .. n .. ' envelopes', function()
+    return H.peer_status().peers[1].outbox == n and count("SELECT 1 AS x FROM sdk_peer_outbox WHERE state = 'sent'") == n
+  end)
 end
 
 local first, first_args
@@ -36,7 +39,6 @@ test('a send to <id>@away stores the message with no delivery and queues one env
   expect(sql('SELECT recipient FROM messages WHERE id = ?', {first.id})[1].recipient).to_be('bob@away')
   expect(count('SELECT 1 AS x FROM deliveries d JOIN messages m ON m.seq = d.seq WHERE m.id = ?', {first.id}), 'no local delivery').to_be(0)
   taken(1)
-  expect(count("SELECT 1 AS x FROM sdk_peer_outbox WHERE state = 'sent'"), 'the SDK row is sent').to_be(1)
   local e = queued()[1]
   expect({e.v, e.id, e.from, e.to, e.body}).to_equal({1, first.id, alice.id, 'bob', 'hello, bob'})
 end)
@@ -58,6 +60,14 @@ test('an envelope from away reaches the local agent as <from>@away', function()
 end)
 
 test('a repeat of the envelope changes nothing', function()
+  expect(deliver(envelope())).to_equal({})
+  expect(count('SELECT 1 AS x FROM messages WHERE id = ?', {got_id})).to_be(1)
+  expect(#alice:call('messaging.read', {}).messages).to_be(1)
+end)
+
+test('without the SDK dedupe row, the message ID still makes a repeat a no-op', function()
+  -- The SDK deletes its dedupe rows after 30 days; the hub can still give the envelope again.
+  sql_write("DELETE FROM sdk_peer_seen WHERE from_hub = 'away' AND key = 'm1'")
   expect(deliver(envelope())).to_equal({})
   expect(count('SELECT 1 AS x FROM messages WHERE id = ?', {got_id})).to_be(1)
   expect(#alice:call('messaging.read', {}).messages).to_be(1)
