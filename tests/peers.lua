@@ -220,3 +220,46 @@ test('a direct thread with a remote agent grows into a group with the remote mem
   table.sort(r.members)
   expect(r.members).to_equal(want)
 end)
+
+-- The user's composer (view send) takes the same routes as messaging.send.
+local function ui_send(thread, text, key)
+  local v = user:open('thread/' .. thread)
+  local saved = v:draft('composer', text, H.node(v:render(), 'composer').draft_revision or '0', key .. '-draft')
+  expect(saved.status, 'draft ' .. key).to_be('succeeded')
+  return v:send('composer', text, saved.result.draft_revision, key)
+end
+
+test('the user answers a remote agent from its thread: one envelope to away', function()
+  local before = #queued()
+  expect(ui_send('claude:0123456789abcdef@away', 'the user answers', 'ui-direct').status).to_be('succeeded')
+  wait('one envelope to away', function() return #queued() == before + 1 end)
+  local e = last_queued()
+  expect({e.from, e.to, e.body}).to_equal({'user', 'claude:0123456789abcdef', 'the user answers'})
+end)
+
+test('the user joins and sends to a group of this hub: local members here, one envelope to away', function()
+  local before = #queued()
+  expect(ui_send(home_gid, 'the user in the group', 'ui-home').status).to_be('succeeded')
+  wait('one envelope to away', function() return #queued() == before + 1 end)
+  local e = last_queued()
+  expect({e.from, e.to}).to_equal({'user', home_gid})
+  local has_user = false
+  for _, id in ipairs(e.group.members) do if id == 'user' then has_user = true end end
+  expect(has_user, 'the user joined at home').to_be(true)
+  expect(count("SELECT 1 AS x FROM deliveries WHERE agent LIKE '%@%'"), 'no local delivery for a remote member').to_be(0)
+  local got = hal:call('messaging.read', {thread = home_gid}).messages
+  expect(got[#got].body).to_be('the user in the group')
+end)
+
+test('the user sends to a group of away only through away, and only as a member', function()
+  expect(deliver(envelope({id = 'am2', from = 'dave', to = 'g-away2', body = 'the user is in this one',
+    group = {name = 'With the user', members = {'dave', 'user@lab'}}}))).to_equal({})
+  local before = #queued()
+  expect(ui_send('g-away2@away', 'the user to the away group', 'ui-mirror').status).to_be('succeeded')
+  wait('one envelope to away', function() return #queued() == before + 1 end)
+  local e = last_queued()
+  expect({e.from, e.to, e.group}).to_equal({'user', 'g-away2', nil})
+  local r = ui_send('g-away1@away', 'not a member', 'ui-mirror-observer')
+  expect(r.status, 'the user is not a member of g-away1').to_be('failed')
+  expect(count("SELECT 1 AS x FROM group_members WHERE gid = 'g-away1@away' AND agent = 'user'"), 'no silent join').to_be(0)
+end)

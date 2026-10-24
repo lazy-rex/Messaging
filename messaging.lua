@@ -688,6 +688,14 @@ local function fan_out(gid, g, m, origin)
   end
 end
 
+-- route_out gives a new message to the hubs that deliver it elsewhere: an agent or group of
+-- another hub (queue_peer), or the member hubs of a group of this hub (fan_out). Every send path
+-- calls it after insert_message.
+local function route_out(m)
+  if fed.split(m.to) then queue_peer(m)
+  elseif is_group_id(m.to) and not builtin[m.to] then fan_out(m.to, group(m.to), m) end
+end
+
 local function saved_result(saved, fingerprint)
   if normalized_fingerprint(saved.fingerprint) ~= normalized_fingerprint(fingerprint) then fail('conflict', 'Send key already has different content') end
   if type(saved.result) ~= 'table' or type(saved.result.id) ~= 'string' then
@@ -730,8 +738,7 @@ local function send(agent, args)
   if args.reply_expected == false then message.reply_expected = false end
   admit(message)
   insert_message(message, targets)
-  if fed.split(args.to) then queue_peer(message)
-  elseif is_group_id(args.to) and not builtin[args.to] then fan_out(args.to, group(args.to), message) end
+  route_out(message)
   if original then
     -- A reply acknowledges the message that it answers. An acked target is not an error.
     db.exec('UPDATE deliveries SET acked = 1 WHERE agent = ? AND seq = CAST(? AS INTEGER)', agent, original.seq)
@@ -1962,7 +1969,8 @@ end
 -- its audience and never becomes the user's unread mail.
 local function ui_recipients(user, peer)
   local g = group(peer.id)
-  if user ~= 'user' or not g or builtin[peer.id] then return recipients(user, peer.id) end
+  -- The user joins a group of another hub only there: its members change on its home hub.
+  if user ~= 'user' or not g or builtin[peer.id] or fed.split(peer.id) then return recipients(user, peer.id) end
   if not is_member(g, user) then
     db.exec([[INSERT INTO group_members (gid, agent, pos, current)
       VALUES (?, ?, (SELECT coalesce(max(pos), 0) + 1 FROM group_members WHERE gid = ?), 1)
@@ -1970,7 +1978,7 @@ local function ui_recipients(user, peer)
     g.members[#g.members + 1] = user
   end
   local targets = {}
-  for _, id in ipairs(g.members) do if id ~= user then targets[#targets + 1] = id end end
+  for _, id in ipairs(g.members) do if id ~= user and not fed.split(id) then targets[#targets + 1] = id end end
   return targets
 end
 
@@ -1993,6 +2001,7 @@ local function view_send(args)
   local text, rev = draft(user, peer.id)
   if rev ~= args.draft_revision or text ~= args.text then fail('draft_conflict', 'The saved draft differs from the text to send') end
   insert_message(message, ui_recipients(user, peer))
+  route_out(message)
   local result = {message_id = id, cleared_draft_revision = args.draft_revision, draft_revision = set_draft(user, peer.id, '')}
   save_operation(id, user, fingerprint, result)
   return result
