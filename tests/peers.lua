@@ -116,3 +116,12 @@ test('a key conflict on hub.peer.send is final: the envelope leaves the outbox a
   expect(count('SELECT 1 AS x FROM peer_outbox'), 'the conflict does not block the outbox').to_be(0)
   expect(H.peer_status().peers[1].outbox, 'the next envelope went').to_be(before + 1)
 end)
+
+test('a key that hub.peer.send refuses as invalid is final: it leaves the outbox and the next one goes', function()
+  -- A key over 512 bytes: the hub answers code refused ("invalid: key must be 1-512 bytes").
+  sql_write('INSERT INTO peer_outbox (seq, id, hub, envelope) VALUES (?, ?, ?, ?)', {1, string.rep('k', 600), 'away', '{"v":1}'})
+  local before = H.peer_status().peers[1].outbox
+  alice:call('messaging.send', {to = 'bob@away', body = 'after the invalid key', key = 'peer-after-invalid'})
+  expect(count('SELECT 1 AS x FROM peer_outbox'), 'the invalid key does not block the outbox').to_be(0)
+  expect(H.peer_status().peers[1].outbox, 'the next envelope went').to_be(before + 1)
+end)
