@@ -2106,8 +2106,6 @@ function receive_peer(msg)
   if type(env.reply_to) == 'string' and db.first('SELECT 1 AS x FROM messages WHERE id = ?', env.reply_to) then m.reply_to = env.reply_to end
   -- admit measures the message as it is stored and read.
   if not pcall(admit, m) then return fed.refuse('too_large', 'The message does not fit one read page here') end
-  -- The SDK deletes its dedupe rows after 30 days; the message ID still makes a later repeat a no-op.
-  if db.first('SELECT 1 AS x FROM messages WHERE id = ?', id) then return end
   notes.marked, notes.list = {}, {}
   insert_message(m, {to})
   flush()

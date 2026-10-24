@@ -65,14 +65,6 @@ test('a repeat of the envelope changes nothing', function()
   expect(#alice:call('messaging.read', {}).messages).to_be(1)
 end)
 
-test('without the SDK dedupe row, the message ID still makes a repeat a no-op', function()
-  -- The SDK deletes its dedupe rows after 30 days; the hub can still give the envelope again.
-  sql_write("DELETE FROM sdk_peer_seen WHERE from_hub = 'away' AND key = 'm1'")
-  expect(deliver(envelope())).to_equal({})
-  expect(count('SELECT 1 AS x FROM messages WHERE id = ?', {got_id})).to_be(1)
-  expect(#alice:call('messaging.read', {}).messages).to_be(1)
-end)
-
 test('a reply to a peer message names the origin ID in its envelope', function()
   local r = alice:call('messaging.send', {to = 'bob@away', body = 'got it', key = 'peer-reply', reply_to = got_id})
   taken(2)
