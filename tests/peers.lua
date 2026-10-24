@@ -125,3 +125,20 @@ test('Messaging splits <id>@<hub> itself: this hub is local, a peer stays as giv
   expect_error(function() alice:call('messaging.send', {to = 'bob@nowhere', body = 'lost', key = 'peer-nowhere'}) end, 'not a configured peer hub')
   expect(count('SELECT 1 AS x FROM messages'), 'nothing stored').to_be(before)
 end)
+
+test('a remote correspondent is a thread of the agent, with its hub in the title', function()
+  local found
+  for _, t in ipairs(alice:call('messaging.thread_list', {}).threads) do if t.id == 'bob@away' then found = t end end
+  expect(found ~= nil, 'bob@away is in the thread list').to_be(true)
+  expect({found.title, found.group}).to_equal({'bob@away', false})
+  expect(#alice:call('messaging.history', {thread = 'bob@away'}).messages > 0).to_be(true)
+end)
+
+test('the user opens the thread of a remote sender; its tab names the hub', function()
+  local from = 'claude:0123456789abcdef'
+  expect(deliver(envelope({id = 'm20', from = from, to = 'user', body = 'to the user from away'}))).to_equal({})
+  local id = from .. '@away'
+  user:open('thread/' .. id):render()
+  local t = wait('the tab of the remote thread', function() return tab('thread/' .. id) end)
+  expect(t.title).to_be('claude:01234567@away')
+end)

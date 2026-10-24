@@ -819,6 +819,9 @@ local page_size = 200
 
 local function display_name(a)
   if type(a.name) == 'string' and a.name ~= a.id and a.name:match('%S') then return a.name end
+  -- A remote agent keeps its hub: "<short ID>@<hub>".
+  local remote, at = fed.split(a.id)
+  if at then return display_name({id = remote}) .. '@' .. at end
   local kind, suffix = a.id:match('^([^:]+):(.+)$')
   if kind == 'claude' or kind == 'codex' then return kind .. ':' .. suffix:sub(1, 8) end
   return a.id
@@ -899,6 +902,29 @@ local function observed_direct_peer(id, s)
     observer = true, readonly = true}
 end
 
+-- remote_peers lists the remote agents (<id>@<hub>) that have a direct thread with user, from
+-- the messages: the hub lists only local agents. s: optional view state.
+local function remote_peers(user, s)
+  local found = {}
+  local function add(a, b)
+    local other = a == user and b or b == user and a or nil
+    if other and fed.split(other) then found[other] = true end
+  end
+  if s then
+    for key in pairs(s.last) do
+      local p = parts(key)
+      if p[1] ~= '' then add(p[1], p[2]) end
+    end
+  else
+    for _, r in ipairs(rows([[SELECT DISTINCT thread_a, thread_b FROM messages WHERE thread_a <> '' AND (thread_a = ? OR thread_b = ?)
+        AND (thread_a LIKE '%@%' OR thread_b LIKE '%@%')]], user, user)) do add(r.thread_a, r.thread_b) end
+  end
+  local list = {}
+  for id in pairs(found) do list[#list + 1] = {id = id, name = display_name({id = id})} end
+  table.sort(list, function(x, y) return x.id < y.id end)
+  return list
+end
+
 -- peers lists the threads of user. s: optional view state. direct_only: no observed
 -- agent-to-agent threads (a caller that resolves one by its ID first).
 local function peers(user, s, direct_only)
@@ -906,6 +932,7 @@ local function peers(user, s, direct_only)
   for _, a in ipairs(participants) do
     if a.id ~= user then list[#list + 1] = a end
   end
+  for _, a in ipairs(remote_peers(user, s)) do list[#list + 1] = a end
   for gid, g in pairs(builtin) do list[#list + 1] = {id = gid, name = g.name, group = true} end
   local created = {}
   for gid, g in pairs(s and s.groups or created_groups()) do
