@@ -673,7 +673,9 @@ end
 -- - origin {hub, id} in a fan-out names the first copy of the message. The sender's hub adds the
 --   deliveries of its other members to that copy, so each member gets each message once.
 -- Limits: the home hub owns the name and the members (a mirror cannot change them); a mirror
--- learns a change with the next message; a member notice and reply_to do not cross hubs.
+-- learns a change with the next message, so a mirror whose hub has no member left gets no later
+-- snapshot and stays stale (the home still refuses a removed sender); a member notice and
+-- reply_to do not cross hubs.
 local function own_hub() return hub('hub.peer.status', {}).hub_name end
 
 local function fan_out(gid, g, m, origin)
