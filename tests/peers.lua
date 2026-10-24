@@ -115,3 +115,13 @@ test('a failed commit is not processed, and the next delivery stores the message
   expect(deliver(envelope({id = 'm8', body = 'after a failure'}))).to_equal({})
   expect(count("SELECT 1 AS x FROM messages WHERE body = 'after a failure'")).to_be(1)
 end)
+
+test('Messaging splits <id>@<hub> itself: this hub is local, a peer stays as given, another hub is refused', function()
+  local carol = agent('carol')
+  local m = alice:call('messaging.send', {to = carol.id .. '@lab', body = 'to this hub', key = 'peer-self'})
+  expect(sql('SELECT recipient FROM messages WHERE id = ?', {m.id})[1].recipient, 'the local ID').to_be(carol.id)
+  expect(#carol:call('messaging.read', {}).messages).to_be(1)
+  local before = count('SELECT 1 AS x FROM messages')
+  expect_error(function() alice:call('messaging.send', {to = 'bob@nowhere', body = 'lost', key = 'peer-nowhere'}) end, 'not a configured peer hub')
+  expect(count('SELECT 1 AS x FROM messages'), 'nothing stored').to_be(before)
+end)

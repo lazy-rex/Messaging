@@ -55,10 +55,31 @@ local function refresh_participants()
   participants = hub('hub.agents', {all = true}).agents or {}
 end
 
+-- Remote agents (federation v1, hub docs/hub.md "Peer hubs"; the SDK's app.peer, docs/plugin-sdk.md
+-- "Federation"). Messaging splits "<id>@<hub>" itself (hub lead, lead-fedxp2): the hub routes by
+-- hub name only, and the ID on a peer is that hub's. So a stored ID with "@" is always a remote
+-- agent: fed.split returns its ID there and the hub name. The SDK keeps the outbox, the retries and
+-- the receive dedupe. receive_peer is below.
+local receive_peer
+local fed = app.peer{receive = function(msg) return receive_peer(msg) end}
+
 -- resolve_recipient returns the stored ID of a recipient. A spawn that has not reported yet stays
--- "spawn:<id>": its rows move to the identity later (rebind_spawns).
+-- "spawn:<id>": its rows move to the identity later (rebind_spawns). "<id>@<this hub>" is the local
+-- "<id>"; "<id>@<peer>" stays as given, for a configured peer only (hub.peer.status).
 local function resolve_recipient(id)
   if id == 'team' or (type(id) == 'string' and id:sub(1, 2) == 'g-') then return id end
+  local remote, at = fed.split(id)
+  if at then
+    local st = hub('hub.peer.status', {})
+    if at == st.hub_name then
+      id = remote
+    else
+      for _, p in ipairs(st.peers or {}) do
+        if p.name == at then return remote .. '@' .. at end
+      end
+      fail('invalid_input', 'Unknown recipient: ' .. id .. ' (' .. at .. ' is not a configured peer hub)')
+    end
+  end
   local ok, result = pcall(hub, 'hub.agents.resolve', {to = id})
   if ok then return result.id end
   -- The hub refuses a name that matches no agent, or more than one. A retry cannot change that, so
@@ -68,13 +89,6 @@ local function resolve_recipient(id)
   end
   error(result, 0)
 end
-
--- Remote agents (federation v1, hub docs/hub.md "Peer hubs"; the SDK's app.peer, docs/plugin-sdk.md
--- "Federation"). The hub resolves "<id>@<peer>" to itself and "<id>@<this hub>" to the local ID, so
--- a stored ID with "@" is always a remote agent: fed.split returns its ID there and the hub name.
--- The SDK keeps the outbox, the retries and the receive dedupe. receive_peer is below.
-local receive_peer
-local fed = app.peer{receive = function(msg) return receive_peer(msg) end}
 
 
 -- Storage: the plugin's SQL database (hub.sql, docs/sql-storage.md). Each action and view handler
