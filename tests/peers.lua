@@ -142,3 +142,72 @@ test('the user opens the thread of a remote sender; its tab names the hub', func
   local t = wait('the tab of the remote thread', function() return tab('thread/' .. id) end)
   expect(t.title, 'the short ID and the hub').to_match('^claude:01234567@away')
 end)
+
+-- Groups across hubs. This hub is "lab"; "away" is the peer.
+local gina, hal = agent('gina'), agent('hal')
+local function last_queued() local e = queued(); return e[#e] end
+local home_gid
+
+test('a group with members on away: local members get it here, away gets one envelope with the group', function()
+  home_gid = gina:call('messaging.thread_create', {members = {hal.id, 'bob@away', 'zed@away'}, title = 'Both hubs', key = 'xg-create'}).id
+  local before = #queued()
+  local m = gina:call('messaging.send', {to = home_gid, body = 'hello both hubs', key = 'xg-1'})
+  expect(#hal:call('messaging.read', {}).messages, 'hal here').to_be(1)
+  wait('away gets one envelope', function() return #queued() == before + 1 end)
+  local e = last_queued()
+  expect({e.id, e.from, e.to, e.group.name}).to_equal({m.id, gina.id, home_gid, 'Both hubs'})
+  table.sort(e.group.members)
+  local want = {gina.id, hal.id, 'bob@away', 'zed@away'}
+  table.sort(want)
+  expect(e.group.members).to_equal(want)
+  expect(count("SELECT 1 AS x FROM deliveries WHERE agent LIKE '%@%'"), 'no local delivery for a remote member').to_be(0)
+end)
+
+test('a member on away sends to the group here: local members get it once, and it fans out to away', function()
+  local before = #queued()
+  expect(deliver(envelope({id = 'bm1', from = 'bob', to = home_gid, body = 'from bob on away'}))).to_equal({})
+  for _, a in ipairs({gina, hal}) do
+    local got = a:call('messaging.read', {thread = home_gid}).messages
+    expect(got[#got].from, a.name).to_be('bob@away')
+  end
+  wait('the fan-out to away (zed is there)', function() return #queued() == before + 1 end)
+  local e = last_queued()
+  expect({e.from, e.to, e.origin.hub, e.origin.id}).to_equal({'bob@away', home_gid, 'away', 'bm1'})
+  expect(deliver(envelope({id = 'bm2', from = 'mallory', to = home_gid})).refused, 'not a member').to_be('unknown_recipient')
+end)
+
+test('a group of away: this hub keeps a mirror; its members get the message once', function()
+  local e = envelope({id = 'am1', from = 'dave', to = 'g-away1', body = 'from the away group',
+    group = {name = 'Away group', members = {'dave', gina.id .. '@lab', hal.id .. '@lab', 'erin@other'}}})
+  expect(deliver(e)).to_equal({})
+  local got = gina:call('messaging.read', {thread = 'g-away1@away'}).messages
+  expect({got[#got].from, got[#got].to}).to_equal({'dave@away', 'g-away1@away'})
+  local mirror
+  for _, t in ipairs(gina:call('messaging.thread_list', {}).threads) do if t.id == 'g-away1@away' then mirror = t end end
+  expect({mirror.title, mirror.group}).to_equal({'Away group', true})
+  table.sort(mirror.members)
+  local want = {'dave@away', gina.id, hal.id, 'erin@other'}
+  table.sort(want)
+  expect(mirror.members).to_equal(want)
+end)
+
+local mirror_send
+test('a send to the mirror goes to the home hub only; the fan-out back adds the deliveries here', function()
+  local before = #queued()
+  mirror_send = gina:call('messaging.send', {to = 'g-away1@away', body = 'gina to the away group', key = 'xg-2'})
+  wait('one envelope to away', function() return #queued() == before + 1 end)
+  local e = last_queued()
+  expect({e.to, e.from, e.group}).to_equal({'g-away1', gina.id, nil})
+  expect(count('SELECT 1 AS x FROM deliveries d JOIN messages m ON m.seq = d.seq WHERE m.id = ?', {mirror_send.id}), 'no delivery before the home').to_be(0)
+  -- The home hub fans it out to this hub, with origin = this hub and the first ID.
+  expect(deliver(envelope({id = 'peer/3:lab' .. #mirror_send.id .. ':' .. mirror_send.id, from = gina.id .. '@lab', to = 'g-away1',
+    body = 'gina to the away group', origin = {hub = 'lab', id = mirror_send.id},
+    group = {name = 'Away group', members = {'dave', gina.id .. '@lab', hal.id .. '@lab', 'erin@other'}}}))).to_equal({})
+  expect(count("SELECT 1 AS x FROM messages WHERE body = 'gina to the away group'"), 'one copy').to_be(1)
+  local got = hal:call('messaging.read', {thread = 'g-away1@away'}).messages
+  expect(got[#got].id, 'hal gets the first copy').to_be(mirror_send.id)
+end)
+
+test('a mirror cannot change its members here', function()
+  expect_error(function() gina:call('messaging.thread_members', {thread = 'g-away1@away', members = {hal.id}, key = 'xg-members'}) end, 'home hub')
+end)

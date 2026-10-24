@@ -502,14 +502,17 @@ local function is_member(g, agent)
   return false
 end
 
--- recipients returns the audience of a message from sender to `to`.
+-- recipients returns the local audience of a message from sender to `to`. A member on another
+-- hub gets the message from its own hub (fan_out); a group of another hub delivers through its
+-- home hub (queue_peer), so a send to it has no delivery here.
 local function recipients(sender, to)
   local g = group(to)
   if g then
     if not is_member(g, sender) then fail('refused', 'Only a member sends to this group') end
+    if fed.split(to) then return {} end
     local list = {}
     for _, id in ipairs(g.members) do
-      if id ~= sender then list[#list + 1] = id end
+      if id ~= sender and not fed.split(id) then list[#list + 1] = id end
     end
     return list
   end
@@ -660,6 +663,31 @@ local function queue_peer(m)
     reply_to = m.reply_to and fed.origin_id(m.reply_to, peer), reply_expected = m.reply_expected})
 end
 
+-- Groups across hubs (fed-msg-priority item 3). A group lives on the hub that made it: its home.
+-- A member on another hub is <id>@<hub>. Each hub with a member keeps a mirror of the group,
+-- "<gid>@<home>", with the members named as that hub names them.
+-- - A send to a group at home: local deliveries, and one envelope for each other hub with a
+--   member (fan_out), with the group snapshot {name, members}.
+-- - A send to a mirror: no local delivery; one envelope to the home hub (queue_peer), which
+--   stores it and fans it out to every other member, also on the sender's hub.
+-- - origin {hub, id} in a fan-out names the first copy of the message. The sender's hub adds the
+--   deliveries of its other members to that copy, so each member gets each message once.
+-- Limits: the home hub owns the name and the members (a mirror cannot change them); a mirror
+-- learns a change with the next message; a member notice and reply_to do not cross hubs.
+local function own_hub() return hub('hub.peer.status', {}).hub_name end
+
+local function fan_out(gid, g, m, origin)
+  local seen, hubs = {}, {}
+  for _, id in ipairs(g.members) do
+    local _, at = fed.split(id)
+    if at and id ~= m.from and not seen[at] then seen[at] = true; hubs[#hubs + 1] = at end
+  end
+  for _, at in ipairs(hubs) do
+    fed.send(at, m.id, {v = 1, id = m.id, from = m.from, to = gid, body = m.body, at = m.at,
+      reply_expected = m.reply_expected, group = {name = g.name, members = g.members}, origin = origin})
+  end
+end
+
 local function saved_result(saved, fingerprint)
   if normalized_fingerprint(saved.fingerprint) ~= normalized_fingerprint(fingerprint) then fail('conflict', 'Send key already has different content') end
   if type(saved.result) ~= 'table' or type(saved.result.id) ~= 'string' then
@@ -702,7 +730,8 @@ local function send(agent, args)
   if args.reply_expected == false then message.reply_expected = false end
   admit(message)
   insert_message(message, targets)
-  if fed.split(args.to) then queue_peer(message) end
+  if fed.split(args.to) then queue_peer(message)
+  elseif is_group_id(args.to) and not builtin[args.to] then fan_out(args.to, group(args.to), message) end
   if original then
     -- A reply acknowledges the message that it answers. An acked target is not an error.
     db.exec('UPDATE deliveries SET acked = 1 WHERE agent = ? AND seq = CAST(? AS INTEGER)', agent, original.seq)
@@ -1054,6 +1083,7 @@ local function thread_create(agent, args, source_session)
       fail('invalid_input', 'members must contain known participant IDs')
     end
     id = resolve_recipient(id)
+    if fed.split(id) and not is_group_id(id) then known[id] = display_name({id = id}) end
     if not known[id] then fail('invalid_input', 'members must contain known participant IDs') end
     selected[id] = true
     count = count + 1
@@ -1152,6 +1182,7 @@ local function change_members(user, peer, input, operation_key, context)
   if peer.observer then fail('refused', 'Send a message to join this group before changing its members') end
   if type(operation_key) ~= 'string' or operation_key == '' then fail('invalid_input', 'An operation key is required') end
   if builtin[peer.id] then fail('refused', 'The team group has dynamic membership') end
+  if fed.split(peer.id) then fail('refused', 'Change the members of this group on its home hub') end
   local members = selected_members(user, input)
   if not peer.group then
     -- A direct thread stays intact. An expanded selection creates a separate group.
@@ -1166,7 +1197,7 @@ local function change_members(user, peer, input, operation_key, context)
   local g = group(peer.id)
   if not g or not is_member(g, user) then fail('refused', 'Only a member changes this group') end
   local added = {}
-  for _, id in ipairs(members) do if not is_member(g, id) then added[#added + 1] = id end end
+  for _, id in ipairs(members) do if not is_member(g, id) and not fed.split(id) then added[#added + 1] = id end end
   db.exec('UPDATE group_members SET current = 0 WHERE gid = ?', peer.id)
   for pos, id in ipairs(members) do
     db.exec([[INSERT INTO group_members (gid, agent, pos, current) VALUES (?, ?, ?, 1)
@@ -2119,11 +2150,73 @@ app.on('hub.changed', function(args)
   if args.what == 'agents' then schedule_refresh() end
 end, {tx = false})
 
+-- receive_group stores a group message from a peer hub (see "Groups across hubs" above).
+-- With env.group, the group lives on from_hub, and this hub keeps its mirror; without it, a member
+-- on from_hub sends to a group of this hub, which stores it and fans it out.
+local function receive_group(from_hub, env)
+  notes.marked, notes.list = {}, {}
+  local m = {id = fed.received_id(from_hub, env.id), body = env.body, at = env.at}
+  if env.reply_expected == false then m.reply_expected = false end
+  if type(env.group) ~= 'table' then
+    local g = not builtin[env.to] and group(env.to)
+    m.from, m.to = env.from .. '@' .. from_hub, env.to
+    if not g or fed.split(env.to) or not is_member(g, m.from) then
+      return fed.refuse('unknown_recipient', m.from .. ' is not a member of a group ' .. env.to .. ' on this hub')
+    end
+    if not pcall(admit, m) then return fed.refuse('too_large', 'The message does not fit one read page here') end
+    insert_message(m, recipients(m.from, m.to))
+    fan_out(m.to, g, m, {hub = from_hub, id = env.id})
+    flush()
+    schedule_refresh()
+    return
+  end
+  if type(env.group.name) ~= 'string' or type(env.group.members) ~= 'table' then
+    return fed.refuse('invalid_envelope', 'group must have a name and members')
+  end
+  -- here names an ID of from_hub as this hub names it.
+  local me = own_hub()
+  local function here(id)
+    local l, at = fed.split(id)
+    if not at then return id .. '@' .. from_hub end
+    if at == me then return l end
+    return id
+  end
+  local gid, members = env.to .. '@' .. from_hub, {}
+  for i, id in ipairs(env.group.members) do
+    if type(id) ~= 'string' or id == '' then return fed.refuse('invalid_envelope', 'group members must be IDs') end
+    members[i] = here(id)
+  end
+  m.from, m.to = here(env.from), gid
+  local targets = {}
+  for _, id in ipairs(members) do
+    if id ~= m.from and not fed.split(id) then targets[#targets + 1] = id end
+  end
+  db.exec('INSERT INTO groups (gid, name) VALUES (?, ?) ON CONFLICT (gid) DO UPDATE SET name = excluded.name', gid, env.group.name)
+  db.exec('UPDATE group_members SET current = 0 WHERE gid = ?', gid)
+  for pos, id in ipairs(members) do
+    db.exec([[INSERT INTO group_members (gid, agent, pos, current) VALUES (?, ?, ?, 1)
+      ON CONFLICT (gid, agent) DO UPDATE SET pos = excluded.pos, current = 1]], gid, id, pos)
+  end
+  -- The fan-out of a message that a member here sent: add the deliveries to the first copy.
+  local origin = env.origin
+  local first = type(origin) == 'table' and origin.hub == me and type(origin.id) == 'string'
+    and db.first('SELECT CAST(seq AS TEXT) AS seq FROM messages WHERE id = ?', origin.id)
+  if first then
+    db.exec('INSERT INTO deliveries (agent, seq, acked) SELECT value, CAST(? AS INTEGER), 0 FROM json_each(?) WHERE true ON CONFLICT DO NOTHING',
+      first.seq, json(targets))
+    for _, id in ipairs(targets) do notify(id) end
+  else
+    if not pcall(admit, m) then return fed.refuse('too_large', 'The message does not fit one read page here') end
+    insert_message(m, targets)
+  end
+  flush()
+  schedule_refresh()
+end
+
 -- receive_peer is the SDK's peer receive listener (app.peer, above): an envelope {from_hub, key,
 -- body} from a peer hub, with the body decoded. It runs in one transaction with the SDK's dedupe
 -- row, so a repeat of an envelope never runs it again. fed.refuse drops an envelope for good: only
--- one that can never be stored (a bad envelope, an unknown or group recipient, a message too
--- large). A raised error rolls back, and the hub gives the same envelope again later.
+-- one that can never be stored (a bad envelope, an unknown recipient, a message too large). A raised error rolls back, and the hub gives the same envelope again later.
 function receive_peer(msg)
   local from_hub, env = msg.from_hub, msg.body
   if env.v ~= 1 then return fed.refuse('invalid_envelope', 'The body is not a v1 envelope') end
@@ -2131,7 +2224,8 @@ function receive_peer(msg)
     if type(env[name]) ~= 'string' or env[name] == '' then return fed.refuse('invalid_envelope', name .. ' must be a nonempty string') end
   end
   if msg.key ~= env.id then return fed.refuse('invalid_envelope', 'The key is not the message ID') end
-  if is_group_id(env.to) or fed.split(env.to) then return fed.refuse('unknown_recipient', 'v1 delivers direct messages to local agents only') end
+  if is_group_id(env.to) then return receive_group(from_hub, env) end
+  if fed.split(env.to) then return fed.refuse('unknown_recipient', 'The recipient is not on this hub') end
   local found, r = pcall(hub, 'hub.agents.resolve', {to = env.to})
   if not found then
     if type(r) == 'table' and (r.code == 'refused' or r.code == 'not_delivered' or r.code == 'invalid_target') then
