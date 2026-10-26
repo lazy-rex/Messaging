@@ -1,97 +1,146 @@
 # Messaging
 
-A [LazyRex](https://github.com/lazy-rex/LazyRex) plugin. Threads between agents and the user: direct and group threads, drafts, unread state, and a thread view that prints its history into the pane's scrollback. Agents use `messaging.send`, `messaging.read`, `messaging.ack` and `messaging.history`.
+A [LazyRex](https://github.com/lazy-rex/LazyRex) plugin. Your agents and you talk in threads:
+direct threads, group threads and the team thread. Each thread has drafts, unread state and a view
+that prints its history into the pane's scrollback. Agents on other LazyRex hubs can join the
+same threads.
 
-## Install
+## Get it
 
-Check this repository out next to LazyRex, and add the plugin to the hub config:
+LazyRex setup installs Messaging with the other core plugins. To add it by hand, add an entry to
+the `plugins` list of the hub config:
 
 ```json
-{"name": "messaging", "path": "/path/to/Messaging/messaging.lua"}
+{"source": "/path/to/Messaging"}
 ```
 
-The plugin loads its other files from its own directory, so keep them together.
+The source is the plugin directory. Messaging uses the LazyRex Plugin SDK (`"sdk": "0"` in
+`lazyrex.json`). It needs a LazyRex hub whose release archive has the SDK federation module
+`sdk/lua/peer.lua`. The archive of v0.5.0-rc.1 does not have it, so Messaging does not start with
+that release.
 
-Messaging runs on the LazyRex Plugin SDK v0. Its `lazyrex.json` has `"sdk": "0"`, so the hub starts it through the SDK launcher (`sdk/lua/boot.lua`). A hub without the launcher cannot start it. Messaging keeps its data in the plugin's SQL database (`hub.sql`), so it also needs a hub with `hub.sql`. It reads a result of any size with `db.each`, and a render only reads, so it needs SDK commit eb9654d or later. It gives notice v2 forms (`once` and `read`), so it needs SDK commit 7e59a2a or later and a hub with notice v2 in `hub.sql.commit`.
+## Palette commands
+
+- **LazyRex: New Thread…** opens a form that starts a conversation with agents.
+- **LazyRex: Threads…** opens a panel that lists all threads, with this session first.
+- **LazyRex: Thread Settings…** opens a form to rename, change the members of, move or archive
+  the thread that you view.
+
+A new message gives the agent the notice "New message. Call messaging_read." The hub gives this
+notice one time until the agent reads.
+
+## Agent actions
+
+| Action | What it does |
+| --- | --- |
+| `messaging.send` | Send a message to an agent, to `user` (the human), to a group, or to `team` (everyone else). |
+| `messaging.read` | Read the unacknowledged messages. Reading does not acknowledge them. |
+| `messaging.ack` | Acknowledge handled messages without a reply. |
+| `messaging.history` | Read a page of thread history, newest first. |
+| `messaging.thread_list` | List the agent's threads with unread counts. |
+| `messaging.thread_create` | Create a thread with the agent and selected agents. |
+| `messaging.thread_archive` | Archive a thread for the agent, or restore it. |
+| `messaging.thread_rename` | Set the agent's own title of a thread. |
+| `messaging.thread_members` | Set the members of a group thread. |
+| `messaging.thread_move` | Set the Rex session where the thread opens for the agent. |
+
+Each action that changes state takes a `key`. After an unknown outcome, retry with the same key
+and the same content. A stored result replays forever.
+
+## Settings
 
 Plugin args (hub config `plugins[].args`):
 
-- `gallery` (default: absent): `"gallery": "true"` declares the Gallery tabs and serves their views: `/gallery` (list, form and widgets) and `/gallery/thread` (history and composer, in thread mode). Without it, the routes are unknown. The hub config holds arg values as strings; Rex gives the plugin the boolean `true` (observed in a lab check, 2026-10-21). The Gallery is a live preview of every control, with sample messages. It is for renderer work, not for users.
-
-## Storage
-
-Each action and each view action is one SQL transaction (`app.db`). The schema is one base step at version 4
-and step 5 (`db.migrate {base = 4, ...}` in `messaging.lua`). Step 5 drops the old `peer_outbox`. The SDK refuses a database below version 4 that
-has tables: start it from an empty database. The main tables:
-
-- `messages`: one row for each message, with its thread (`thread_a`, `thread_b`). A direct thread is
-  the sorted pair of its agents; a group thread is (`''`, group ID). `seq` comes from `clock`, and
-  it is the message cursor.
-- `deliveries`: one row for each recipient of a message, fixed at send. `acked = 0` is unread.
-- `groups` and `group_members`: created groups. The team has no rows: its members are the hub's agents.
-- `thread_homes`, `thread_titles`, `thread_opened`, `thread_archived`, `drafts`: thread state for
-  each viewer.
-- `operations`: saved results of keyed operations. An agent key replays forever.
-- A spawn address `spawn:<id>` stays in the rows until the hub binds the spawn to an identity
-  (`hub.agents.resolve`). At each agents change and at its start, Messaging moves the rows of a
-  bound spawn to its identity. A spawn that ended unbound (`not_delivered`) loses its waiting
-  deliveries and goes to `spawns_ended`; its other rows stay as history.
-- `sdk_peer_outbox` and `sdk_peer_seen`: the SDK's federation tables (see "Peer hubs").
-
-A send writes one message row and one delivery row for each recipient. No request depends on the
-size of a mailbox, a thread or a group. The hub admits one notice for each agent in a commit.
-New mail gives a pending notice with `once`: the hub nudges the agent one time until it reads.
-`messaging.read` records the read (`read`), or gives `pending = false` when no mail is unread.
+- `gallery` (default: absent). `"gallery": "true"` adds the Gallery views, `/gallery` and
+  `/gallery/thread`. The Gallery is a preview of every control with sample messages, for renderer
+  work. It is not for users.
 
 ## Peer hubs
 
-Federation v1 (hub `docs/hub.md`, "Peer hubs"). An agent sends to `<id>@<hub>`, where `<hub>` is a
-peer in the hub config. Only direct messages cross hubs: a group has no remote members.
+An agent sends to `<id>@<hub>`, where `<hub>` is a peer in the hub config. The hub docs describe
+peers in
+[Peer hubs](https://github.com/lazy-rex/LazyRex/blob/main/docs/hub.md#peer-hubs-federation-v1-2026-10-23).
+Messaging uses the SDK's `app.peer`
+([Federation](https://github.com/lazy-rex/LazyRex/blob/main/docs/plugin-sdk.md#federation)). The
+SDK keeps the outbox, the retries, the order for each peer and the receive dedupe.
 
-- Federation uses the SDK's `app.peer` (hub `docs/plugin-sdk.md`, "Federation"). The SDK keeps
-  the outbox, the retries, the order per peer and the receive dedupe.
-- Send: the message is stored here with the remote recipient and no delivery. The same commit
-  stages its envelope with `peer.send`, with the message ID as the key: JSON
-  `{v = 1, id, from, to, body, at, reply_to?, reply_expected?}`. After the reply, the SDK gives it
-  to `hub.peer.send`, in send order per peer. A send whose envelope the hub would refuse as too
-  large fails at the call (`too_large`). The body limit of 16384 bytes keeps an envelope far below
-  that. A final refusal of the hub marks the SDK row failed with a log line.
-- Receive: the SDK gives Messaging each envelope `{from_hub, key, body}` once. Messaging stores the
-  message as `peer/<len:hub><len:id>`, from `<from>@<from_hub>`, with one delivery to the local
-  agent. Messaging refuses (for good) a bad envelope, a group or unknown recipient, and a message
-  too large for one read page. Any other error is retried by the hub.
-- Reply: a reply to a peer message names the message ID of its origin hub in `reply_to`.
-- Read state stays on each hub. The sender gets no bounce in v1.
+- **Direct messages.** The send stores the message here and stages one envelope to the peer in the
+  same commit. The SDK sends it after the commit. The receiving hub stores it with one delivery to
+  its local agent.
+- **Groups.** A group lives on the hub that made it: its home. Each other hub with a member keeps
+  a mirror, `<gid>@<home>`. A send at home goes to the local members and to each other hub with a
+  member. A send to a mirror goes to the home hub, which sends it on to every other member. Each
+  member gets each message once.
+- **Replies.** A reply to a message from a peer names the message ID of its origin hub.
+- **Read state** stays on each hub. The sender gets no bounce.
 
-## Size limits
+The receiving hub refuses an envelope for good when:
 
-What a Lua plugin sends is at most 64 KiB in one control message (LazyRex docs/rex-protocol.md,
-"Rex Lua runtime"). A plugin reply that is too large never arrives: the caller sees a timeout.
-The plugin keeps every reply and request inside that limit:
+- the envelope is not a valid v1 envelope;
+- the recipient is not an agent on this hub;
+- the sender of a group message is not a member of that group here;
+- the message does not fit one read page here.
 
-- **Read and history pages** hold at most 49152 encoded bytes (JSON, counted as the hub's Go
-  encoder writes it: `<`, `>`, `&`, U+2028 and U+2029 count 6 bytes). A page is measured with the
-  largest cursor values, so the final page is not larger. `more` or `next_before` continues it.
-  The remaining 16 KiB is for the reply frame (measured: the frame around a request is 73 bytes).
-- **New messages** (agent send, view send, membership notice): the body is at most 16384 encoded
-  bytes. A send carries the body in two SQL requests (the message insert and the operation
-  fingerprint). `key` is at most 200 bytes and `reply_to` at most 512 bytes (raw). The whole
-  message must also fit one read page and one history page. A stored operation replays before
-  these limits.
-- Every stored message fits these limits too (checked on the live store, 2026-10-22). A read or
-  history page never cuts a message.
-- Open (deferred, F): bodies over 16 KiB would need a digest of the body in the fingerprint, from a
-  hub digest action, not a Lua hash.
+The hub retries every other receive error.
+
+## Storage
+
+Messaging keeps its data in its own SQL database (`hub.sql`). Each action and each view action is
+one SQL transaction. The schema is at version 5. The plugin refuses a database below version 4
+that has tables: start it from an empty database.
+
+- `messages`: one row for each message, with its thread. `seq` is the message cursor.
+- `deliveries`: one row for each recipient of a message, fixed at send. `acked = 0` is unread.
+- `groups` and `group_members`: created groups. The team has no rows: its members are the hub's
+  agents.
+- `thread_homes`: the session where each thread opens.
+- `thread_titles`, `thread_opened`, `thread_archived`, `drafts`: thread state for each viewer.
+- `operations`: the saved results of keyed operations.
+- `sdk_peer_outbox` and `sdk_peer_seen`: the SDK's federation tables.
+
+Mail to a spawn that has not reported its identity yet is stored for `spawn:<id>`. When the hub
+binds the spawn to an identity, Messaging moves the rows to that identity. A spawn that ends
+unbound loses its waiting deliveries.
+
+A send writes one message row and one delivery row for each recipient. The delivery insert of a
+group message holds one ID for each member.
+
+## Limits
+
+A Lua plugin sends at most 64 KiB in one control message (LazyRex
+[Rex Lua runtime](https://github.com/lazy-rex/LazyRex/blob/main/docs/rex-protocol.md#rex-lua-runtime-rex-do)).
+Messaging keeps every reply and request inside that limit:
+
+- A read or history page holds at most 49152 encoded bytes (JSON, as the hub's Go encoder writes
+  it: `<`, `>`, `&`, U+2028 and U+2029 count 6 bytes). `more` or `next_before` continues it. A
+  page never cuts a message.
+- A new message body is at most 16384 encoded bytes. The whole message must also fit one read
+  page and one history page. Bodies over 16 KiB are not implemented.
+- `key` is at most 200 bytes, for `messaging.send` and `messaging.thread_create`.
+- `reply_to` is at most 512 bytes, for `messaging.send`.
+- A stored operation replays before these limits.
+
+Groups across hubs have these limits:
+
+- Only the home hub can change the name and the members of a group. A mirror cannot.
+- A mirror learns a change with the next message. A mirror whose hub has no member left gets no
+  later change.
+- A member notice and `reply_to` do not cross hubs.
 
 ## Tests
 
 The Lua tests in `tests/*.lua` run against the real hub, on a lab Rex server that the command
-starts and stops (docs/testing.md in LazyRex). Build the hub in `../LazyRex/hub`, then run:
+starts and stops (LazyRex
+[docs/testing.md](https://github.com/lazy-rex/LazyRex/blob/main/docs/testing.md#run)). Run them
+from the Messaging directory, with `lazyrex-hub` on `PATH`:
 
 ```sh
 lazyrex-hub test            # every file, after the parity sweep
 lazyrex-hub test -file send.lua
 ```
+
+`lazyrex-hub test` needs a LazyRex checkout: `-lazyrex <dir>`, `LAZYREX_DIR`, or `../LazyRex` beside
+the plugin directory.
 
 | File | What it covers |
 | --- | --- |
@@ -103,21 +152,23 @@ lazyrex-hub test -file send.lua
 | home_views.lua | The open view of a homed thread: focus, a user close, a closed tab across a hub restart, reopens by a message and by Threads…, the draft across a menu form. |
 | thread_forms.lua | The New Thread form, the thread menu overview, renames (the form and a Rex tab rename), short identity names. |
 | identity_mail.lua | Mail between identities: a send and its replay, /clear and resume, a hub crash. |
-| schema.lua | A new database is at version 4 with the current tables only (no import tables, no `meta`, no `aliases_applied`). |
+| schema.lua | A new database is at version 5 with the current tables only. |
 | observer.lua | Read-only observation, the group join, long history in pages. |
-| threads_panel.lua | The Threads panel at three times the live thread count: under the view limit, names only, agent-only and archived threads as a count, every thread reachable through More pages; the 200-byte thread_create key limit that bounds every new group ID. |
-| agents_render.lua | Read tracking: a new agent appears in an open view without a SQL write (the hub renders again on hub.changed agents). |
+| threads_panel.lua | The Threads panel with many threads: under the view limit, names only, agent-only and archived threads as a count, every thread reachable through More pages; the 200-byte thread_create key limit. |
+| agents_render.lua | Read tracking: a new agent appears in an open view without a SQL write. |
 | thread_menu.lua | Rename, members and move as tools and as UI forms; Thread Settings… in the palette for the thread in view. |
-| readsize_send.lua | Size admission: encoded sizes as the hub encodes them (an agent-face reply), the body limit on both send paths, key and reply_to, replay before limits, a large unread backlog, the notice title. |
+| readsize_send.lua | Size admission: encoded sizes as the hub encodes them, the body limit on both send paths, key and reply_to, replay before limits, a large unread backlog, the notice title. |
 | growth.lua | A thread of 2000 messages: every send commits, history to the oldest message, the view renders. |
-| tab_reads.lua | The SQL statements of a send and its tab declaration do not grow with the number of peers (needs hub.test.calls). |
+| tab_reads.lua | The SQL statements of a send and its tab declaration do not grow with the number of peers. |
 | tabs_commit.lua | The tabs come from committed state: a failed send, move or archive leaves the tabs as they were. |
 | sql_paging.lua | Results over one hub.sql reply: the group list, history after a partial result. |
 | max_sequence.lua | A message at the largest sequence (9223372036854775807) appears in history and in the thread view. |
-| concat.lua | Joins of lists that a caller controls do not overflow table.concat (the Gallery form with 2600 fields; lazyrex.json test.files sets gallery = true). |
-| gallery.lua | The Gallery views with the plugin arg gallery = true (lazyrex.json test.files): /gallery renders list and form with actions; /gallery/thread renders history and composer with draft and send. |
-| tab_coalesce.lua | A burst of `hub.changed agents` gives one or two tab declarations, and the declaration still has the threads (needs hub.test.calls). |
-| notice.lua | The notice forms of each commit (notice v2): `once` for new mail, `read` for a read, `pending = false` without unread mail (needs hub.test.calls). |
+| concat.lua | Joins of lists that a caller controls do not overflow table.concat (the Gallery form with 2600 fields). |
+| gallery.lua | The Gallery views with the plugin arg gallery = true. |
+| tab_coalesce.lua | A burst of `hub.changed agents` gives one or two tab declarations, and the declaration still has the threads. |
+| notice.lua | The notice forms of each commit: `once` for new mail, `read` for a read, `pending = false` without unread mail. |
+| peers.lua | Peer hubs on one lab hub: direct and group envelopes, receive refusals, replies. |
+| spawn_bind.lua | Mail to a spawn before it reports, the move to its identity, and a spawn that ends unbound. |
 
-`lazyrex.json` is the test manifest. `tests/parity_fixture.lua` renders the thread menu forms for
-the parity sweep.
+The `test` field of `lazyrex.json` configures the tests. `tests/parity_fixture.lua` renders the
+thread menu forms for the parity sweep.
