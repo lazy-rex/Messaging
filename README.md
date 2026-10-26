@@ -107,9 +107,11 @@ group message holds one ID for each member.
 
 ## Limits
 
-A Lua plugin sends at most 64 KiB in one control message (LazyRex
+One Rex control message is at most 64 KiB (LazyRex
 [Rex Lua runtime](https://github.com/lazy-rex/LazyRex/blob/main/docs/rex-protocol.md#rex-lua-runtime-rex-do)).
-Messaging keeps every reply and request inside that limit:
+That limit applies to each request that the plugin sends. A reply to the hub can be larger: the
+SDK sends a reply over `inline_max` (45056 bytes) in parts, up to `max_total` (786432 bytes)
+(LazyRex [Reply parts](https://github.com/lazy-rex/LazyRex/blob/main/docs/hub.md#reply-parts)). Messaging keeps its own limits:
 
 - A read or history page holds at most 49152 encoded bytes (JSON, as the hub's Go encoder writes
   it: `<`, `>`, `&`, U+2028 and U+2029 count 6 bytes). `more` or `next_before` continues it. A
